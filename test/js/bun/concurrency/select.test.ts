@@ -249,6 +249,28 @@ describe("Bun.select", () => {
     expect(counts[0]).toBeGreaterThan(N * 0.4);
     expect(counts[2]).toBeGreaterThan(N * 0.4);
 
+    // Waiting cases on one channel are as likely to win, receives and sends.
+    const shared = new Bun.Channel<number>();
+    const waited = [0, 0];
+    for (let i = 0; i < N / 4; i++) {
+      const selected = Bun.select([shared, shared]);
+      await shared.send(i);
+      waited[(await selected).index]++;
+    }
+    expect(waited[0]).toBeGreaterThan((N / 4) * 0.4);
+    expect(waited[1]).toBeGreaterThan((N / 4) * 0.4);
+    const sent = [0, 0];
+    for (let i = 0; i < N / 4; i++) {
+      const selected = Bun.select([
+        [shared, 1],
+        [shared, 2],
+      ]);
+      await shared.receive();
+      sent[(await selected).index]++;
+    }
+    expect(sent[0]).toBeGreaterThan((N / 4) * 0.4);
+    expect(sent[1]).toBeGreaterThan((N / 4) * 0.4);
+
     const sides = [0, 0];
     for (let i = 0; i < N; i++) sides[(await Bun.select([closedChannel(), closedChannel()])).index]++;
     expect(sides[0]).toBeGreaterThan(N * 0.4);
@@ -315,16 +337,18 @@ describe("Bun.select", () => {
     const PER_WORKER = 500;
     const a = new Bun.Channel<number>();
     const b = new Bun.Channel<number>(2);
+    const done = new Bun.Channel<void>(WORKERS);
     const workers = Array.from({ length: WORKERS }, (_, id) =>
       startWorker(
-        `self.onmessage = async ({ data: { a, b, id, count } }) => {
+        `self.onmessage = async ({ data: { a, b, done, id, count } }) => {
           postMessage("ready");
           for (let i = 0; i < count; i++) {
             const n = id * count + i;
             await Bun.select([[a, n], [b, n]]);
           }
+          await done.send();
         };`,
-        { a, b, id, count: PER_WORKER },
+        { a, b, done, id, count: PER_WORKER },
       ),
     );
     try {
@@ -332,6 +356,8 @@ describe("Bun.select", () => {
       const total = WORKERS * PER_WORKER;
       const seen = new Uint8Array(total);
       for (let i = 0; i < total; i++) seen[(await Bun.select([a, b])).value!]++;
+      // Each worker's last select has taken its losing case out by then.
+      for (let i = 0; i < WORKERS; i++) await done.receive();
       expect(seen.every(count => count === 1)).toBe(true);
       expect(b.length).toBe(0);
       expect(channelQueueLengths(a)).toEqual(empty);

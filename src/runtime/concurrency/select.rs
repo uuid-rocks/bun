@@ -129,10 +129,12 @@ pub(crate) fn select(
         }
         let id = ops().next_id();
         let waiter = new_waiter(global, id);
-        for (i, case) in read.iter_mut().enumerate() {
+        // In the random order too: cases on one channel are ready together.
+        for &i in &order {
+            let case = &mut read[i as usize];
             let queued = Queued {
                 waiter: Arc::clone(&waiter),
-                case: i as u32,
+                case: i,
             };
             let state = &mut *locks[case.lock];
             match case.send.take() {
