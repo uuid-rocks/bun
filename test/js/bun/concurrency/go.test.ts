@@ -116,6 +116,40 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
+  // A pool thread's goroutine spawns while the pool could grow, but only the main thread creates
+  // threads, and it is blocked: an idle thread runs the goroutine.
+  test("a goroutine spawned on a pool thread runs while the main thread is blocked", async () => {
+    const { stdout, exitCode } = await run(
+      {
+        "main.ts": `
+          const flag = new Int32Array(new SharedArrayBuffer(4));
+          const started = new Bun.Channel<void>();
+          const go = new Bun.Channel<void>(1);
+          const parent = Bun.go(
+            async (flag: Int32Array, started: Bun.Channel<void>, go: Bun.Channel<void>) => {
+              await started.send();
+              await go.receive();
+              Bun.go((flag: Int32Array) => {
+                Atomics.store(flag, 0, 1);
+                Atomics.notify(flag, 0);
+              }, flag);
+            },
+            flag,
+            started,
+            go,
+          );
+          await started.receive();
+          await go.send();
+          console.log(Atomics.wait(flag, 0, 0, 10_000));
+          await parent;
+        `,
+      },
+      { threads: 4 },
+    );
+    expect(stdout).toBe("ok");
+    expect(exitCode).toBe(0);
+  });
+
   test("10,000 goroutines settle on a small pool, and each pool thread evaluates the module once", async () => {
     const { stdout, exitCode } = await run(
       {

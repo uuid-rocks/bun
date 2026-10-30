@@ -178,8 +178,9 @@ impl Waiter {
         if self.vm.is_current() {
             let vm = VirtualMachine::get();
             if vm.current_loop_kind() == self.loop_kind {
-                // Its own thread, which runs that loop and checks the queue before it polls.
-                vm.event_loop_mut().enqueue_task(Task::init(wake));
+                // Its own thread, which runs that loop. After a yield, as for a post from another
+                // thread: channel traffic on one thread must not keep timers and I/O waiting.
+                vm.event_loop_mut().enqueue_task_after_yield(Task::init(wake));
                 return;
             }
         }

@@ -483,6 +483,31 @@ describe.concurrent("Bun.Channel process", () => {
     });
   });
 
+  test("traffic on one thread does not keep timers from running", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const channel = new Bun.Channel();
+         let fired = false;
+         setTimeout(() => (fired = true), 1);
+         let sent = 0;
+         const sender = (async () => {
+           while (!fired && sent < 100_000) await channel.send(sent++);
+           channel.close();
+         })();
+         for await (const _ of channel);
+         await sender;
+         console.log(fired ? "timer fired" : "timer starved");`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: "timer fired\n", stderr: "", exitCode: 0 });
+  });
+
   test("channels, messages and waiters are freed", async () => {
     await using proc = Bun.spawn({
       cmd: [
