@@ -97,6 +97,7 @@
 #include "GeneratedBlob.h"
 #include "GeneratedBlockList.h"
 #include "GeneratedHistogram.h"
+#include "GeneratedChannel.h"
 #include "JSX509Certificate.h"
 #include "ncrypto.h"
 #include "JSKeyObject.h"
@@ -203,6 +204,7 @@ enum SerializationTag {
     Bun__KeyObjectTag = 252,
     Bun__nodenet_BlockList = 251,
     Bun__NodePerformanceHooksHistogramTag = 250,
+    Bun__ChannelTag = 249,
 
     ErrorTag = 255
 };
@@ -222,6 +224,11 @@ extern "C" void BlockList__onStructuredCloneDestroy(void*);
 extern "C" uint64_t Histogram__retainForStructuredClone(JSC::EncodedJSValue histogram);
 extern "C" JSC::EncodedJSValue Histogram__fromStructuredClone(JSC::JSGlobalObject*, uint64_t id);
 extern "C" void Histogram__releaseStructuredClone(uint64_t id);
+// A clone of a `Bun.Channel` is a handle to the same channel. The wire has an id, which keeps the
+// channel alive until `Channel__releaseStructuredClone`.
+extern "C" uint64_t Channel__retainForStructuredClone(JSC::EncodedJSValue channel);
+extern "C" JSC::EncodedJSValue Channel__fromStructuredClone(JSC::JSGlobalObject*, uint64_t id);
+extern "C" void Channel__releaseStructuredClone(uint64_t id);
 
 enum ArrayBufferViewSubtag {
     DataViewTag = 0,
@@ -762,7 +769,7 @@ public:
 #endif
         Vector<uint8_t>& out, SerializationContext context, ArrayBufferContentsArray& sharedBuffers,
         Vector<void*>& serializedBlockListRefs,
-        Vector<uint64_t>& serializedHistogramIds,
+        Vector<SerializedHandle>& serializedHandles,
         SerializationForStorage forStorage, SerializationForCrossProcessTransfer forTransfer)
     {
         CloneSerializer serializer(lexicalGlobalObject, messagePorts, arrayBuffers,
@@ -773,7 +780,7 @@ public:
             out, context, sharedBuffers, forStorage, forTransfer);
         auto code = serializer.serialize(value);
         serializedBlockListRefs = WTF::move(serializer.m_serializedBlockListRefs);
-        serializedHistogramIds = WTF::move(serializer.m_serializedHistogramIds);
+        serializedHandles = WTF::move(serializer.m_serializedHandles);
         return code;
     }
 
@@ -1450,8 +1457,23 @@ private:
                 if (!startObjectInternal(histogram)) // handle duplicates
                     return true;
                 uint64_t id = Histogram__retainForStructuredClone(JSValue::encode(histogram));
-                m_serializedHistogramIds.append(id);
+                m_serializedHandles.append({ Histogram__releaseStructuredClone, id });
                 write(Bun__NodePerformanceHooksHistogramTag);
+                write(id);
+                return true;
+            }
+
+            if (auto* channel = dynamicDowncast<Bun::Bindgen::Generated::JSChannel>(obj)) {
+                // The clone is the same channel, which bytes that leave the process cannot be.
+                if (m_forTransfer == SerializationForCrossProcessTransfer::Yes || m_forStorage == SerializationForStorage::Yes) {
+                    code = SerializationReturnCode::DataCloneError;
+                    return true;
+                }
+                if (!startObjectInternal(channel)) // handle duplicates
+                    return true;
+                uint64_t id = Channel__retainForStructuredClone(JSValue::encode(channel));
+                m_serializedHandles.append({ Channel__releaseStructuredClone, id });
+                write(Bun__ChannelTag);
                 write(id);
                 return true;
             }
@@ -2003,7 +2025,7 @@ private:
     SerializationContext m_context;
     ArrayBufferContentsArray& m_sharedBuffers;
     Vector<void*> m_serializedBlockListRefs;
-    Vector<uint64_t> m_serializedHistogramIds;
+    Vector<SerializedHandle> m_serializedHandles;
 #if ENABLE(WEBASSEMBLY)
     WasmModuleArray& m_wasmModules;
     WasmMemoryHandleArray& m_wasmMemoryHandles;
@@ -3498,6 +3520,26 @@ private:
         return histogram;
     }
 
+    JSValue readChannel()
+    {
+        VM& vm = m_globalObject->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        uint64_t id;
+        if (!read(id)) {
+            fail();
+            return JSValue();
+        }
+        JSValue channel = JSValue::decode(Channel__fromStructuredClone(defaultGlobalObject(m_globalObject), id));
+        RETURN_IF_EXCEPTION(scope, JSValue());
+        // Empty: no message in flight has this id.
+        if (channel.isEmpty()) {
+            fail();
+            return JSValue();
+        }
+        addTerminalToObjectPool(channel);
+        return channel;
+    }
+
     JSValue readBunType(JSC::EncodedJSValue (*deserialize)(JSC::JSGlobalObject*, const uint8_t** ptr, const uint8_t* end))
     {
         JSValue deserialized = JSValue::decode(deserialize(m_lexicalGlobalObject, &m_ptr, m_end));
@@ -4021,6 +4063,9 @@ private:
         case Bun__NodePerformanceHooksHistogramTag:
             return readHistogram();
 
+        case Bun__ChannelTag:
+            return readChannel();
+
         default:
             m_ptr = preTagPtr; // Push the tag back
             return JSValue();
@@ -4297,8 +4342,8 @@ SerializedScriptValue::~SerializedScriptValue()
 {
     for (auto* ptr : m_serializedBlockListRefs)
         BlockList__onStructuredCloneDestroy(ptr);
-    for (uint64_t id : m_serializedHistogramIds)
-        Histogram__releaseStructuredClone(id);
+    for (auto& handle : m_serializedHandles)
+        handle.release(handle.id);
 }
 
 SerializedScriptValue::SerializedScriptValue(Vector<uint8_t>&& buffer, std::unique_ptr<ArrayBufferContentsArray>&& arrayBufferContentsArray)
@@ -4943,21 +4988,21 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
 #endif
     std::unique_ptr<ArrayBufferContentsArray> sharedBuffers = makeUnique<ArrayBufferContentsArray>();
     Vector<void*> serializedBlockListRefs;
-    Vector<uint64_t> serializedHistogramIds;
+    Vector<SerializedHandle> serializedHandles;
     auto code = CloneSerializer::serialize(&lexicalGlobalObject, value, messagePorts, arrayBuffers,
 #if ENABLE(WEBASSEMBLY)
         wasmModules,
         wasmMemoryHandles,
 #endif
-        buffer, context, *sharedBuffers, serializedBlockListRefs, serializedHistogramIds, forStorage, forTransfer);
+        buffer, context, *sharedBuffers, serializedBlockListRefs, serializedHandles, forStorage, forTransfer);
 
     auto releaseSerializedRefs = [&] {
         for (auto* ptr : serializedBlockListRefs)
             BlockList__onStructuredCloneDestroy(ptr);
         serializedBlockListRefs.clear();
-        for (uint64_t id : serializedHistogramIds)
-            Histogram__releaseStructuredClone(id);
-        serializedHistogramIds.clear();
+        for (auto& handle : serializedHandles)
+            handle.release(handle.id);
+        serializedHandles.clear();
     };
 
     // Serialize may throw an exception. This code looks weird, but we'll rethrow it
@@ -4997,7 +5042,7 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
 #endif
         ));
     result->m_serializedBlockListRefs = WTF::move(serializedBlockListRefs);
-    result->m_serializedHistogramIds = WTF::move(serializedHistogramIds);
+    result->m_serializedHandles = WTF::move(serializedHandles);
     return result;
 }
 

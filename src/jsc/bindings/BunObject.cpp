@@ -38,6 +38,7 @@
 #include "BunObject+exports.h"
 #include "ErrorCode.h"
 #include "GeneratedArchive.h"
+#include "GeneratedChannel.h"
 #include "GeneratedBlob.h"
 #include "GeneratedBunObject.h"
 #include "GeneratedBunObjectInternals.h"
@@ -989,6 +990,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     $                                              constructBunShell                                                   DontDelete|PropertyCallback
     Archive                                        Bun::Bindgen::Generated::Archive::getArchiveConstructor             DontDelete|PropertyCallback
     ArrayBufferSink                                Bun::Bindgen::Generated::Sink::getArrayBufferSinkConstructor        DontDelete|PropertyCallback
+    Channel                                        Bun::Bindgen::Generated::Channel::getChannelConstructor             DontDelete|PropertyCallback
     Cookie                                         constructCookieObject                                               DontDelete|ReadOnly|PropertyCallback
     CookieMap                                      constructCookieMapObject                                            DontDelete|ReadOnly|PropertyCallback
     CryptoHasher                                   Bun::Bindgen::Generated::CryptoHasher::getCryptoHasherConstructor   DontDelete|PropertyCallback

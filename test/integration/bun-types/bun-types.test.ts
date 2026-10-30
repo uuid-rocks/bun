@@ -380,6 +380,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "bindgen_test.bind.ts": null,
   "bun_string_jsc.bind.ts": null,
   "cares_jsc.bind.ts": null,
+  "channel.bind.ts": "typeof Bun",
   "checker_queries_testing.bind.ts": null,
   "code_resolver_testing.bind.ts": null,
   "color_js.bind.ts": "typeof Bun",

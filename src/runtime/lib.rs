@@ -53,6 +53,7 @@ pub(crate) mod shell;
 pub(crate) mod api;
 pub(crate) mod checker_queries_testing;
 pub(crate) mod code_resolver_testing;
+pub(crate) mod concurrency;
 pub(crate) mod dispatch;
 pub(crate) mod hw_exports;
 #[cfg(debug_assertions)]

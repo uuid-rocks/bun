@@ -744,6 +744,12 @@ pub(crate) fn run_task(
             // `ptr` is the packed level (NOTE_MEMORYSTATUS_PRESSURE_* bits), not a pointer.
             crate::node::memory_pressure::emit(global, task.ptr as usize as i32);
         }
+        task_tag::ChannelWake => {
+            crate::concurrency::channel::ChannelWake::run(
+                cast_ptr!(crate::concurrency::channel::ChannelWake),
+                global,
+            )?;
+        }
         // One feature for each kind of context a `NativePromiseContext` cell holds.
         task_tag::NativePromiseContextDeferredDerefTask => in_features!(
             [Serve, HtmlRewriter, S3Client, Cron],
@@ -884,7 +890,7 @@ fn run_task_cold(task: Task) {
 /// `release_task_unrun` track `bun_event_loop::task_tag::COUNT`. Bump when
 /// adding a variant — and give it an arm in both.
 const _: () = assert!(
-    task_tag::COUNT == 86,
+    task_tag::COUNT == 87,
     "dispatch::run_task / release_task_unrun arm count out of sync with bun_event_loop::task_tag",
 );
 
@@ -1775,6 +1781,7 @@ fn __bun_release_task_unrun(task: bun_event_loop::Task) {
         task_tag::PollPendingModulesTask => release!(bun_jsc::async_module::Queue),
         task_tag::PosixSignalTask => release!(PosixSignalTask),
         task_tag::MemoryPressureTask => release!(crate::node::memory_pressure::MemoryPressureTask),
+        task_tag::ChannelWake => release!(crate::concurrency::channel::ChannelWake),
         task_tag::ProcessWaiterThreadTask => {
             #[cfg(not(windows))]
             release_in!([ChildProcess], ProcessWaiterThreadTask<Process>);

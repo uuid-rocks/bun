@@ -1,0 +1,144 @@
+---
+title: Channels
+description: Send values between threads with Bun.Channel
+---
+
+`Bun.Channel` passes values between threads, in the order they were sent, the way Go's channels do. One thread sends, another receives, and either one waits until the other is ready.
+
+```ts
+const channel = new Bun.Channel<string>();
+
+const sent = channel.send("hello");
+console.log(await channel.receive()); // => "hello"
+await sent;
+```
+
+---
+
+## Sharing a channel with a worker
+
+A channel is shared, not copied. Send it to a [`Worker`](/runtime/workers) with `postMessage()`, and both threads use the same channel.
+
+```ts main.ts icon="/icons/typescript.svg"
+const jobs = new Bun.Channel<number>(16);
+const results = new Bun.Channel<number>(16);
+
+const worker = new Worker(new URL("./worker.ts", import.meta.url));
+worker.postMessage({ jobs, results });
+
+for (let i = 1; i <= 3; i++) await jobs.send(i);
+jobs.close();
+
+for (let i = 0; i < 3; i++) console.log(await results.receive());
+// => 2
+// => 4
+// => 6
+```
+
+```ts worker.ts icon="/icons/typescript.svg"
+declare var self: Worker;
+
+self.onmessage = async ({ data: { jobs, results } }) => {
+  for await (const job of jobs) await results.send(job * 2);
+  process.exit(0);
+};
+```
+
+Any number of threads can send on and receive from the same channel. Each value goes to exactly one receiver.
+
+---
+
+## Capacity
+
+`new Bun.Channel(capacity)` sets how many values the channel holds while no receiver waits. The default, `0`, makes every `send()` wait until a receiver takes the value.
+
+With a capacity, `send()` resolves at once while `channel.length < channel.capacity`. When the channel is full, `send()` waits for a receiver to make room.
+
+```ts
+const channel = new Bun.Channel<number>(2);
+await channel.send(1);
+await channel.send(2);
+console.log(channel.length); // => 2
+
+const third = channel.send(3); // waits: the channel is full
+console.log(await channel.receive()); // => 1
+await third;
+```
+
+A full channel slows down a producer that is faster than its consumers.
+
+---
+
+## Closing a channel
+
+`close()` closes the channel for every thread. After it:
+
+- Waiting and later `send()` calls reject with `ERR_CHANNEL_CLOSED`.
+- Receivers receive the values the channel still holds.
+- Once those are gone, `receive()` rejects with `ERR_CHANNEL_CLOSED`, and `for await` loops end.
+
+```ts
+const channel = new Bun.Channel<number>(2);
+await channel.send(1);
+await channel.send(2);
+channel.close();
+
+for await (const value of channel) console.log(value);
+// => 1
+// => 2
+```
+
+`break` ends a `for await` loop and leaves the channel open, so other receivers keep receiving. A channel declared with `using` closes at the end of its scope.
+
+```ts
+{
+  using channel = new Bun.Channel();
+  // ...
+} // channel.close()
+```
+
+---
+
+## Cancelling with a signal
+
+Pass an `AbortSignal` to stop waiting. The promise rejects with the signal's reason, and the operation sends or takes nothing.
+
+```ts
+const channel = new Bun.Channel<string>();
+
+try {
+  await channel.receive({ signal: AbortSignal.timeout(100) });
+} catch (error) {
+  console.log(error.name); // => "TimeoutError"
+}
+```
+
+A value that a receiver took before the signal aborted stays sent and is received.
+
+---
+
+## What a channel sends
+
+Every value is a [structured clone](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm), made the way `postMessage()` makes one. This is true on one thread too, so a receiver never shares an object with its sender.
+
+- `SharedArrayBuffer` and `WebAssembly.Memory` are shared: both threads see the same memory.
+- Channels are shared: the receiver gets a handle to the same channel.
+- `ArrayBuffer`s listed in `transfer` move to the receiver and are detached for the sender.
+- Everything else is copied. Functions and other values that cannot be cloned reject with a `DataCloneError`.
+
+```ts
+const channel = new Bun.Channel<ArrayBuffer>(1);
+const buffer = new ArrayBuffer(1024);
+
+await channel.send(buffer, { transfer: [buffer] });
+console.log(buffer.byteLength); // => 0
+console.log((await channel.receive()).byteLength); // => 1024
+```
+
+A channel that holds a value containing a handle to itself is freed only once that value is received.
+
+---
+
+## The event loop
+
+A waiting `send()` or `receive()` does not keep the process alive. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel.
