@@ -68,7 +68,8 @@ pub(crate) fn select(
     }
 
     // Each value is cloned as its case is read, losing cases' too: the clone is what waits.
-    let mut read = Vec::with_capacity(len as usize);
+    // Not `len` at once: a sparse array's can be 2 ** 32 - 1, and its first hole throws.
+    let mut read = Vec::new();
     for i in 0..len as u32 {
         read.push(read_case(global, cases.get_index(global, i)?, i)?);
     }
@@ -153,7 +154,7 @@ pub(crate) fn select(
     // The values of the cases that lost, outside the locks.
     drop(read);
 
-    let index = index as i32;
+    let index = i64::from(index);
     let value = match won {
         Won::Received(ReceiveNow::Value(message, sender)) => {
             if let Some(sender) = sender {

@@ -282,19 +282,22 @@ impl ChannelOp {
             let value = match result {
                 WakeResult::Received(message) => message
                     .deserialize(global)
-                    .map(|value| select_result(global, case as i32, value, false)),
+                    .map(|value| select_result(global, i64::from(case), value, false)),
                 WakeResult::Sent => Ok(select_result(
                     global,
-                    case as i32,
+                    i64::from(case),
                     JSValue::UNDEFINED,
                     false,
                 )),
                 WakeResult::Closed if sends[case as usize] => {
                     return promise.reject(global, Ok(closed_error(global)));
                 }
-                WakeResult::Closed => {
-                    Ok(select_result(global, case as i32, JSValue::UNDEFINED, true))
-                }
+                WakeResult::Closed => Ok(select_result(
+                    global,
+                    i64::from(case),
+                    JSValue::UNDEFINED,
+                    true,
+                )),
             };
             return promise.settle(global, value);
         }
@@ -346,12 +349,12 @@ fn iterator_result(global: &JSGlobalObject, value: JSValue, done: bool) -> JSVal
 /// What `Bun.select` resolves to. `index` is `-1` for `default`.
 pub(super) fn select_result(
     global: &JSGlobalObject,
-    index: i32,
+    index: i64,
     value: JSValue,
     closed: bool,
 ) -> JSValue {
     let result = JSValue::create_empty_object(global, 3);
-    result.put(global, "index", JSValue::js_number(f64::from(index)));
+    result.put(global, "index", JSValue::js_number(index as f64));
     result.put(global, "value", value);
     result.put(global, "closed", JSValue::js_boolean(closed));
     result

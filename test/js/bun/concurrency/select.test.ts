@@ -462,6 +462,8 @@ describe("Bun.select", () => {
       [[], undefined, { code: "ERR_INVALID_ARG_VALUE" }],
       [[], {}, { code: "ERR_INVALID_ARG_VALUE" }],
       [[[ch, () => {}]], undefined, { name: "DataCloneError" }],
+      // Its first hole, not its length.
+      [Object.assign([], { length: 2 ** 32 - 1 }), undefined, { code: "ERR_INVALID_ARG_TYPE" }],
     ];
     for (const [cases, options, error] of invalid) {
       let promise: Promise<unknown>;
