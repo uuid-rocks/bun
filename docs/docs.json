@@ -132,7 +132,13 @@
           {
             "group": "Concurrency",
             "icon": "split",
-            "pages": ["/runtime/workers", "/runtime/goroutines", "/runtime/channels", "/runtime/module-graph"]
+            "pages": [
+              "/runtime/concurrency",
+              "/runtime/goroutines",
+              "/runtime/channels",
+              "/runtime/workers",
+              "/runtime/module-graph"
+            ]
           },
           {
             "group": "Process & System",

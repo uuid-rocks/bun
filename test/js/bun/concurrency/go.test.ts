@@ -79,6 +79,117 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
+  // A started goroutine never moves, so while the pool can grow, a goroutine does not go to a thread
+  // that already runs one, even one that waits (it may compute next), nor to a thread that took one
+  // and runs a turn while the others start.
+  test("goroutines get threads of their own while the pool can grow", async () => {
+    const { stdout, exitCode } = await run(
+      {
+        "main.ts": `
+          const started = new Bun.Channel<number>();
+          const release = new Bun.Channel<void>();
+          const waiting = Bun.go(
+            async (started: Bun.Channel<number>, release: Bun.Channel<void>) => {
+              await started.send(require("node:worker_threads").threadId);
+              await release.receive();
+            },
+            started,
+            release,
+          );
+          const first = await started.receive();
+          const others = await Promise.all(
+            Array.from({ length: 3 }, () =>
+              Bun.go(async () => {
+                await Bun.sleep(1);
+                return require("node:worker_threads").threadId;
+              }),
+            ),
+          );
+          await release.send();
+          await waiting;
+          console.log(new Set([first, ...others]).size);
+        `,
+      },
+      { threads: 4 },
+    );
+    expect(stdout).toBe("4");
+    expect(exitCode).toBe(0);
+  });
+
+  // A pool thread's goroutine spawns while the pool could grow, but only the main thread creates
+  // threads: if it is blocked, an idle thread runs the goroutine, and if the spawning thread blocks,
+  // a new thread does.
+  test("a goroutine spawned on a pool thread runs while the main thread or the spawning thread is blocked", async () => {
+    const { stdout, exitCode } = await run(
+      {
+        "main.ts": `
+          const flag = new Int32Array(new SharedArrayBuffer(4));
+          const started = new Bun.Channel<void>();
+          const go = new Bun.Channel<void>(1);
+          const parent = Bun.go(
+            async (flag: Int32Array, started: Bun.Channel<void>, go: Bun.Channel<void>) => {
+              await started.send();
+              await go.receive();
+              Bun.go((flag: Int32Array) => {
+                Atomics.store(flag, 0, 1);
+                Atomics.notify(flag, 0);
+              }, flag);
+            },
+            flag,
+            started,
+            go,
+          );
+          await started.receive();
+          await go.send();
+          // "not-equal" if the child was quicker: either way it ran on another thread.
+          console.log(Atomics.wait(flag, 0, 0, 10_000) !== "timed-out");
+          await parent;
+
+          console.log(
+            await Bun.go(async (flag: Int32Array) => {
+              await new Promise(resolve => setImmediate(resolve));
+              Atomics.store(flag, 0, 0);
+              Bun.go((flag: Int32Array) => {
+                Atomics.store(flag, 0, 1);
+                Atomics.notify(flag, 0);
+              }, flag);
+              return Atomics.wait(flag, 0, 0, 10_000) !== "timed-out";
+            }, flag),
+          );
+        `,
+      },
+      { threads: 4 },
+    );
+    expect(stdout).toBe("true\ntrue");
+    expect(exitCode).toBe(0);
+
+    // The spawning thread blocks after queueing two goroutines, one of which waits for the other,
+    // while the main thread can't create threads yet: each needs a new thread.
+    const twoChildren = await run(
+      {
+        "main.ts": `
+          const flags = new Int32Array(new SharedArrayBuffer(8)); // [both queued, second ran]
+          const parent = Bun.go(async (flags: Int32Array) => {
+            await new Promise(resolve => setImmediate(resolve));
+            Bun.go((flags: Int32Array) => Atomics.wait(flags, 1, 0, 10_000), flags);
+            Bun.go((flags: Int32Array) => {
+              Atomics.store(flags, 1, 1);
+              Atomics.notify(flags, 1);
+            }, flags);
+            Atomics.store(flags, 0, 1);
+            Atomics.notify(flags, 0);
+            return Atomics.wait(flags, 1, 0, 10_000) !== "timed-out";
+          }, flags);
+          Atomics.wait(flags, 0, 0, 10_000);
+          console.log(await parent);
+        `,
+      },
+      { threads: 4 },
+    );
+    expect(twoChildren.stdout).toBe("true");
+    expect(twoChildren.exitCode).toBe(0);
+  });
+
   test("10,000 goroutines settle on a small pool, and each pool thread evaluates the module once", async () => {
     const { stdout, exitCode } = await run(
       {

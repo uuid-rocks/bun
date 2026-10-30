@@ -121,20 +121,28 @@ public:
     // Main thread: `threads` (the whole pool) are retired, and what is queued is dropped. Nothing
     // started before the reset runs in the pool that grows after it.
     void reset(const Vector<ScriptExecutionContextIdentifier>& threads);
+    // A thread counted as starting won't take: what was queued for it goes to an idle thread.
     void threadFailedToStart();
+    // Main thread: a thread that grow() asked it for is being created.
+    void willCreateThread();
+    enum class Grow : bool { No,
+        Yes };
     // Wake an idle thread for what is queued, or grow the pool. Called without the lock.
-    void dispatch();
+    void dispatch(Grow = Grow::Yes);
 
 private:
     void retireLocked(ScriptExecutionContextIdentifier, Vector<std::pair<uint64_t, Spawner>>& lost) WTF_REQUIRES_LOCK(m_lock);
-    // Whether to start another thread (counted as starting) for what is queued.
-    bool shouldGrow() WTF_REQUIRES_LOCK(m_lock);
-    void grow();
+    // Whether to start another thread (counted as starting) for what is queued. `onMainThread`:
+    // whether this thread can create it now.
+    bool shouldGrow(bool onMainThread) WTF_REQUIRES_LOCK(m_lock);
+    void grow(bool onMainThread);
 
     Lock m_lock;
     Deque<std::pair<Task, Spawner>> m_queue WTF_GUARDED_BY_LOCK(m_lock);
     // Threads that found nothing to take, most recent last.
     Vector<ScriptExecutionContextIdentifier> m_idle WTF_GUARDED_BY_LOCK(m_lock);
+    // How many goroutines each thread runs, if any.
+    HashMap<ScriptExecutionContextIdentifier, unsigned> m_load WTF_GUARDED_BY_LOCK(m_lock);
     // Threads that were woken and have not taken since.
     HashSet<ScriptExecutionContextIdentifier> m_woken WTF_GUARDED_BY_LOCK(m_lock);
     // Threads that have taken at least once and are not retired.
@@ -144,6 +152,9 @@ private:
     // Threads not retired, and of those, the ones that have not taken yet.
     unsigned m_threadCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
     unsigned m_startingCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
+    // Of the starting threads, the ones the main thread has yet to create. A busy main thread
+    // would hold up what is queued for them, so it is not theirs.
+    unsigned m_uncreatedCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
     uint64_t m_nextId WTF_GUARDED_BY_LOCK(m_lock) { 1 };
 };
 
@@ -215,13 +226,15 @@ void wake(ScriptExecutionContext& context)
     }
 }
 
-bool Scheduler::shouldGrow()
+bool Scheduler::shouldGrow(bool onMainThread)
 {
     // Starting and woken threads will take what is queued; grow while more is queued than that.
     if (m_threadCount >= maxThreads() || m_queue.size() <= m_startingCount + m_woken.size())
         return false;
     m_threadCount++;
     m_startingCount++;
+    if (!onMainThread)
+        m_uncreatedCount++;
     return true;
 }
 
@@ -250,8 +263,10 @@ uint64_t Scheduler::spawn(Task&& task, Spawner spawner)
     return id;
 }
 
-void Scheduler::dispatch()
+void Scheduler::dispatch(Grow mayGrow)
 {
+    auto* mainContext = ScriptExecutionContext::getMainThreadScriptExecutionContext();
+    bool onMainThread = mainContext && mainContext->isContextThread();
     for (;;) {
         std::optional<ScriptExecutionContextIdentifier> thread;
         bool grows = false;
@@ -259,15 +274,27 @@ void Scheduler::dispatch()
             Locker locker { m_lock };
             if (m_queue.size() <= m_startingCount + m_woken.size())
                 return;
-            if (!m_idle.isEmpty()) {
-                thread = m_idle.takeLast();
-                m_woken.add(*thread);
+            // A thread that runs no goroutine, else a new thread, else a thread whose goroutines
+            // all wait: a goroutine that computes keeps its thread to itself.
+            auto unloaded = m_idle.reverseFindIf([&](auto thread) {
+                return !m_load.contains(thread);
+            });
+            if (unloaded != notFound) {
+                thread = m_idle[unloaded];
+                m_idle.removeAt(unloaded);
             } else {
-                grows = shouldGrow();
+                grows = mayGrow == Grow::Yes && shouldGrow(onMainThread);
+                // Off the main thread, a new thread waits for the main thread to create it, and the
+                // idle thread may be this one, about to block: ask both, the first to take runs it.
+                // The new thread is the one counted on, so what is queued next gets another.
+                if ((!grows || !onMainThread) && !m_idle.isEmpty())
+                    thread = m_idle.takeLast();
             }
+            if (thread && !grows)
+                m_woken.add(*thread);
         }
         if (grows)
-            grow();
+            grow(onMainThread);
         if (!thread)
             return;
         // What is queued stays queued until a thread takes it: a thread that is ending refuses the
@@ -284,18 +311,25 @@ std::optional<Task> Scheduler::take(ScriptExecutionContextIdentifier thread)
     Locker locker { m_lock };
     if (m_retired.contains(thread))
         return std::nullopt;
-    if (m_threads.add(thread).isNewEntry) {
+    bool isNew = m_threads.add(thread).isNewEntry;
+    if (isNew) {
         ASSERT(m_startingCount);
         m_startingCount--;
     }
     m_woken.remove(thread);
-    if (m_queue.isEmpty()) {
+    // What is queued for the threads that are starting is theirs. A started goroutine never moves,
+    // so a thread that took it all as the pool grows would run it while the new threads idle. (A
+    // woken thread gets no such claim: a thread that is running takes the next goroutine sooner.)
+    ASSERT(m_startingCount >= m_uncreatedCount);
+    size_t reserved = isNew ? 0 : m_startingCount - m_uncreatedCount;
+    if (m_queue.size() <= reserved) {
         if (!m_idle.contains(thread))
             m_idle.append(thread);
         return std::nullopt;
     }
     auto [task, spawner] = m_queue.takeFirst();
     m_running.add(task.id, Running { thread, spawner });
+    m_load.add(thread, 0).iterator->value++;
     return WTF::move(task);
 }
 
@@ -306,15 +340,22 @@ std::optional<Spawner> Scheduler::finish(uint64_t id)
     if (it == m_running.end())
         return std::nullopt;
     auto spawner = it->value.spawner;
+    auto load = m_load.find(it->value.thread);
+    if (--load->value == 0)
+        m_load.remove(load);
     m_running.remove(it);
     return spawner;
 }
 
 void Scheduler::threadFailedToStart()
 {
-    Locker locker { m_lock };
-    m_threadCount--;
-    m_startingCount--;
+    {
+        Locker locker { m_lock };
+        m_threadCount--;
+        m_startingCount--;
+    }
+    // Not grow: that would start (and fail to start) another thread from here.
+    dispatch(Grow::No);
 }
 
 void Scheduler::retireLocked(ScriptExecutionContextIdentifier thread, Vector<std::pair<uint64_t, Spawner>>& lost)
@@ -326,6 +367,7 @@ void Scheduler::retireLocked(ScriptExecutionContextIdentifier thread, Vector<std
         m_startingCount--;
     m_woken.remove(thread);
     m_idle.removeFirst(thread);
+    m_load.remove(thread);
     m_running.removeIf([&](auto& entry) {
         if (entry.value.thread != thread)
             return false;
@@ -360,17 +402,27 @@ void Scheduler::reset(const Vector<ScriptExecutionContextIdentifier>& threads)
         rejectAsThreadExited(id, spawner);
 }
 
-void Scheduler::grow()
+void Scheduler::grow(bool onMainThread)
 {
-    if (auto* context = ScriptExecutionContext::getMainThreadScriptExecutionContext(); context && context->isContextThread()) {
-        startPoolThread(*context);
+    if (onMainThread) {
+        startPoolThread(*ScriptExecutionContext::getMainThreadScriptExecutionContext());
         return;
     }
     bool posted = ScriptExecutionContext::postTaskTo(mainThreadContext, BunLoopKind::Regular, [](ScriptExecutionContext& context) {
+        scheduler().willCreateThread();
         startPoolThread(context);
     });
-    if (!posted)
+    if (!posted) {
+        willCreateThread();
         threadFailedToStart();
+    }
+}
+
+void Scheduler::willCreateThread()
+{
+    Locker locker { m_lock };
+    ASSERT(m_uncreatedCount);
+    m_uncreatedCount--;
 }
 
 JSObject* spawnExports(Zig::GlobalObject* globalObject)

@@ -175,6 +175,16 @@ impl Waiter {
             case,
             result,
         }));
+        if self.vm.is_current() {
+            let vm = VirtualMachine::get();
+            if vm.current_loop_kind() == self.loop_kind {
+                // Its own thread, which runs that loop. After a yield, as for a post from another
+                // thread: channel traffic on one thread must not keep timers and I/O waiting.
+                vm.event_loop_mut()
+                    .enqueue_task_after_yield(Task::init(wake));
+                return;
+            }
+        }
         let task = ConcurrentTask::create(Task::init(wake));
         if let Posted::Refused(task) = self.vm.post(self.loop_kind, task) {
             // The VM is gone, and the operation with it.
@@ -339,11 +349,16 @@ pub(super) fn closed_error(global: &JSGlobalObject) -> JSValue {
         .to_js()
 }
 
+unsafe extern "C" {
+    safe fn Bun__Channel__iteratorResult(
+        global: &JSGlobalObject,
+        value: JSValue,
+        done: bool,
+    ) -> JSValue;
+}
+
 fn iterator_result(global: &JSGlobalObject, value: JSValue, done: bool) -> JSValue {
-    let result = JSValue::create_empty_object(global, 2);
-    result.put(global, "value", value);
-    result.put(global, "done", JSValue::js_boolean(done));
-    result
+    Bun__Channel__iteratorResult(global, value, done)
 }
 
 /// What `Bun.select` resolves to. `index` is `-1` for `default`.

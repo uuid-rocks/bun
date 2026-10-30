@@ -418,6 +418,96 @@ describe.concurrent("Bun.Channel process", () => {
     });
   });
 
+  // A wake for a waiter on the thread that fires it goes straight to that thread's task queue, with
+  // no wakeup: whatever runs the send (a timer, I/O, a microtask, a finalizer), the loop runs it
+  // before it next polls.
+  test("operations on one thread wake each other from any callback", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const timer = new Bun.Channel();
+         setTimeout(() => timer.send("timer"), 1);
+         console.log(await timer.receive());
+
+         const microtask = new Bun.Channel();
+         queueMicrotask(() => microtask.send("microtask"));
+         console.log(await microtask.receive());
+
+         const io = new Bun.Channel();
+         using server = Bun.serve({ port: 0, fetch: async () => (await io.send("io"), new Response("ok")) });
+         const response = fetch(server.url);
+         console.log(await io.receive(), await (await response).text());
+
+         const selected = new Bun.Channel();
+         setTimeout(() => Bun.select([[selected, "select"]]), 1);
+         console.log((await Bun.select([selected])).value);
+
+         const closed = new Bun.Channel();
+         setTimeout(() => closed.close(), 1);
+         for await (const _ of closed);
+         console.log("closed");
+
+         const finalized = new Bun.Channel();
+         const registry = new FinalizationRegistry(() => finalized.send("finalizer"));
+         (() => registry.register({}, 0))();
+         const received = finalized.receive();
+         const interval = setInterval(() => Bun.gc(true), 1);
+         console.log(await received);
+         clearInterval(interval);
+
+         const iterator = closed[Symbol.asyncIterator]();
+         const pending = new Bun.Channel(1);
+         await pending.send(1);
+         const next = await pending[Symbol.asyncIterator]().next();
+         console.log(JSON.stringify([next, Object.keys(next), await iterator.next()]));`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout:
+        [
+          "timer",
+          "microtask",
+          "io ok",
+          "select",
+          "closed",
+          "finalizer",
+          '[{"value":1,"done":false},["value","done"],{"done":true}]',
+        ].join("\n") + "\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test("traffic on one thread does not keep timers from running", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const channel = new Bun.Channel();
+         let fired = false;
+         setTimeout(() => (fired = true), 1);
+         let sent = 0;
+         const sender = (async () => {
+           while (!fired && sent < 100_000) await channel.send(sent++);
+           channel.close();
+         })();
+         for await (const _ of channel);
+         await sender;
+         console.log(fired ? "timer fired" : "timer starved");`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: "timer fired\n", stderr: "", exitCode: 0 });
+  });
+
   test("channels, messages and waiters are freed", async () => {
     await using proc = Bun.spawn({
       cmd: [

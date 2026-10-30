@@ -14,6 +14,7 @@
 #include "ScriptExecutionContext.h"
 #include "SerializedScriptValue.h"
 #include "ZigGlobalObject.h"
+#include <JavaScriptCore/IteratorOperations.h>
 
 using namespace JSC;
 using namespace WebCore;
@@ -67,4 +68,10 @@ extern "C" EncodedJSValue Bun__ChannelMessage__deserialize(JSGlobalObject* globa
 extern "C" void Bun__ChannelMessage__destroy(MessageWithMessagePorts* message)
 {
     delete message;
+}
+
+// `{ value, done }` of a channel's async iterator, with the structure JSC's iterators use.
+extern "C" EncodedJSValue Bun__Channel__iteratorResult(JSGlobalObject* globalObject, EncodedJSValue value, bool done)
+{
+    return JSValue::encode(JSC::createIteratorResultObject(globalObject, JSValue::decode(value), done));
 }

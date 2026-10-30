@@ -1,0 +1,306 @@
+---
+title: Concurrency
+description: Run JavaScript on every core with goroutines, channels and select
+---
+
+Bun runs JavaScript on more than one thread at a time. `Bun.go()` starts a function on another thread, `Bun.Channel` passes values between threads, and `Bun.select()` waits on several channels at once. They work the way Go's `go` statement, channels and `select` do.
+
+```ts main.ts icon="/icons/typescript.svg"
+const results = new Bun.Channel<number>();
+
+for (let i = 1; i <= 4; i++) {
+  Bun.go(
+    async (n: number, out: Bun.Channel<number>) => {
+      let sum = 0;
+      for (let k = 0; k < 50_000_000; k++) sum += k % n;
+      await out.send(sum);
+    },
+    i,
+    results,
+  );
+}
+
+for (let i = 0; i < 4; i++) console.log(await results.receive());
+```
+
+The four functions run at the same time, each on its own thread, while the main thread waits for their results on the channel. A function that `Bun.go()` runs is a _goroutine_.
+
+This page shows how the pieces fit together. [Goroutines](/runtime/goroutines) and [Channels](/runtime/channels) describe each API in full.
+
+---
+
+## Goroutines
+
+`Bun.go(fn, ...args)` runs `fn(...args)` on a pool of threads and returns a `Goroutine`: a promise for what `fn` returns.
+
+```ts
+const count = await Bun.go((text: string) => text.split(/\s+/).length, "one two three");
+console.log(count); // => 3
+```
+
+The function runs on another thread, which has its own globals and none of the variables around the function. So a goroutine's function uses only its parameters, what it declares, and globals such as `Bun` and `fetch`. Pass everything else as arguments. Arguments and results are copied the way `postMessage()` copies them. To use a module, import it inside the function, or pass a function that a module exports:
+
+```ts
+const hash = await Bun.go(async (text: string) => {
+  const { createHash } = await import("node:crypto");
+  return createHash("sha256").update(text).digest("hex");
+}, "hello");
+```
+
+The pool has as many threads as the machine has cores. Thousands of goroutines can share it: while a goroutine awaits, its thread runs others.
+
+---
+
+## Channels
+
+A channel carries values from goroutines that send to goroutines that receive, in order. Every thread that has the channel uses the same one.
+
+```ts
+const jobs = new Bun.Channel<string>(10); // holds up to 10 values
+
+await jobs.send("a"); // waits while the channel is full
+const job = await jobs.receive(); // waits while the channel is empty
+jobs.close(); // receivers get what is left, then stop
+```
+
+`for await` receives until the channel is closed, which makes the common shape of a concurrent program short: a producer, a few workers, and a collector.
+
+```ts pipeline.ts icon="/icons/typescript.svg"
+const urls = new Bun.Channel<string>(16);
+const sizes = new Bun.Channel<number>(16);
+
+// Workers: fetch each URL and send on its size.
+const workers = Array.from({ length: 8 }, () =>
+  Bun.go(
+    async (urls: Bun.Channel<string>, sizes: Bun.Channel<number>) => {
+      for await (const url of urls) {
+        const body = await (await fetch(url)).arrayBuffer();
+        await sizes.send(body.byteLength);
+      }
+    },
+    urls,
+    sizes,
+  ),
+);
+// No more sizes once every worker is done.
+Promise.allSettled(workers).then(() => sizes.close());
+
+// Producer.
+(async () => {
+  for (let page = 1; page <= 100; page++) await urls.send(`http://localhost:3000/page/${page}`);
+  urls.close();
+})();
+
+// Collector.
+let total = 0;
+for await (const size of sizes) total += size;
+console.log(total);
+```
+
+A channel with a capacity, like `new Bun.Channel(16)`, makes a fast producer wait for slow workers, so the program never holds more than a few values in memory.
+
+---
+
+## Waiting on several channels with `select`
+
+`Bun.select()` waits until one of several channel operations can happen, then does exactly that one. A case is a channel to receive from, or `[channel, value]` to send `value`.
+
+```ts
+const result = await Bun.select([jobs, quit]);
+if (result.index === 0) console.log("job:", result.value);
+else console.log("quit");
+```
+
+A closed `quit` channel tells any number of goroutines to stop, because a closed channel is always ready to receive from. Here a producer stops as soon as `quit` closes, even while it waits for room in `jobs`:
+
+```ts
+async function produce(jobs: Bun.Channel<number>, quit: Bun.Channel<never>) {
+  for (let i = 0; ; i++) {
+    const { index } = await Bun.select([[jobs, i], quit]);
+    if (index === 1) return; // quit closed
+  }
+}
+```
+
+With `{ default: true }`, `select()` doesn't wait: it resolves `{ index: -1 }` when no case is ready. With `{ signal }`, it stops waiting when the signal aborts, so `AbortSignal.timeout()` is a timeout:
+
+```ts
+try {
+  const { value } = await Bun.select([results], { signal: AbortSignal.timeout(1000) });
+} catch (error) {
+  console.log(error.name); // => "TimeoutError"
+}
+```
+
+---
+
+## Cancelling
+
+An `AbortSignal` is the `context.Context` of Bun's goroutines. Pass a signal to `Bun.go()` or send it on a channel, and it arrives as a signal that aborts when the original does. It cancels `fetch()`, channel operations and `select()` in the goroutine, like it does on the main thread.
+
+```ts
+const controller = new AbortController();
+
+const crawler = Bun.go(async (signal: AbortSignal) => {
+  const pages = [];
+  for (let page = 1; !signal.aborted; page++) {
+    pages.push(await (await fetch(`http://localhost:3000/page/${page}`, { signal })).text());
+  }
+  return pages.length;
+}, controller.signal);
+
+setTimeout(() => controller.abort(), 100);
+await crawler.catch(() => {}); // fetch() rejects with an AbortError
+```
+
+Nothing stops a goroutine that computes without awaiting. Check `signal.aborted` in long loops, as the worker in `examples/concurrency/pipeline.ts` does.
+
+---
+
+## Waiting for goroutines, and errors
+
+A goroutine is a promise, so the tools for promises are the tools for goroutines:
+
+- `await Promise.all(goroutines)` waits for all of them, like a `sync.WaitGroup`, and rejects with the first error.
+- `await Promise.allSettled(goroutines)` waits for all of them, even when some fail.
+
+If a goroutine's function throws, the goroutine rejects with a copy of the error, with its name, message, stack, `cause` and `code`. A goroutine that rejects when nothing handles it is an unhandled rejection, which ends the process by default, as a panic does in Go.
+
+For Go's `errgroup`, where the first error cancels the others, give every goroutine one signal and abort it on the first error:
+
+```ts
+const controller = new AbortController();
+const goroutines = pages.map(page =>
+  Bun.go(
+    async (page: number, signal: AbortSignal) => {
+      const response = await fetch(`http://localhost:3000/page/${page}`, { signal });
+      if (!response.ok) throw new Error(`page ${page}: ${response.status}`);
+      return response.text();
+    },
+    page,
+    controller.signal,
+  ),
+);
+for (const goroutine of goroutines) goroutine.catch(error => controller.abort(error));
+const texts = await Promise.all(goroutines); // rejects with the first error
+```
+
+---
+
+## Sharing memory
+
+Values sent between goroutines are copies, so goroutines share nothing unless you share it:
+
+- A `SharedArrayBuffer` passed to a goroutine or sent on a channel is the same memory on both threads. Use [`Atomics`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Atomics) to read and write it safely.
+- A `Bun.Channel` passed to a goroutine is the same channel.
+
+```ts
+const counter = new Int32Array(new SharedArrayBuffer(4));
+
+await Promise.all(
+  Array.from({ length: 8 }, () =>
+    Bun.go((counter: Int32Array) => {
+      for (let i = 0; i < 1000; i++) Atomics.add(counter, 0, 1);
+    }, counter),
+  ),
+);
+console.log(counter[0]); // => 8000
+```
+
+A channel with a capacity of 1 is a lock, as in Go: `send()` takes it, waiting while another goroutine has it, and `receive()` releases it. Use it for work that must not overlap, such as several writes to a shared buffer or one file:
+
+```ts
+const lock = new Bun.Channel<void>(1);
+
+async function withLock<T>(lock: Bun.Channel<void>, fn: () => Promise<T>): Promise<T> {
+  await lock.send(); // wait for the lock
+  try {
+    return await fn();
+  } finally {
+    await lock.receive(); // release it
+  }
+}
+```
+
+---
+
+## Executables
+
+`bun build --compile` bundles a program into one executable, and goroutines work in it as they do with `bun run`. The build finds the modules whose functions you pass to `Bun.go()`, as in `Bun.go(countPrimes)` after `import { countPrimes } from "./primes.ts"`, and puts them in the executable.
+
+```sh terminal icon="terminal"
+bun build --compile ./main.ts --outfile app
+```
+
+A goroutine written in place runs from its source, so in a bundle it must not `await import()` a module of the bundle: the build rewrites that import into code of the bundle around the function. Import the function from the module and pass it to `Bun.go()` instead. [Bundles and executables](/runtime/goroutines#bundles-and-executables) has the details.
+
+---
+
+## Limits
+
+- **No preemption.** A goroutine runs until it awaits. One that computes for a second keeps its thread for a second, and the goroutines that share the thread wait. Split long work into smaller goroutines, or `await` now and then.
+- **Copies, not references.** Arguments, results and channel values are [structured clones](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm), also on one thread. Functions can't be sent, and a class instance arrives as a plain object. Share memory with a `SharedArrayBuffer`.
+- **Module state belongs to a thread.** A module that goroutines import runs once on each pool thread, so its top-level variables are per thread, like thread-local storage.
+- **A goroutine stays on the thread that starts it.** While the pool has room, Bun starts each goroutine on a thread that runs no other, so goroutines that compute run in parallel. Goroutines that only pass small values to each other pay for a wakeup between threads on every value; with less to compute than to send, fewer goroutines are faster.
+- **`Atomics.wait()` blocks the whole thread,** including the other goroutines on it. Wait on a channel instead when the goroutine that would wake you may share your thread.
+- **The pool doesn't keep the process alive.** A goroutine keeps alive the thread that started it until it settles, unless you call `unref()` on it. A waiting channel operation keeps nothing alive.
+
+---
+
+## From Go to Bun
+
+| Go                                       | Bun                                                                 |
+| ---------------------------------------- | ------------------------------------------------------------------- |
+| `go f(x)`                                | `Bun.go(f, x)`                                                      |
+| `go func() { ... }()`                    | `Bun.go(() => { ... })`                                             |
+| `make(chan T)`                           | `new Bun.Channel<T>()`                                              |
+| `make(chan T, n)`                        | `new Bun.Channel<T>(n)`                                             |
+| `ch <- v`                                | `await ch.send(v)`                                                  |
+| `v := <-ch`                              | `const v = await ch.receive()`                                      |
+| `v, ok := <-ch`                          | `const { value, closed } = await Bun.select([ch])`                  |
+| `for v := range ch`                      | `for await (const v of ch)`                                         |
+| `close(ch)`, `defer close(ch)`           | `ch.close()`, `using ch = new Bun.Channel()`                        |
+| `select { case v := <-a: case b <- x: }` | `await Bun.select([a, [b, x]])`                                     |
+| `select { ... default: }`                | `await Bun.select([...], { default: true })`                        |
+| `case <-time.After(d):`                  | `Bun.select([...], { signal: AbortSignal.timeout(ms) })`            |
+| `sync.WaitGroup`                         | `await Promise.all(goroutines)`                                     |
+| `errgroup.Group`                         | `Promise.all()` and an `AbortController` aborted on the first error |
+| `context.Context`, `ctx.Done()`          | `AbortSignal`, `signal.aborted` or the signal's `abort` event       |
+| `sync.Mutex`                             | `new Bun.Channel<void>(1)`: `send()` to lock, `receive()` to unlock |
+| `sync/atomic`                            | `Atomics` on a `SharedArrayBuffer`                                  |
+| `GOMAXPROCS`                             | `GOMAXPROCS` (the environment variable)                             |
+| `panic` in a goroutine                   | an unhandled rejection of the goroutine                             |
+
+---
+
+## Example app and benchmarks
+
+The `examples/concurrency` directory of the Bun repository has two programs to run:
+
+- `pipeline.ts` counts the primes below 20 million with a producer, a goroutine per core and a collector, then with the same function on the main thread, and prints both times. `--timeout <ms>` stops it with an `AbortSignal`.
+- `server.ts` is a `Bun.serve()` server that counts primes on goroutines. `--demo` sends it requests and measures how long a `/ping` takes meanwhile, with the work on goroutines and on the main thread.
+
+```sh terminal icon="terminal"
+bun examples/concurrency/pipeline.ts
+```
+
+```txt
+Counting the primes below 20,000,000, in 200 ranges of 100,000:
+  16 goroutines       152 ms   1,270,607 primes
+  main thread       1,469 ms   1,270,607 primes
+  9.7x as fast on 16 goroutines
+```
+
+`bench/concurrency` measures what goroutines and channels cost. On a 16-core aarch64 Linux machine, with a release build:
+
+| Benchmark                                                 |                 Result |
+| --------------------------------------------------------- | ---------------------: |
+| Start a goroutine and await its result, warm              |                   3 µs |
+| Goroutines started and finished per second                |                440,000 |
+| Memory of a pool thread                                   |                 4.8 MB |
+| Memory of a waiting goroutine                             |                 3.2 KB |
+| Small values through a channel, same thread               |               6.1M / s |
+| Small values through a channel, between threads           |               3.2M / s |
+| `pipeline.ts` on 2, 4, 8 and 16 goroutines vs main thread | 2.0×, 3.6×, 7.2×, 9.5× |
+
+Run them with `bun bench/concurrency/run.ts`.
