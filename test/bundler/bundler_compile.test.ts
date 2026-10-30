@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, renameSync, rmSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "fs";
 import { bunEnv, bunExe, isWindows, tempDir } from "harness";
 import { join } from "path";
 import { BundlerTestInput, itBundled as itBundledBase } from "./expectBundled";
@@ -1578,15 +1578,20 @@ describe("Bun.go", () => {
       import { work } from "./tasks/cjs.cjs";
       import { urlLabel } from "./label.ts";
       import { go, go as spawn, WaitGroup } from "bun";
-      // A WaitGroup's go() is a method of any name: the build keeps the function, and tells Bun.go its URL.
+      // A WaitGroup the build can't see is a method of any name: it keeps the function, and tells Bun.go its URL.
       async function inGroup(group: Bun.WaitGroup) {
-        return [await group.go(mul, 2, 5), await group.go(new URL("./tasks/url-task.ts", import.meta.url), 9)];
+        return [await group.go(mul, 2, 5)];
       }
       async function grouped() {
         await using group = new Bun.WaitGroup({ limit: 1 });
-        const results = [await group.go(add, 1, 2), await group.go(text.shout, "wg"), ...(await inGroup(group))];
+        const results = [
+          await group.go(add, 1, 2),
+          await group.go(text.shout, "wg"),
+          ...(await inGroup(group)),
+          await group.go(new URL("./tasks/url-task.ts", import.meta.url), 9),
+        ];
         let named = new WaitGroup();
-        results.push(await named.go(twice, 4));
+        results.push(await named.go(twice, 4), await named.go(new URL("tasks/math.ts#mul", import.meta.url), 3, 3));
         await named.wait();
         return results;
       }
@@ -1633,7 +1638,7 @@ describe("Bun.go", () => {
     // Shares the bundle's top-level scope with the calls the build writes.
     "src/label.ts": `const URL = "shadowed"; export const urlLabel = URL;`,
   };
-  const goStdout = `[{"sum":1,"isMainThread":false},"GO!",[{"sum":3,"isMainThread":false},"WG!",10,10,8],true,{"sum":5,"isMainThread":false},{"sum":2,"isMainThread":false},"HI!",-5,42,5,42,"mjs","package mjs",77,{"inline":15}] math shadowed\n`;
+  const goStdout = `[{"sum":1,"isMainThread":false},"GO!",[{"sum":3,"isMainThread":false},"WG!",10,10,8,9],true,{"sum":5,"isMainThread":false},{"sum":2,"isMainThread":false},"HI!",-5,42,5,42,"mjs","package mjs",77,{"inline":15}] math shadowed\n`;
 
   async function run(cmd: string[], cwd: string) {
     await using proc = Bun.spawn({ cmd, env: bunEnv, cwd, stdout: "pipe", stderr: "pipe" });
@@ -1692,6 +1697,32 @@ describe("Bun.go", () => {
       expect(exitCode).toBe(0);
     });
   }
+
+  test("a URL passed to a go() method that is not Bun's is left as written, whether or not it names a module", async () => {
+    using dir = tempDir("bun-go-other-method", {
+      "navigation.ts": `
+        const router = { go: (url: URL) => console.log(url.href.slice(url.href.lastIndexOf("/") + 1)) };
+        router.go(new URL("./settings", import.meta.url));
+        router.go(new URL("./tasks.ts#label", import.meta.url));
+      `,
+      "tasks.ts": `export const label = "tasks";`,
+    });
+    const root = String(dir);
+    const expected = "settings\ntasks.ts#label\n";
+    const bundle = await run([bunExe(), "build", "--target=bun", "navigation.ts", "--outdir", "out"], root);
+    expect(bundle.stderr).toBe("");
+    expect(bundle.exitCode).toBe(0);
+    expect(existsSync(join(root, "out", "tasks.js"))).toBe(false);
+    const bundled = await run([bunExe(), join(root, "out", "navigation.js")], root);
+    expect(bundled.stdout).toBe(expected);
+    expect(bundled.exitCode).toBe(0);
+    const compile = await run([bunExe(), "build", "--compile", "navigation.ts", "--outfile", join("bin", "app")], root);
+    expect(compile.stderr).toBe("");
+    expect(compile.exitCode).toBe(0);
+    const compiled = await run([join(root, "bin", "app")], root);
+    expect(compiled.stdout).toBe(expected);
+    expect(compiled.exitCode).toBe(0);
+  });
 
   test("bun build --compile: an entry point that exports its goroutine's function and guards its top-level code", async () => {
     using dir = tempDir("bun-go-compile-single-file", {

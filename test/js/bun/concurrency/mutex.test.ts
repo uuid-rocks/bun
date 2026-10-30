@@ -195,4 +195,16 @@ describe("Bun.Mutex", () => {
     (await waiting[1]).unlock();
     expect(Bun.inspect(mutex)).toBe("Mutex { locked: false, waiters: 0 }");
   });
+
+  test("a lock can't be sent to another thread, and the error says what to do", async () => {
+    const mutex = new Bun.Mutex();
+    using lock = mutex.tryLock()!;
+    expect(() => Bun.go((lock: unknown) => lock, lock)).toThrow(
+      "Bun.go() argument 1 is an object, which can't be sent to another thread. A lock belongs to the goroutine that took it: pass the Mutex and lock it there.",
+    );
+    const channel = new Bun.Channel(1);
+    expect(await channel.send({ lock: await Promise.resolve(lock) }).catch(e => e.message)).toBe(
+      "channel.send(): value.lock is an object, which can't be sent to another thread. A lock belongs to the goroutine that took it: pass the Mutex and lock it there.",
+    );
+  });
 });

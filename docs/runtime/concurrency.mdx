@@ -159,7 +159,7 @@ while (true) {
 }
 ```
 
-With `{ default: true }`, `select()` doesn't wait: it resolves `{ index: -1 }` when no case is ready. With `{ signal }`, the whole `select()` rejects with the signal's reason when it aborts.
+With `{ default: true }`, `select()` doesn't wait: it resolves `{ index: -1 }` when no case is ready. A `null` case is never ready, and keeps the others' indexes: set a finished channel to `null` to turn its case off. With `{ signal }`, the whole `select()` rejects with the signal's reason when it aborts.
 
 ---
 
@@ -324,6 +324,7 @@ A goroutine written in place runs from its source, so in a bundle it must not `a
 | `select { ... default: }`                      | `await Bun.select([...], { default: true })`                     |
 | `case <-time.After(d):`                        | `Bun.select([..., AbortSignal.timeout(ms)])`                     |
 | `case <-ctx.Done():`                           | `Bun.select([..., signal])`                                      |
+| `ch = nil` (a case that is never ready)        | `ch = null`, and `Bun.select([ch, ...])`                         |
 | `for v := range ch` until cancelled            | `for await (const v of ch.values({ signal }))`                   |
 | `sync.WaitGroup`, `wg.Go(f)`, `wg.Wait()`      | `const wg = new Bun.WaitGroup()`, `wg.go(f)`, `await wg.wait()`  |
 | `errgroup.WithContext(ctx)`                    | `await using g = new Bun.WaitGroup({ signal })`, pass `g.signal` |
@@ -368,4 +369,4 @@ Counting the primes below 20,000,000, in 200 ranges of 100,000:
 | Small values through a channel, between threads           |               3.2M / s |
 | `pipeline.ts` on 2, 4, 8 and 16 goroutines vs main thread | 2.0×, 3.6×, 7.2×, 9.5× |
 
-Run them with `bun bench/concurrency/run.ts`.
+Run them with `bun bench/concurrency/run.ts`. Each channel operation clones its value and settles a promise, so channels move millions of small values a second, not the tens of millions a Go channel does: send larger values, or batches, when that matters.

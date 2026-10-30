@@ -586,6 +586,15 @@ class WaitGroup {
   #onAbort = () => this.#next();
 
   constructor(options?: { signal?: AbortSignal; limit?: number }) {
+    try {
+      this.#signal = this.#init(options);
+    } catch (error) {
+      throw thrownBy(error, WaitGroup);
+    }
+    ownedByThisThread(this, kWaitGroupHint);
+  }
+
+  #init(options: { signal?: AbortSignal; limit?: number } | undefined) {
     let parent: AbortSignal | undefined;
     if (options !== undefined) {
       if (!$isObject(options)) throw $ERR_INVALID_ARG_TYPE("options", "object", options);
@@ -603,12 +612,27 @@ class WaitGroup {
       }
     }
     // AbortSignal.any() holds what it makes weakly: a long-lived parent does not keep this alive.
-    this.#signal = parent === undefined ? this.#controller.signal : AbortSignal.any([parent, this.#controller.signal]);
-    ownedByThisThread(this, kWaitGroupHint);
+    return parent === undefined ? this.#controller.signal : AbortSignal.any([parent, this.#controller.signal]);
   }
 
   get signal() {
     return this.#signal;
+  }
+
+  get [Symbol.toStringTag]() {
+    return "WaitGroup";
+  }
+
+  // `console.log(group)` shows its state, as for a channel.
+  [Symbol.for("nodejs.util.inspect.custom")](depth: number, options: { stylize(text: string, style: string): string }) {
+    if (depth < 0) return options.stylize("[WaitGroup]", "special");
+    const { inspect } = require("node:util");
+    const fields = {
+      running: this.#running.size - (this.#queue.length - this.#queueHead),
+      queued: this.#queue.length - this.#queueHead,
+      aborted: this.#signal.aborted,
+    };
+    return `WaitGroup ${inspect(fields, { ...options, depth: options.depth == null ? null : options.depth - 1 })}`;
   }
 
   go(fn: unknown, ...args: unknown[]) {

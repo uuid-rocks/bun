@@ -505,7 +505,8 @@ describe("Bun.select", () => {
       [ch, undefined, { code: "ERR_INVALID_ARG_TYPE" }],
       [new Set([ch]), undefined, { code: "ERR_INVALID_ARG_TYPE" }],
       [[1], undefined, { code: "ERR_INVALID_ARG_TYPE", message: expect.stringContaining('"cases[0]"') }],
-      [[ch, null], undefined, { code: "ERR_INVALID_ARG_TYPE", message: expect.stringContaining('"cases[1]"') }],
+      [[ch, 1], undefined, { code: "ERR_INVALID_ARG_TYPE", message: expect.stringContaining('"cases[1]"') }],
+      [[null, undefined], undefined, { code: "ERR_INVALID_ARG_VALUE" }],
       [[[ch]], undefined, { code: "ERR_INVALID_ARG_TYPE" }],
       [[[ch, 1, { transfer: [] }]], undefined, { code: "ERR_INVALID_ARG_TYPE" }],
       [[[{}, 1]], undefined, { code: "ERR_INVALID_ARG_TYPE" }],
@@ -528,6 +529,36 @@ describe("Bun.select", () => {
     }
     // Nothing happened on the channel.
     expect(ch.length).toBe(0);
+    expect(channelQueueLengths(ch)).toEqual(empty);
+  });
+
+  test("null and undefined are cases that are never ready, and keep the indexes of the others", async () => {
+    const ch = new Bun.Channel<number>(1);
+    await ch.send(7);
+    expect(await Bun.select([null, undefined, ch])).toEqual({ index: 2, value: 7, closed: false });
+    expect(await Bun.select([undefined, AbortSignal.abort("stop")])).toEqual({
+      index: 1,
+      value: "stop",
+      closed: false,
+    });
+    expect(await Bun.select([null, ch], { default: true })).toEqual({ index: -1, value: undefined, closed: false });
+    expect(await Bun.select([null], { default: true })).toEqual({ index: -1, value: undefined, closed: false });
+    await expect(Bun.select([null], { signal: AbortSignal.abort("gave up") })).rejects.toBe("gave up");
+    // A merge loop turns off the channels that closed.
+    const a = new Bun.Channel<number>(2);
+    const b = new Bun.Channel<number>(2);
+    await a.send(1);
+    await b.send(2);
+    a.close();
+    b.close();
+    let cases: (Bun.Channel<number> | null)[] = [a, b];
+    const got: number[] = [];
+    while (cases.some(c => c !== null)) {
+      const result = await Bun.select(cases);
+      if (result.closed) cases[result.index] = null;
+      else got.push(result.value);
+    }
+    expect(got.sort()).toEqual([1, 2]);
     expect(channelQueueLengths(ch)).toEqual(empty);
   });
 
@@ -608,7 +639,7 @@ describe("Bun.select", () => {
 
   test("a case that is neither a channel, a send nor a signal names what it may be", async () => {
     expect(await Bun.select([1 as any]).catch(e => e.message)).toBe(
-      'The "cases[0]" argument must be a Bun.Channel to receive from, a [Bun.Channel, value] array to send on, or an AbortSignal',
+      'The "cases[0]" argument must be a Bun.Channel to receive from, a [Bun.Channel, value] array to send on, an AbortSignal, or null',
     );
   });
 });

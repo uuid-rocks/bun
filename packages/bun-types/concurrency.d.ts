@@ -188,13 +188,14 @@ declare module "bun" {
   type GoModule = string | URL;
 
   /**
-   * A case of {@link select}: a channel to receive from, `[channel, value]` to send `value` on it, or an
-   * `AbortSignal`, which is ready once it aborts (`AbortSignal.timeout(ms)` for Go's `time.After`, a cancellation
-   * signal for `ctx.Done()`).
+   * A case of {@link select}: a channel to receive from, `[channel, value]` to send `value` on it, an `AbortSignal`,
+   * which is ready once it aborts (`AbortSignal.timeout(ms)` for Go's `time.After`, a cancellation signal for
+   * `ctx.Done()`), or `null`/`undefined`, which is never ready (Go's nil channel): it turns a case off and keeps the
+   * indexes of the others.
    *
    * @category Concurrency
    */
-  type SelectCase = Channel<any> | readonly [Channel<any>, unknown] | AbortSignal;
+  type SelectCase = Channel<any> | readonly [Channel<any>, unknown] | AbortSignal | null | undefined;
 
   /** @category Concurrency */
   interface SelectOptions {

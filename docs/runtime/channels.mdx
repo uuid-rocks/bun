@@ -206,6 +206,22 @@ if (result.index === 0 && !result.closed) {
 }
 ```
 
+### Turning a case off
+
+`null` or `undefined` as a case is never ready, like a nil channel in Go. It keeps the indexes of the other cases, so a loop that merges several channels can turn one off when it closes:
+
+```ts
+let a: Bun.Channel<number> | null = first;
+let b: Bun.Channel<number> | null = second;
+while (a || b) {
+  const result = await Bun.select([a, b]);
+  if (result.closed) {
+    if (result.index === 0) a = null;
+    else b = null;
+  } else console.log(result.value);
+}
+```
+
 ### Not waiting
 
 With `default: true`, `select()` resolves at once with `index: -1` if no case is ready.
@@ -271,6 +287,8 @@ await channel.send(buffer, { transfer: [buffer] });
 console.log(buffer.byteLength); // => 0
 console.log((await channel.receive()).byteLength); // => 1024
 ```
+
+Each operation clones its value and settles a promise, so a channel moves a few million small values a second (3 to 6 million in `bench/concurrency`), far fewer than a Go channel. When values are small and many, send them in batches, such as arrays of a few hundred.
 
 A channel that holds a value containing a handle to itself is freed only once that value is received.
 

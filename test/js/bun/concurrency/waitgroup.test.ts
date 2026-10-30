@@ -41,7 +41,10 @@ describe("Bun.WaitGroup", () => {
       group.go(
         async (signal: AbortSignal, ended: SharedArrayBuffer, slot: number, started: Bun.Channel<void>) => {
           await started.send();
-          const wait = new Promise((_, reject) => signal.addEventListener("abort", () => reject(signal.reason)));
+          const wait = new Promise((_, reject) => {
+            if (signal.aborted) reject(signal.reason);
+            signal.addEventListener("abort", () => reject(signal.reason));
+          });
           try {
             await wait;
           } finally {
@@ -167,7 +170,8 @@ describe("Bun.WaitGroup", () => {
     const thrown = await (async () => {
       await using group = new Bun.WaitGroup();
       group.go(async (signal: AbortSignal) => {
-        await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+        // The scope ends at once: the signal can have aborted before the goroutine started.
+        if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
         throw new DOMException(signal.reason.message, signal.reason.name);
       }, group.signal);
     })().catch(e => e);
@@ -194,6 +198,31 @@ describe("Bun.WaitGroup", () => {
       "Bun.go() argument 1 is a Goroutine, which can't be sent to another thread. A goroutine belongs to the thread that started it: await it, and send its result.",
     );
     await goroutine;
+  });
+
+  test("an invalid option throws from the call to the constructor, not from Bun's own code", () => {
+    for (const options of [{ limit: 0 }, { signal: 1 }, 1]) {
+      let error: any;
+      try {
+        new Bun.WaitGroup(options as any);
+      } catch (e) {
+        error = e;
+      }
+      expect(error.stack.split("\n")[1]).toContain(import.meta.path);
+    }
+  });
+
+  test("Bun.inspect() shows what runs, what waits and whether it was cancelled", async () => {
+    const group = new Bun.WaitGroup({ limit: 1 });
+    expect(Object.prototype.toString.call(group)).toBe("[object WaitGroup]");
+    expect(Bun.inspect(group)).toBe("WaitGroup { running: 0, queued: 0, aborted: false }");
+    const gate = new Bun.Channel<void>(1);
+    group.go((gate: Bun.Channel<void>) => gate.receive(), gate);
+    group.go(() => 1);
+    expect(Bun.inspect(group)).toBe("WaitGroup { running: 1, queued: 1, aborted: false }");
+    await gate.send();
+    await group.wait();
+    expect(Bun.inspect({ group })).toBe("{\n  group: WaitGroup { running: 0, queued: 0, aborted: false },\n}");
   });
 
   describe("limit", () => {

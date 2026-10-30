@@ -56,6 +56,13 @@ type NumberReceived = { index: 0; value: number; closed: false } | { index: 0; v
   expectType(await Bun.select([ch], { default: maybe })).is<NumberReceived | Bun.SelectDefault>();
 }
 
+// null turns a case off: it is never the result.
+{
+  const off = await Bun.select([ch, null, strings]);
+  expectType(off.index).is<0 | 2>();
+  const maybe: Bun.Channel<number> | null = Math.random() > 0.5 ? ch : null;
+  expectType((await Bun.select([maybe, undefined])).index).is<0>();
+}
 // @ts-expect-error - the value must be a T of its channel
 Bun.select([[strings, 1]]);
 // A channel is invariant: a Channel<string> takes only strings, so it is not a Channel<unknown>.

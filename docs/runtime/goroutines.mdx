@@ -209,7 +209,7 @@ const pages = urls.map(url => group.go(fetchPage, url, group.signal)); // 4 fetc
 console.log(await Promise.all(pages));
 ```
 
-`go()` does not wait for a slot, so a loop that starts a million goroutines holds a million waiting ones: start them in batches, or from a channel, when there are that many. A waiting goroutine's arguments are cloned when it starts. `go()` still throws at once when a function can't run on another thread, or an argument can't be cloned. Once `group.signal` has aborted, a goroutine that waits rejects with `signal.reason` and never starts.
+`go()` does not wait for a slot, so a loop that starts a million goroutines holds a million waiting ones: start them in batches, or from a channel, when there are that many. A waiting goroutine's arguments are cloned when it starts. `go()` still throws at once when a function can't run on another thread, or an argument can't be cloned. Once `group.signal` has aborted, a goroutine that waits rejects with `signal.reason` and never starts: the error of the goroutine that failed, the caller's reason, or the group's disposal. So `error === group.signal.reason` tells a goroutine that was cancelled from one that failed.
 
 Goroutines that started other goroutines can wait for them too: a goroutine can call `Bun.go()`.
 
@@ -255,7 +255,7 @@ await Promise.all(
 console.log(balance[0]); // => 4000
 ```
 
-- `await mu.lock()` resolves with a lock once this thread holds the mutex. `using` unlocks it at the end of the scope, even when the scope throws; `lock.unlock()` unlocks it sooner. Only the first unlock does anything.
+- `await mu.lock()` resolves with a lock once this thread holds the mutex. `using` unlocks it at the end of the scope, even when the scope throws; `lock.unlock()` unlocks it sooner. Only the first unlock does anything: a second is not an error, as it is in Go.
 - Waiting for a lock does not block the thread: the thread runs other goroutines meanwhile. Waiters get the lock in the order they asked for it.
 - `mu.tryLock()` returns the lock if the mutex is free, or `undefined`. `using lock = mu.tryLock()` works either way.
 - `mu.lock({ signal })` stops waiting when the signal aborts, and rejects with its reason.
@@ -302,6 +302,8 @@ console.log(total); // => 338350
 ## Cancelling goroutines
 
 Pass an `AbortSignal` to a goroutine to tell it to stop. In the goroutine, the signal aborts when the original aborts, with a copy of its reason, so it works with `fetch()`, channel operations and `abort` listeners there. A goroutine stops only where its code checks the signal or passes it on: nothing interrupts code that computes. A loop that computes without awaiting can check `signal.aborted` or call `signal.throwIfAborted()`: these see the abort as soon as the original aborts, and fire the signal's `abort` listeners there and then.
+
+A goroutine can start with a signal that has already aborted, as after an `await using` scope that ends at once, or a parent that was cancelled. An `abort` listener added then never fires: check `signal.aborted`, or call `signal.throwIfAborted()`, before you listen.
 
 ```ts
 const controller = new AbortController();

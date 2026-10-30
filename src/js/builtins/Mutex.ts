@@ -10,7 +10,14 @@ export async function lock(this: Mutex, options?: { signal?: AbortSignal }) {
     held = false;
     mutex.$mutexUnlock();
   };
-  return { unlock, [Symbol.dispose]: unlock };
+  const lock = { unlock, [Symbol.dispose]: unlock };
+  // What a DataCloneError says to do instead (ChannelMessage.cpp).
+  $putByIdDirectPrivate(
+    lock,
+    "isUncloneable",
+    "a lock belongs to the goroutine that took it: pass the Mutex and lock it there",
+  );
+  return lock;
 }
 
 export function tryLock(this: Mutex) {
@@ -22,5 +29,12 @@ export function tryLock(this: Mutex) {
     held = false;
     mutex.$mutexUnlock();
   };
-  return { unlock, [Symbol.dispose]: unlock };
+  const lock = { unlock, [Symbol.dispose]: unlock };
+  // What a DataCloneError says to do instead (ChannelMessage.cpp).
+  $putByIdDirectPrivate(
+    lock,
+    "isUncloneable",
+    "a lock belongs to the goroutine that took it: pass the Mutex and lock it there",
+  );
+  return lock;
 }
