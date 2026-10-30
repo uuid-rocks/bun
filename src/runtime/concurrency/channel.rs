@@ -335,6 +335,11 @@ impl ChannelWake {
     pub(crate) fn run(this: *mut Self, global: &JSGlobalObject) -> JsResult<()> {
         // SAFETY: the dispatch hands over the boxed wake.
         let wake = unsafe { bun_core::heap::take(this) };
+        if !global.bun_vm().script_allowed() {
+            // The VM is ending: nothing would read a value. Its operation leaves the table when
+            // its context stops, and a value goes back to its channel.
+            return Ok(());
+        }
         match ops().remove(wake.op_id) {
             Some(mut op) => op.settle(global, wake.case, wake.result),
             None => Ok(()),

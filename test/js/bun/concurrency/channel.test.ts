@@ -416,6 +416,28 @@ describe("Bun.Channel", () => {
     expect(values).toEqual([1, 2, 3]);
   });
 
+  test("a value handed to a Worker that is terminated before it reads it is received once, elsewhere", async () => {
+    const ch = new Bun.Channel<string>();
+    const w = startWorker(
+      `self.onmessage = ({ data: { ch } }) => {
+        ch.receive().then(v => { throw new Error("the worker read " + v); });
+        postMessage("waiting");
+        // The value is handed to the receive above, and this thread never gets to read it.
+        for (;;) {}
+      };`,
+      { ch },
+    );
+    expect(await w.ready).toBe("waiting");
+    // Taken by the worker's receive at once: the send has happened.
+    await ch.send("handed");
+    w.worker.terminate();
+    await w.closed;
+    ch.close();
+    const values: string[] = [];
+    for await (const v of ch) values.push(v);
+    expect(values).toEqual(["handed"]);
+  });
+
   test("values({ signal }): an abort rejects the loop with the reason and leaves the channel open", async () => {
     const ch = new Bun.Channel<number>(4);
     await ch.send(1);
@@ -601,6 +623,113 @@ describe.concurrent("Bun.Channel process", () => {
     });
     const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
     expect({ stdout, stderr, exitCode }).toEqual({ stdout: "timer fired\n", stderr: "", exitCode: 0 });
+  });
+
+  // Each runs `body` in a process of its own, where `reclaimed()` waits for the channels that only
+  // unreachable channels hold to be freed and says how many channels are left beside the ones
+  // that existed when it started.
+  async function runReclaiming(body: string) {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+        import { channelLiveCount, collectChannels } from "bun:internal-for-testing";
+        const base = channelLiveCount();
+        async function reclaimed(threads = false) {
+          const deadline = Date.now() + 3_000;
+          while (Date.now() < deadline) {
+            Bun.gc(true);
+            // A pool thread lets go of its wrappers when it collects its own garbage. Goroutines
+            // started one at a time all run on the pool's one thread.
+            if (threads) await Bun.go(() => { Bun.gc(true); });
+            collectChannels();
+            if (channelLiveCount() === base) break;
+            await Bun.sleep(1);
+          }
+          return channelLiveCount() - base;
+        }
+        ${body}
+        `,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test("a channel sent into itself, and channels sent into each other, are freed", async () => {
+    const result = await runReclaiming(`
+      async function cycles() {
+        for (let i = 0; i < 200; i++) {
+          const ch = new Bun.Channel(1);
+          await ch.send({ ch, payload: new Uint8Array(1024) });
+          ch.close();
+        }
+        for (let i = 0; i < 100; i++) {
+          const a = new Bun.Channel(2), b = new Bun.Channel(2), c = new Bun.Channel(1);
+          // A ring of three, with a mutex and a channel that holds nothing hanging off it.
+          await a.send(b);
+          await b.send({ c, mutex: new Bun.Mutex(), leaf: new Bun.Channel() });
+          await c.send(a);
+          // A sender waiting on a full channel of the ring holds it until it is aborted.
+          const controller = new AbortController();
+          const waiting = a.send(a, { signal: controller.signal });
+          await a.send(a, { signal: AbortSignal.abort() }).catch(() => {});
+          controller.abort();
+          await waiting.catch(() => {});
+        }
+      }
+      await cycles();
+      console.log(await reclaimed());
+    `);
+    expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
+  });
+
+  test("a channel that only a reachable channel's queue holds keeps its values", async () => {
+    const result = await runReclaiming(`
+      const outer = new Bun.Channel(1);
+      async function fill() {
+        const inner = new Bun.Channel(3);
+        await inner.send("first");
+        // A reference to itself does not make it unreachable while outer holds it.
+        await inner.send({ self: inner });
+        await inner.send("last");
+        await outer.send(inner);
+      }
+      await fill();
+      for (let i = 0; i < 3; i++) {
+        Bun.gc(true);
+        collectChannels();
+      }
+      const inner = await outer.receive();
+      const values = [await inner.receive(), await inner.receive(), await inner.receive()];
+      console.log(values[0], values[1].self === inner ? "itself" : "another", values[2]);
+      await inner.send("still works");
+      console.log(await inner.receive());
+    `);
+    expect(result).toEqual({ stdout: "first another last\nstill works\n", stderr: "", exitCode: 0 });
+  });
+
+  test("a cycle made across threads is freed once no thread holds it", async () => {
+    const result = await runReclaiming(`
+      async function cycles() {
+        for (let i = 0; i < 5; i++) {
+          // The goroutine sends each channel into the other, and sends one back.
+          const a = await Bun.go(async (a, b) => {
+            await a.send(b);
+            await b.send(a);
+            return a;
+          }, new Bun.Channel(1), new Bun.Channel(1));
+          if (a.length !== 1) throw new Error("a holds b");
+        }
+      }
+      await cycles();
+      console.log(await reclaimed(true));
+    `);
+    expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   });
 
   test("channels, messages and waiters are freed", async () => {
