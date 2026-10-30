@@ -268,7 +268,7 @@ Bun.go(new URL("./primes.js#countPrimes", import.meta.url), 0, 5e5);
 
 So you can move the output and delete the sources. Each task module's output keeps its exports under their own names, with `--minify` too. An executable holds the task modules, so it runs from any directory.
 
-The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A function written in place still runs from its source. Any other function throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment. For a module named by a computed path, list the module as an entry point of the build, as for a [Worker](/runtime/workers):
+The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment. For a module named by a computed path, list the module as an entry point of the build, as for a [Worker](/runtime/workers):
 
 ```sh terminal icon="terminal"
 bun build --compile ./main.ts ./tasks/*.ts --outfile app
