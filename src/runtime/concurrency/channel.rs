@@ -35,7 +35,7 @@ use bun_jsc::{
 };
 use bun_threading::Guarded;
 
-use super::message::ChannelMessage;
+use super::message::{ChannelMessage, CloneSite};
 use super::ops::OpTable;
 use crate::node::util::validators;
 
@@ -553,7 +553,8 @@ impl Channel {
         if self.core.state.lock().closed {
             return Ok(JSPromise::rejected_promise(global, closed_error(global)).to_js());
         }
-        let message = ChannelMessage::create(global, value.to_js(), options.transfer)?;
+        let message =
+            ChannelMessage::create(global, value.to_js(), options.transfer, CloneSite::Send)?;
         // A getter the clone ran can have aborted it.
         if let Some(rejected) = options.rejected_if_aborted(global) {
             return Ok(rejected);

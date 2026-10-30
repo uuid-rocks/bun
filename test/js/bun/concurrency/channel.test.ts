@@ -200,6 +200,32 @@ describe("Bun.Channel", () => {
     await sent;
   });
 
+  test("a value that can't be cloned rejects with a DataCloneError that says what and where", async () => {
+    const channel = new Bun.Channel(1);
+    const messages: string[] = [];
+    for (const value of [{ cb() {} }, [1, { deep: Symbol("s") }], () => {}, new Map([["k", () => {}]])]) {
+      const error = await channel.send(value).catch(e => e);
+      expect(error).toBeInstanceOf(DOMException);
+      expect(error.name).toBe("DataCloneError");
+      messages.push(error.message);
+    }
+    expect(messages).toEqual([
+      "channel.send(): value.cb is a function, which can't be sent to another thread.",
+      "channel.send(): value[1].deep is a symbol, which can't be sent to another thread.",
+      "channel.send(): value is a function, which can't be sent to another thread.",
+      "channel.send(): value is a Map that holds something that can't be cloned, which can't be sent to another thread.",
+    ]);
+    expect(channel.length).toBe(0);
+  });
+
+  test("console.log shows a channel's state", async () => {
+    const channel = new Bun.Channel<number>(4);
+    await channel.send(1);
+    expect(Bun.inspect(channel)).toBe("Channel { capacity: 4, length: 1, closed: false }");
+    channel.close();
+    expect(Bun.inspect({ channel })).toBe("{\n  channel: Channel { capacity: 4, length: 1, closed: true },\n}");
+  });
+
   test("a structured clone is a handle to the same channel", async () => {
     const ch = new Bun.Channel<string>(1);
     const clone = structuredClone(ch);

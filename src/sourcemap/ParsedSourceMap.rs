@@ -238,6 +238,14 @@ impl ParsedSourceMap {
         !self.external_source_names.is_empty()
     }
 
+    /// The map is an `InternalSourceMap` blob and nothing else: no VM's source provider is behind
+    /// it, so a VM on another thread can use it too.
+    pub fn is_self_contained(&self) -> bool {
+        self.internal.is_some()
+            && !self.is_external()
+            && self.underlying_provider.provider().is_none()
+    }
+
     pub fn find_mapping(&self, line: Ordinal, column: Ordinal) -> Option<Mapping> {
         if let Some(ism) = &self.internal {
             return ism.find(line, column);

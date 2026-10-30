@@ -301,6 +301,116 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("an enumerable cause, an AggregateError's errors and a DOMException come back as they were", async () => {
+    const { stdout, exitCode } = await run({
+      "task.ts": `
+        export function enumerableCause() {
+          const error = new Error("outer");
+          (error as any).cause = Object.assign(new Error("inner"), { code: "E_INNER" });
+          throw error;
+        }
+        export function aggregate() {
+          throw new AggregateError(
+            [new TypeError("first"), Object.assign(new Error("second"), { code: "E_SECOND" }), "third"],
+            "all failed",
+            { cause: "why" },
+          );
+        }
+        export function domException() {
+          throw new DOMException("not there", "NotFoundError");
+        }
+      `,
+      "main.ts": `
+        import { enumerableCause, aggregate, domException } from "./task.ts";
+        await Bun.go(enumerableCause).catch(e => console.log(e.message, e.cause.message, e.cause.code, Object.keys(e)));
+        await Bun.go(aggregate).catch(e =>
+          console.log(
+            e instanceof AggregateError,
+            e.message,
+            e.cause,
+            e.errors.map(inner => (inner instanceof Error ? [inner.name, inner.message, inner.code].join(":") : inner)),
+          ),
+        );
+        await Bun.go(domException).catch(e => console.log(e instanceof DOMException, e.name, e.code, e.message));
+      `,
+    });
+    expect(stdout).toMatchInlineSnapshot(`
+      "outer inner E_INNER []
+      true all failed why [ "TypeError:first:", "Error:second:E_SECOND", "third" ]
+      true NotFoundError 8 not there"
+    `);
+    expect(exitCode).toBe(0);
+  });
+
+  test("a DataCloneError says which argument or which part of the result can't be cloned", async () => {
+    const { stdout, exitCode } = await run({
+      "task.ts": `
+        export function echo(...args: unknown[]) {
+          return args;
+        }
+        export function result() {
+          return { ok: 1, handler: { onDone() {} } };
+        }
+      `,
+      "main.ts": `
+        import { echo, result } from "./task.ts";
+        for (const args of [[() => {}], [1, { cb: function cb() {} }], [{ list: [1, new WeakMap()] }], [Symbol("s")]]) {
+          try {
+            Bun.go(echo, ...args);
+          } catch (e) {
+            console.log(e.name, e.message);
+          }
+        }
+        await Bun.go(result).catch(e => console.log(e.name, e.message));
+      `,
+    });
+    expect(stdout).toMatchInlineSnapshot(`
+      "DataCloneError Bun.go() argument 1 is a function, which can't be sent to another thread.
+      DataCloneError Bun.go() argument 2 has a function at .cb, which can't be sent to another thread.
+      DataCloneError Bun.go() argument 1 has a WeakMap at .list[1], which can't be sent to another thread.
+      DataCloneError Bun.go() argument 1 is a symbol, which can't be sent to another thread.
+      DataCloneError Bun.go(): the goroutine returned a function at .handler.onDone, which can't be sent to another thread."
+    `);
+    expect(exitCode).toBe(0);
+  });
+
+  // Each pool thread evaluates the entry point to run its export, and there it would wait for its own goroutines.
+  test("an entry point that waits on goroutines of its own exports fails at once instead of hanging", async () => {
+    const { stdout, exitCode } = await run({
+      "main.ts": `
+        function helper(x: number) {
+          return x * 2;
+        }
+        export function work(x: number) {
+          return helper(x);
+        }
+        // On a pool thread, Bun.go() throws here, and so the module does.
+        const results = await Promise.all([1, 2, 3, 4].map(x => Bun.go(work, x))).catch(e => e);
+        console.log(results.code);
+        console.log(results.message);
+      `,
+    });
+    expect(stdout).toMatchInlineSnapshot(`
+      "ERR_GOROUTINE_NOT_SENDABLE
+      Bun.go() can't run "work" here: it is exported by <dir>/main.ts, which this pool thread is still evaluating (a pool thread evaluates the module of each export it runs). The goroutine would wait for the module, and the module for the goroutine. Run that module's top-level code only on the main thread, inside if (import.meta.main) { ... }, or move "work" to a module of its own."
+    `);
+    expect(exitCode).toBe(0);
+  });
+
+  test("process.exit() in a goroutine exits the process with its code", async () => {
+    const { stdout, exitCode } = await run({
+      "main.ts": `
+        process.on("exit", code => console.log("exit", code));
+        // Its thread may be the one that exits: its rejection must not decide the exit code.
+        for (let i = 0; i < 4; i++) Bun.go(() => new Promise(() => {})).catch(() => {});
+        await Bun.go(() => process.exit(7));
+        console.log("the goroutine returned");
+      `,
+    });
+    expect(stdout).toBe("exit 7");
+    expect(exitCode).toBe(7);
+  });
+
   test("throws for what can't run on another thread", async () => {
     const { stdout, exitCode } = await run({
       "task.ts": `

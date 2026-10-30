@@ -366,6 +366,59 @@ unsafe extern "C" fn Bun__Go__resolveModule(
     path.is_some()
 }
 
+/// `Bun.go(fn)` with a function no module exports: the source map of `path`, the module it is
+/// written in, for the pool thread that compiles the function's text (`Bun__Go__adoptSourceMap`).
+/// Null if there is none that another thread can use.
+///
+/// # Safety
+/// `vm` is the calling thread's live VM.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn Bun__Go__retainSourceMap(
+    vm: *mut VirtualMachine,
+    path: &BunString,
+) -> *const bun_sourcemap::ParsedSourceMap {
+    let path = path.to_utf8();
+    // SAFETY: fn contract.
+    let mappings = unsafe { (*vm).source_mappings() };
+    match mappings.get(path.slice()) {
+        Some(map) if map.is_self_contained() => std::sync::Arc::into_raw(map),
+        _ => core::ptr::null(),
+    }
+}
+
+/// A pool thread: stack traces of code compiled from `path`'s text map with `map` (from
+/// `Bun__Go__retainSourceMap`, consumed), unless this thread has a map of its own for `path`.
+///
+/// # Safety
+/// `vm` is the calling thread's live VM; `map` is from `Bun__Go__retainSourceMap`.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn Bun__Go__adoptSourceMap(
+    vm: *mut VirtualMachine,
+    path: &BunString,
+    map: *const bun_sourcemap::ParsedSourceMap,
+) {
+    // SAFETY: fn contract: one strong ref, now ours.
+    let map = unsafe { std::sync::Arc::from_raw(map) };
+    let path = path.to_utf8();
+    // SAFETY: fn contract.
+    let mappings = unsafe { (*vm).source_mappings() };
+    if mappings.get(path.slice()).is_some() {
+        return;
+    }
+    let _ = mappings.put_value(
+        path.slice(),
+        crate::saved_source_map::Value::init(std::sync::Arc::into_raw(map)),
+    );
+}
+
+/// # Safety
+/// `map` is from `Bun__Go__retainSourceMap`, not adopted.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn Bun__Go__releaseSourceMap(map: *const bun_sourcemap::ParsedSourceMap) {
+    // SAFETY: fn contract.
+    drop(unsafe { std::sync::Arc::from_raw(map) });
+}
+
 impl Drop for WebWorker {
     fn drop(&mut self) {
         log!("[{}] destroy", self.execution_context_id);
@@ -1565,6 +1618,11 @@ impl WebWorker {
     pub fn stopped_by_parent(&self) -> bool {
         self.terminated_by_parent.load(Ordering::Relaxed)
             && !self.exit_called.load(Ordering::Relaxed)
+    }
+
+    /// A thread of the `Bun.go` pool.
+    pub fn is_goroutine_thread(&self) -> bool {
+        self.kind == WorkerKind::Goroutine
     }
 
     /// process.exit() inside the worker. Worker-thread only.

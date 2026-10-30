@@ -17,6 +17,11 @@ expectType(ch.close()).is<void>();
 for await (const n of ch) {
   expectType(n).is<number>();
 }
+const iterator = ch[Symbol.asyncIterator]();
+expectType(iterator).is<AsyncIterableIterator<number, undefined>>();
+for await (const n of iterator) {
+  expectType(n).is<number>();
+}
 {
   using scoped = new Bun.Channel<string>();
   expectType(scoped).is<Bun.Channel<string>>();

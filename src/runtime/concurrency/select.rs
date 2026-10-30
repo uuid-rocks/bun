@@ -18,7 +18,7 @@ use super::channel::{
     Channel, ChannelCore, Channels, OpKind, Options, Queued, ReceiveNow, SendNow, WakeResult,
     closed_error, new_waiter, ops, select_result, shuffle, wait,
 };
-use super::message::ChannelMessage;
+use super::message::{ChannelMessage, CloneSite};
 use crate::node::util::validators;
 
 struct Case {
@@ -190,7 +190,12 @@ fn read_case(global: &JSGlobalObject, case: JSValue, i: u32) -> JsResult<Case> {
         if let Some(channel) = case.get_index(global, 0)?.as_class_ref::<Channel>() {
             let channel = Arc::clone(channel.core());
             let value = case.get_index(global, 1)?;
-            let message = ChannelMessage::create(global, value, JSValue::UNDEFINED)?;
+            let message = ChannelMessage::create(
+                global,
+                value,
+                JSValue::UNDEFINED,
+                CloneSite::SelectSend(i),
+            )?;
             return Ok(Case {
                 channel,
                 send: Some(message),

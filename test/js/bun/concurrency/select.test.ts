@@ -487,6 +487,16 @@ describe("Bun.select", () => {
     expect(reads).toBe(2);
   });
 
+  test("a send value that can't be cloned rejects with a DataCloneError that names its case", async () => {
+    const a = new Bun.Channel(1);
+    const b = new Bun.Channel(1);
+    const error = await Bun.select([a, [b, 1], [a, { onMessage() {} }]]).catch(e => e);
+    expect(error.name).toBe("DataCloneError");
+    expect(error.message).toBe(
+      "Bun.select(): cases[2][1].onMessage is a function, which can't be sent to another thread.",
+    );
+  });
+
   test("invalid inputs reject", async () => {
     const ch = new Bun.Channel<number>(1);
     expect(Bun.select.length).toBe(1);
