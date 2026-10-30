@@ -240,7 +240,12 @@ describe("Bun.Mutex", () => {
     // Hands the lock to the waiter, then its signal aborts before the handoff arrives.
     barged.unlock();
     controller.abort(new Error("gave up"));
-    expect(await waiting.then(() => "locked", error => (error as Error).message)).toBe("gave up");
+    expect(
+      await waiting.then(
+        () => "locked",
+        error => (error as Error).message,
+      ),
+    ).toBe("gave up");
     expect(mutexWaiters(mu)).toBe(0);
     using free = mu.tryLock();
     expect(free).toBeDefined();

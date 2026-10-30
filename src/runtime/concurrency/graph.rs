@@ -48,9 +48,29 @@ static BACKLOG: AtomicUsize = AtomicUsize::new(0);
 /// Candidates one collection takes at most.
 const BATCH: usize = 1024;
 /// Channels one collection locks at most. Leaving out what lies beyond keeps it correct (their
-/// edges count as roots), and bounds how long it holds the locks; a cycle of more channels than
-/// this is not reclaimed.
+/// edges count as roots), and bounds how long it holds the locks. A batch that reached more is
+/// tried again later without the limit ([`LARGE`]).
 const REACH: usize = 256 * BATCH;
+/// [`REACH`], but for `bun:internal-for-testing`.
+static REACH_LIMIT: AtomicUsize = AtomicUsize::new(REACH);
+
+/// Candidates of batches that reached more than the limit: a component of channels too large for
+/// one collection, which a collection without the limit tries now and then, less often each time
+/// it finds it alive.
+struct Large {
+    candidates: Vec<Weak<ChannelCore>>,
+    due: Option<Instant>,
+    backoff: Duration,
+}
+
+const LARGE_FIRST: Duration = Duration::from_secs(1);
+const LARGE_MOST: Duration = Duration::from_secs(64);
+
+static LARGE: Guarded<Large> = Guarded::new(Large {
+    candidates: Vec::new(),
+    due: None,
+    backoff: LARGE_FIRST,
+});
 /// Candidates waiting past which a thread that makes a channel collects a batch first, if no
 /// collection runs, and past which it waits for one to.
 const ASSIST_AT: usize = 4 * BATCH;
@@ -189,7 +209,15 @@ fn run() {
         {
             let mut started = STARTED.lock();
             while !WANTED.load(Ordering::Acquire) {
-                WAKE.wait_guarded(&mut started);
+                let due = LARGE.lock().due;
+                match due.map(|due| due.saturating_duration_since(Instant::now())) {
+                    Some(Duration::ZERO) => break,
+                    Some(wait) => {
+                        let wait = u64::try_from(wait.as_nanos()).unwrap_or(u64::MAX);
+                        let _ = WAKE.timed_wait_guarded(&mut started, wait);
+                    }
+                    None => WAKE.wait_guarded(&mut started),
+                }
             }
         }
         let wait = idle_since
@@ -199,8 +227,59 @@ fn run() {
         std::thread::sleep(wait);
         // What is asked for from here on, this collection may miss: it runs another.
         WANTED.store(false, Ordering::Release);
-        idle_since = (collect_all() == 0).then(Instant::now);
+        let found = collect_all() + collect_large(false);
+        idle_since = (found == 0).then(Instant::now);
     }
+}
+
+/// Collects the components too large for one collection, if it is time to (or `now`). Returns how
+/// many channels it reclaimed.
+pub(super) fn collect_large(now: bool) -> usize {
+    let candidates = {
+        let mut large = LARGE.lock();
+        if large.candidates.is_empty()
+            || !(now || large.due.is_some_and(|due| due <= Instant::now()))
+        {
+            return 0;
+        }
+        large.due = None;
+        core::mem::take(&mut large.candidates)
+    };
+    let _collecting = Collecting::lock();
+    let (reclaimed, _) = collect_batch(candidates.clone(), &mut Seen::default(), usize::MAX);
+    let mut large = LARGE.lock();
+    if reclaimed == 0 {
+        // Alive: try again, later.
+        large.candidates.extend(
+            candidates
+                .into_iter()
+                .filter(|candidate| candidate.strong_count() > 0),
+        );
+        large.backoff = (large.backoff * 2).min(LARGE_MOST);
+    } else {
+        // What is left alive comes back as candidates when it is released.
+        large.backoff = LARGE_FIRST;
+    }
+    if !large.candidates.is_empty() && large.due.is_none() {
+        large.due = Some(Instant::now() + large.backoff);
+    }
+    reclaimed
+}
+
+/// `batch` reached more channels than one collection locks.
+fn note_large(batch: Vec<Weak<ChannelCore>>) {
+    let mut large = LARGE.lock();
+    // A few members find the rest of a component.
+    let room = BATCH.saturating_sub(large.candidates.len());
+    large.candidates.extend(batch.into_iter().take(room));
+    if large.due.is_none() {
+        large.due = Some(Instant::now() + large.backoff);
+    }
+}
+
+/// `bun:internal-for-testing`: how many channels one collection locks at most.
+pub(super) fn set_reach_for_testing(reach: usize) {
+    REACH_LIMIT.store(reach, Ordering::Relaxed);
 }
 
 /// Collects the candidates that wait now, in batches. Returns how many channels it reclaimed.
@@ -217,7 +296,15 @@ pub(super) fn collect_all() -> usize {
         if batch.is_empty() {
             return reclaimed;
         }
-        reclaimed += collect_batch(batch, &mut seen);
+        let (found, truncated) = collect_batch(
+            batch.clone(),
+            &mut seen,
+            REACH_LIMIT.load(Ordering::Relaxed),
+        );
+        reclaimed += found;
+        if truncated {
+            note_large(batch);
+        }
     }
 }
 
@@ -245,13 +332,16 @@ fn take_candidates(count: usize) -> Vec<Weak<ChannelCore>> {
 fn collect_newest() {
     let batch = take_candidates(BATCH);
     if !batch.is_empty() {
-        collect_batch(batch, &mut Seen::default());
+        let limit = REACH_LIMIT.load(Ordering::Relaxed);
+        if collect_batch(batch.clone(), &mut Seen::default(), limit).1 {
+            note_large(batch);
+        }
     }
 }
 
-/// Collects `batch` and what it reaches, but what `seen` has. Returns how many channels it
-/// reclaimed. No channel locked.
-fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen) -> usize {
+/// Collects `batch` and what it reaches, but what `seen` has, up to `limit` channels. Returns how
+/// many channels it reclaimed, and whether it reached more than the limit. No channel locked.
+fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen, limit: usize) -> (usize, bool) {
     // What the candidates reach through values that share channels, one channel locked at a time.
     // Channels that hold none are left out: they are in no cycle, and drop with what holds them.
     // Weakly: one that the counts free meanwhile is not kept, and drops out.
@@ -261,6 +351,7 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen) -> usize {
             reached.push(candidate);
         }
     }
+    let mut truncated = false;
     let mut i = 0;
     while i < reached.len() {
         let Some(channel) = reached[i].upgrade() else {
@@ -273,11 +364,15 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen) -> usize {
                 for &target in message.targets() {
                     // SAFETY: the message holds the core, and the lock holds the message.
                     let core = unsafe { &*target };
+                    if !core.holds_channels.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     // Past the limit, left for another batch to reach.
-                    if reached.len() < REACH
-                        && core.holds_channels.load(Ordering::Relaxed)
-                        && seen.insert(target as usize, ()).is_none()
-                    {
+                    if reached.len() >= limit {
+                        truncated |= !seen.contains_key(&(target as usize));
+                        continue;
+                    }
+                    if seen.insert(target as usize, ()).is_none() {
                         // SAFETY: as above: a live core of an `Arc`, which this does not drop.
                         let target = core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(target) });
                         reached.push(Arc::downgrade(&target));
@@ -290,7 +385,7 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen) -> usize {
     }
     let channels = reached.iter().filter_map(Weak::upgrade).collect();
     drop(reached);
-    collect(channels)
+    (collect(channels), truncated)
 }
 
 /// Reclaims the channels of `channels` that no root reaches. Returns how many. No channel locked.

@@ -99,6 +99,11 @@ export const channelQueueLengths = $bindgen("channel_testing.bind.ts", "queueLen
 /** How many `Bun.Channel`s exist, on every thread. */
 export const channelLiveCount = $bindgen("channel_testing.bind.ts", "liveCountForTesting") as () => number;
 
+/** Sets how many channels one collection of channels locks at most; a larger component waits for a collection without the limit. */
+export const setChannelCollectReach = $bindgen("channel_testing.bind.ts", "setCollectReachForTesting") as (
+  reach: number,
+) => void;
+
 /** How many channel values that share a channel exist, on every thread. */
 export const channelValuesSharingChannels = $bindgen(
   "channel_testing.bind.ts",

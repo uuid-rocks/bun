@@ -671,7 +671,12 @@ describe.concurrent("Bun.Channel process", () => {
     // From a file: the goroutines of a \`bun -e\` script keep what they made until a full collection.
     using dir = tempDir("channel-reclaiming", {
       "main.js": `
-        import { channelLiveCount, channelValuesSharingChannels, collectChannels } from "bun:internal-for-testing";
+        import {
+          channelLiveCount,
+          channelValuesSharingChannels,
+          collectChannels,
+          setChannelCollectReach,
+        } from "bun:internal-for-testing";
         const base = channelLiveCount();
         // \`threads\`: the size of the goroutine pool (GOMAXPROCS), whose threads collect too.
         async function reclaimed(threads = 0) {
@@ -793,6 +798,19 @@ describe.concurrent("Bun.Channel process", () => {
         await ch.receive();
       }
       console.log(channelValuesSharingChannels() - before);
+    `);
+    expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
+  });
+
+  test("a cycle of more channels than one collection reaches is freed by a collection without the limit", async () => {
+    const result = await runReclaiming(`
+      setChannelCollectReach(256);
+      async function ring(length) {
+        const channels = Array.from({ length }, () => new Bun.Channel(1));
+        for (let i = 0; i < length; i++) await channels[i].send({ next: channels[(i + 1) % length] });
+      }
+      await ring(3000);
+      console.log(await reclaimed());
     `);
     expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   });

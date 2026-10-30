@@ -1298,5 +1298,9 @@ pub(crate) fn sharing_count_for_testing() -> f64 {
 }
 
 pub(crate) fn collect_for_testing() -> f64 {
-    graph::collect_all() as f64
+    (graph::collect_all() + graph::collect_large(true)) as f64
+}
+
+pub(crate) fn set_collect_reach_for_testing(reach: f64) {
+    graph::set_reach_for_testing(reach as usize);
 }
