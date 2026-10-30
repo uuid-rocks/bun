@@ -6,8 +6,8 @@
 // turn (`take`); a thread with nothing to take is idle until `spawn` hands it the next one. A
 // started goroutine stays on its thread; while it awaits, the thread runs others.
 //
-// Arguments and results cross by structured clone (SerializationContext::WorkerPostMessage: a
-// SharedArrayBuffer is shared). Everything posted between threads goes through
+// Arguments and results cross as Bun.Channel values do (ChannelMessage.cpp: the clone
+// worker.postMessage() makes; a SharedArrayBuffer or a Bun.Channel is shared). Everything posted between threads goes through
 // ScriptExecutionContext::postTaskTo by context identifier, so a thread that has ended just drops
 // what was meant for it. No lock is held while script runs, a value is cloned, or a task is posted.
 
@@ -16,9 +16,7 @@
 
 #include "ErrorStackTrace.h"
 #include "InternalModuleRegistry.h"
-#include "JSDOMExceptionHandling.h"
-#include "MessagePort.h"
-#include "SerializedScriptValue.h"
+#include "MessageWithMessagePorts.h"
 #include "ZigGlobalObject.h"
 #include "webcore/Worker.h"
 #include "webcore/WorkerOptions.h"
@@ -33,6 +31,9 @@
 #include <wtf/NeverDestroyed.h>
 
 extern "C" uint32_t Bun__Go__maxPoolThreads();
+// ChannelMessage.cpp
+extern "C" WebCore::MessageWithMessagePorts* Bun__ChannelMessage__create(JSC::JSGlobalObject*, JSC::EncodedJSValue value, JSC::EncodedJSValue transfer);
+extern "C" JSC::EncodedJSValue Bun__ChannelMessage__deserialize(JSC::JSGlobalObject*, WebCore::MessageWithMessagePorts*);
 extern "C" bool Bun__Go__resolveModule(void* bunVM, const BunString* specifier, BunString* out, BunString* errorMessage);
 
 namespace Bun::Go {
@@ -43,10 +44,7 @@ namespace {
 
 constexpr ScriptExecutionContextIdentifier mainThreadContext = 1;
 
-struct Message {
-    RefPtr<SerializedScriptValue> value;
-    Vector<TransferredMessagePort> ports;
-};
+using Message = std::unique_ptr<MessageWithMessagePorts>;
 
 struct Task {
     uint64_t id;
@@ -126,22 +124,15 @@ unsigned maxThreads()
     return max;
 }
 
-ExceptionOr<Message> serialize(JSGlobalObject& globalObject, JSValue value)
+// Null with an exception pending if `value` can't be cloned.
+Message serialize(JSGlobalObject* globalObject, JSValue value)
 {
-    Vector<RefPtr<MessagePort>> ports;
-    auto serialized = SerializedScriptValue::create(globalObject, value, {}, ports, SerializationForStorage::No, SerializationContext::WorkerPostMessage);
-    if (serialized.hasException())
-        return serialized.releaseException();
-    auto disentangled = MessagePort::disentanglePorts(WTF::move(ports));
-    if (disentangled.hasException())
-        return disentangled.releaseException();
-    return Message { serialized.releaseReturnValue(), disentangled.releaseReturnValue() };
+    return Message { Bun__ChannelMessage__create(globalObject, JSValue::encode(value), JSValue::encode(jsUndefined())) };
 }
 
 JSValue deserialize(Zig::GlobalObject* globalObject, Message&& message)
 {
-    auto ports = MessagePort::entanglePorts(*globalObject->scriptExecutionContext(), WTF::move(message.ports));
-    return message.value->deserialize(*globalObject, globalObject, ports, SerializationErrorMode::Throwing);
+    return JSValue::decode(Bun__ChannelMessage__deserialize(globalObject, message.release()));
 }
 
 void startPoolThread(ScriptExecutionContext& mainContext)
@@ -430,14 +421,10 @@ JSC_DEFINE_HOST_FUNCTION(jsGoSpawn, (JSGlobalObject * lexicalGlobalObject, CallF
     String exportName = callFrame->argument(1).toWTFString(lexicalGlobalObject);
     RETURN_IF_EXCEPTION(scope, {});
     bool fromCommonJSExports = callFrame->argument(2).toBoolean(lexicalGlobalObject);
-    auto args = serialize(*lexicalGlobalObject, callFrame->argument(3));
-    if (args.hasException()) {
-        propagateException(*lexicalGlobalObject, scope, args.releaseException());
-        return {};
-    }
+    auto args = serialize(lexicalGlobalObject, callFrame->argument(3));
     RETURN_IF_EXCEPTION(scope, {});
     auto& context = contextOf(lexicalGlobalObject);
-    Task task { 0, WTF::move(module).isolatedCopy(), WTF::move(exportName).isolatedCopy(), fromCommonJSExports, args.releaseReturnValue() };
+    Task task { 0, WTF::move(module).isolatedCopy(), WTF::move(exportName).isolatedCopy(), fromCommonJSExports, WTF::move(args) };
     uint64_t id = scheduler().spawn(WTF::move(task), Spawner { context.identifier(), context.currentLoopKind() });
     return JSValue::encode(jsNumber(id));
 }
@@ -532,16 +519,12 @@ JSC_DEFINE_HOST_FUNCTION(jsGoSettle, (JSGlobalObject * lexicalGlobalObject, Call
     auto scope = DECLARE_THROW_SCOPE(vm);
     uint64_t id = static_cast<uint64_t>(callFrame->argument(0).asNumber());
     auto outcome = callFrame->argument(1).asNumber() ? Outcome::Rejected : Outcome::Fulfilled;
-    auto message = serialize(*lexicalGlobalObject, callFrame->argument(2));
-    if (message.hasException()) {
-        propagateException(*lexicalGlobalObject, scope, message.releaseException());
-        return {};
-    }
+    auto message = serialize(lexicalGlobalObject, callFrame->argument(2));
     RETURN_IF_EXCEPTION(scope, {});
     auto spawner = scheduler().finish(id);
     if (!spawner)
         return JSValue::encode(jsUndefined());
-    ScriptExecutionContext::postTaskTo(spawner->context, spawner->loopKind, [id, outcome, message = message.releaseReturnValue()](ScriptExecutionContext& context) mutable {
+    ScriptExecutionContext::postTaskTo(spawner->context, spawner->loopKind, [id, outcome, message = WTF::move(message)](ScriptExecutionContext& context) mutable {
         settleOnSpawner(context, id, outcome, WTF::move(message));
     });
     return JSValue::encode(jsUndefined());
@@ -588,21 +571,18 @@ extern "C" void Bun__Go__reportUncaughtError(Zig::GlobalObject* globalObject, JS
     auto& vm = globalObject->vm();
     auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
     JSValue error = JSValue::decode(encodedError);
-    std::optional<Bun::Go::Message> message;
-    if (auto serialized = Bun::Go::serialize(*globalObject, error); !serialized.hasException())
-        message = serialized.releaseReturnValue();
+    auto message = Bun::Go::serialize(globalObject, error);
     CLEAR_IF_EXCEPTION(scope);
     if (!message) {
         // What can't be cloned is reported as its text.
         auto text = error.toWTFString(globalObject);
         CLEAR_IF_EXCEPTION(scope);
-        if (auto serialized = Bun::Go::serialize(*globalObject, jsString(vm, text)); !serialized.hasException())
-            message = serialized.releaseReturnValue();
+        message = Bun::Go::serialize(globalObject, jsString(vm, text));
         CLEAR_IF_EXCEPTION(scope);
         if (!message)
             return;
     }
-    ScriptExecutionContext::postTaskTo(Bun::Go::mainThreadContext, BunLoopKind::Regular, [message = WTF::move(*message)](ScriptExecutionContext& context) mutable {
+    ScriptExecutionContext::postTaskTo(Bun::Go::mainThreadContext, BunLoopKind::Regular, [message = WTF::move(message)](ScriptExecutionContext& context) mutable {
         auto* globalObject = defaultGlobalObject(context.jsGlobalObject());
         auto& vm = globalObject->vm();
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
