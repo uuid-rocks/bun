@@ -83,11 +83,15 @@ public:
     // Main thread: the thread is ending (asked to, or on its own). Idempotent. It may be called
     // while the main thread's context stops its active objects, so it starts no thread.
     void retire(ScriptExecutionContextIdentifier thread);
+    // Main thread: `threads` (the whole pool) are retired, and what is queued is dropped. Nothing
+    // started before the reset runs in the pool that grows after it.
+    void reset(const Vector<ScriptExecutionContextIdentifier>& threads);
     void threadFailedToStart();
     // Wake an idle thread for what is queued, or grow the pool. Called without the lock.
     void dispatch();
 
 private:
+    void retireLocked(ScriptExecutionContextIdentifier, Vector<std::pair<uint64_t, Spawner>>& lost) WTF_REQUIRES_LOCK(m_lock);
     // Whether to start another thread (counted as starting) for what is queued.
     bool shouldGrow() WTF_REQUIRES_LOCK(m_lock);
     void grow();
@@ -186,16 +190,28 @@ bool Scheduler::shouldGrow()
     return true;
 }
 
+// A goroutine whose thread ended before it settled.
+void rejectAsThreadExited(uint64_t id, Spawner spawner);
+
 uint64_t Scheduler::spawn(Task&& task, Spawner spawner)
 {
     uint64_t id;
+    bool refused = false;
     {
         Locker locker { m_lock };
         id = m_nextId++;
         task.id = id;
-        m_queue.append({ WTF::move(task), spawner });
+        // A thread of a pool that was reset runs on only until it notices: what it spawns is not
+        // for the new pool.
+        if (!m_retired.contains(spawner.context))
+            m_queue.append({ WTF::move(task), spawner });
+        else
+            refused = true;
     }
-    dispatch();
+    if (refused)
+        rejectAsThreadExited(id, spawner);
+    else
+        dispatch();
     return id;
 }
 
@@ -266,27 +282,44 @@ void Scheduler::threadFailedToStart()
     m_startingCount--;
 }
 
-// A goroutine whose thread ended before it settled.
-void rejectAsThreadExited(uint64_t id, Spawner spawner);
+void Scheduler::retireLocked(ScriptExecutionContextIdentifier thread, Vector<std::pair<uint64_t, Spawner>>& lost)
+{
+    if (!m_retired.add(thread).isNewEntry)
+        return;
+    m_threadCount--;
+    if (!m_threads.remove(thread))
+        m_startingCount--;
+    m_woken.remove(thread);
+    m_idle.removeFirst(thread);
+    m_running.removeIf([&](auto& entry) {
+        if (entry.value.thread != thread)
+            return false;
+        lost.append({ entry.key, entry.value.spawner });
+        return true;
+    });
+}
 
 void Scheduler::retire(ScriptExecutionContextIdentifier thread)
 {
     Vector<std::pair<uint64_t, Spawner>> lost;
     {
         Locker locker { m_lock };
-        if (!m_retired.add(thread).isNewEntry)
-            return;
-        m_threadCount--;
-        if (!m_threads.remove(thread))
-            m_startingCount--;
-        m_woken.remove(thread);
-        m_idle.removeFirst(thread);
-        m_running.removeIf([&](auto& entry) {
-            if (entry.value.thread != thread)
-                return false;
-            lost.append({ entry.key, entry.value.spawner });
-            return true;
-        });
+        retireLocked(thread, lost);
+    }
+    for (auto& [id, spawner] : lost)
+        rejectAsThreadExited(id, spawner);
+}
+
+void Scheduler::reset(const Vector<ScriptExecutionContextIdentifier>& threads)
+{
+    Vector<std::pair<uint64_t, Spawner>> lost;
+    {
+        Locker locker { m_lock };
+        for (auto thread : threads)
+            retireLocked(thread, lost);
+        for (auto& [task, spawner] : m_queue)
+            lost.append({ task.id, spawner });
+        m_queue.clear();
     }
     for (auto& [id, spawner] : lost)
         rejectAsThreadExited(id, spawner);
@@ -544,9 +577,15 @@ JSValue createGoRuntimeBinding(Zig::GlobalObject* globalObject)
     RELEASE_AND_RETURN(scope, binding);
 }
 
+// `--hot` reloads and `bun test --isolate` retires a file: the pool's threads end, with every
+// goroutine they run or that waits for one. Main thread.
 extern "C" void Bun__Go__restartPool()
 {
     auto workers = WTF::move(Bun::Go::poolWorkers());
+    Vector<ScriptExecutionContextIdentifier> threads;
+    for (auto& worker : workers)
+        threads.append(worker->clientIdentifier());
+    Bun::Go::scheduler().reset(threads);
     for (auto& worker : workers)
         worker->terminate();
 }

@@ -369,6 +369,56 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
+  // File a queues goroutines behind two that block both threads; none of them may run in b's pool.
+  test("bun test --isolate drops what a finished file left queued", async () => {
+    const { stderr, exitCode } = await run(
+      {
+        "task.ts": `
+          export function block(started: SharedArrayBuffer) {
+            const counter = new Int32Array(started);
+            Atomics.add(counter, 0, 1);
+            Atomics.notify(counter, 0);
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+          }
+          export function poison() {
+            globalThis.poisoned = true;
+          }
+          // Both threads arrive, so each has finished what it took before.
+          export function report(sab: SharedArrayBuffer, parties: number) {
+            const counter = new Int32Array(sab);
+            Atomics.add(counter, 0, 1);
+            Atomics.notify(counter, 0);
+            for (let seen; (seen = Atomics.load(counter, 0)) < parties; ) Atomics.wait(counter, 0, seen);
+            return globalThis.poisoned ?? false;
+          }
+        `,
+        "a.test.ts": `
+          import { test } from "bun:test";
+          import { block, poison } from "./task.ts";
+          test("a", async () => {
+            const started = new SharedArrayBuffer(4);
+            Bun.go(block, started).unref();
+            Bun.go(block, started).unref();
+            const counter = new Int32Array(started);
+            for (let seen; (seen = Atomics.load(counter, 0)) < 2; ) await Atomics.waitAsync(counter, 0, seen).value;
+            for (let i = 0; i < 4; i++) Bun.go(poison).unref().catch(() => {});
+          });
+        `,
+        "b.test.ts": `
+          import { test, expect } from "bun:test";
+          import { report } from "./task.ts";
+          test("b", async () => {
+            const sab = new SharedArrayBuffer(4);
+            expect(await Promise.all([Bun.go(report, sab, 2), Bun.go(report, sab, 2)])).toEqual([false, false]);
+          });
+        `,
+      },
+      { threads: 2, args: ["test", "--isolate", "a.test.ts", "b.test.ts"] },
+    );
+    expect(stderr).toContain("2 pass");
+    expect(exitCode).toBe(0);
+  });
+
   test("bun build --compile runs a task module listed as an entry point", async () => {
     using dir = tempDir("bun-go-compile", {
       "task.ts": `export default function (a: number, b: number) { return { sum: a + b, isMainThread: Bun.isMainThread }; }`,
