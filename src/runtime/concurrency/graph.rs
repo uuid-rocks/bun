@@ -15,17 +15,19 @@
 //! values out of those queues and drops them once everything is unlocked, which drops the channels.
 //!
 //! Values that share no channel skip all of this. A channel joins the registry only when its queues
-//! hold a value that shares one. A collection runs on the work pool when a reference to a
-//! registered channel goes away, and when the registry has doubled since the last one.
+//! hold a value that shares one. A collection runs on a thread of its own when a reference to a
+//! registered channel goes away, and when the registry has doubled since the last one, at most
+//! once per [`INTERVAL`]: traffic that keeps sending a channel through itself must not keep its
+//! lock busy.
 //!
 //! Lock order: channels in address order, then the registry or `IN_FLIGHT`. A collection lets the
 //! registry go before it locks the channels it found there.
 
-use core::sync::atomic::{AtomicU8, Ordering, fence};
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
-use bun_threading::Guarded;
-use bun_threading::work_pool::WorkPool;
+use bun_threading::{Condition, Guarded};
 
 use super::channel::{ChannelCore, State, with_in_flight};
 
@@ -45,12 +47,13 @@ static REGISTRY: Guarded<Registry> = Guarded::new(Registry {
 /// One collection at a time.
 static COLLECTING: Guarded<()> = Guarded::new(());
 
-const IDLE: u8 = 0;
-/// A collection is queued or running.
-const RUNNING: u8 = 1;
-/// And another was asked for since it started.
-const AGAIN: u8 = 2;
-static COLLECTOR: AtomicU8 = AtomicU8::new(IDLE);
+const INTERVAL: Duration = Duration::from_millis(10);
+
+/// A collection was asked for since the last one started.
+static WANTED: AtomicBool = AtomicBool::new(false);
+/// Whether the collector's thread was started. Its wait is on this lock.
+static STARTED: Guarded<bool> = Guarded::new(false);
+static WAKE: Condition = Condition::new();
 
 /// `state` is `channel`'s, locked. Registers the channel if its queues hold a value that shares a
 /// channel.
@@ -78,34 +81,42 @@ pub(super) fn release(channel: Arc<ChannelCore>) {
     }
 }
 
-/// A collection on the work pool, soon.
+/// A collection on the collector's thread, soon.
 fn request() {
-    let mut current = COLLECTOR.load(Ordering::Relaxed);
-    loop {
-        let next = if current == IDLE { RUNNING } else { AGAIN };
-        if next == current {
-            return;
-        }
-        match COLLECTOR.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(actual) => current = actual,
-        }
+    if WANTED.swap(true, Ordering::AcqRel) {
+        return;
     }
-    if current == IDLE && WorkPool::go((), |()| run()).is_err() {
-        COLLECTOR.store(IDLE, Ordering::Release);
+    let mut started = STARTED.lock();
+    if *started {
+        WAKE.signal();
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("Bun.Channel collector".into())
+        .spawn(run);
+    if spawned.is_ok() {
+        *started = true;
+    } else {
+        WANTED.store(false, Ordering::Release);
     }
 }
 
 fn run() {
+    let mut last: Option<Instant> = None;
     loop {
-        collect();
-        if COLLECTOR
-            .compare_exchange(RUNNING, IDLE, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
         {
-            return;
+            let mut started = STARTED.lock();
+            while !WANTED.load(Ordering::Acquire) {
+                WAKE.wait_guarded(&mut started);
+            }
         }
-        COLLECTOR.store(RUNNING, Ordering::Release);
+        if let Some(wait) = last.and_then(|last| INTERVAL.checked_sub(last.elapsed())) {
+            std::thread::sleep(wait);
+        }
+        // What is asked for from here on, this collection may miss: it runs another.
+        WANTED.store(false, Ordering::Release);
+        collect();
+        last = Some(Instant::now());
     }
 }
 
