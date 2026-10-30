@@ -734,6 +734,51 @@ describe.concurrent("Bun.go", () => {
     });
   });
 
+  test("a value handed to a goroutine of a terminated Worker before it could read it goes to another receiver", async () => {
+    const { stdout, stderr, exitCode } = await run({
+      "main.ts": `
+        import { channelQueueLengths } from "bun:internal-for-testing";
+        async function until(condition: () => boolean) {
+          const deadline = Date.now() + 4000;
+          while (!condition() && Date.now() < deadline) await Bun.sleep(1);
+          return condition();
+        }
+        const ch = new Bun.Channel<number>();
+        // [the goroutine's thread is blocked, release it, what its receive did]
+        const state = new Int32Array(new SharedArrayBuffer(12));
+        const worker = new Worker(URL.createObjectURL(new Blob([\`
+          self.onmessage = ({ data: { ch, state } }) => {
+            Bun.go(async (ch, state) => {
+              const received = ch.receive();
+              // The value is handed over while this thread can't read it.
+              Atomics.store(state, 0, 1);
+              Atomics.wait(state, 1, 0);
+              await received.then(
+                () => Atomics.store(state, 2, 1),
+                error => Atomics.store(state, 2, error.code === "ERR_GOROUTINE_THREAD_EXITED" ? 2 : 3),
+              );
+            }, ch, state).catch(() => {});
+          };
+        \`])));
+        worker.postMessage({ ch, state });
+        await until(() => Atomics.load(state, 0) === 1 && channelQueueLengths(ch).receivers === 1);
+        await ch.send(42);
+        const closed = new Promise(resolve => worker.addEventListener("close", resolve));
+        worker.terminate();
+        await closed;
+        Atomics.store(state, 1, 1);
+        Atomics.notify(state, 1);
+        console.log("the goroutine's receive:", (await until(() => Atomics.load(state, 2) !== 0), ["", "resolved", "cancelled", "rejected"][state[2]]));
+        console.log("received here:", await ch.receive());
+      `,
+    });
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout: "the goroutine's receive: cancelled\nreceived here: 42",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
   test("CommonJS exports, a module's default export, and module URLs", async () => {
     const { stdout, exitCode } = await run({
       "props.cjs": `exports.multiply = (a, b) => a * b;`,

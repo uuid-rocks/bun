@@ -349,6 +349,16 @@ impl ChannelWake {
             // its context stops, and a value goes back to its channel.
             return Ok(());
         }
+        if let Some(op) = ops().get(wake.op_id) {
+            // SAFETY: in the table, so live.
+            let owner = unsafe { op.as_ref() }.owner;
+            if owner != 0 && Bun__Go__ownerEnded(owner) {
+                // Ahead of the `Bun__Go__cancelOwner` on its way here. What the wake carries
+                // passes on as it drops.
+                cancel(global, wake.op_id);
+                return Ok(());
+            }
+        }
         if let WakeResult::Retry(wakeup) = wake.result {
             return match ops().get(wake.op_id) {
                 Some(op) => ChannelOp::retry(op, global, wakeup),
@@ -607,6 +617,8 @@ unsafe extern "C" {
     safe fn Bun__Go__currentOwner(global: &JSGlobalObject) -> u32;
     /// BunGo.cpp: the goroutine whose code runs now was cancelled: its owner's thread ended.
     safe fn Bun__Go__isCancelled(global: &JSGlobalObject) -> bool;
+    /// BunGo.cpp: the thread of `owner` ended while goroutines of its ran.
+    safe fn Bun__Go__ownerEnded(owner: u32) -> bool;
     safe fn Bun__Go__moduleCallSite(
         global: &JSGlobalObject,
         url: &mut bun_core::String,
@@ -649,14 +661,18 @@ pub(crate) extern "C" fn Bun__Go__cancelOwner(global: &JSGlobalObject, owner: u3
         .map(|op| op.id)
         .collect();
     for id in ids {
-        let Some(op) = ops().remove(id) else {
-            continue;
-        };
-        op.waiter.cancel();
-        op.forget();
-        let mut promise = op.promise;
-        let _ = promise.reject(global, Ok(cancelled_error(global)));
+        cancel(global, id);
     }
+}
+
+fn cancel(global: &JSGlobalObject, id: u64) {
+    let Some(op) = ops().remove(id) else {
+        return;
+    };
+    op.waiter.cancel();
+    op.forget();
+    let mut promise = op.promise;
+    let _ = promise.reject(global, Ok(cancelled_error(global)));
 }
 
 pub(super) fn closed_error(global: &JSGlobalObject) -> JSValue {

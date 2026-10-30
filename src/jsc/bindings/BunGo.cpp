@@ -1446,3 +1446,8 @@ extern "C" bool Bun__Go__isCancelled(JSC::JSGlobalObject* globalObject)
     auto owner = Bun::Go::currentOwner(defaultGlobalObject(globalObject));
     return owner && scheduler.hasEnded(owner);
 }
+
+extern "C" bool Bun__Go__ownerEnded(uint32_t owner)
+{
+    return Bun::Go::scheduler().hasEnded(owner);
+}
