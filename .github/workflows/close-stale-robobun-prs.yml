@@ -9,7 +9,8 @@ on:
 
 jobs:
   close-stale-robobun-prs:
-    runs-on: ubuntu-latest
+    if: github.repository == 'oven-sh/bun'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       pull-requests: write

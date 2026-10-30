@@ -55,7 +55,7 @@ on:
 jobs:
   sign:
     name: Sign Release
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     if: ${{ github.repository_owner == 'oven-sh' }}
     permissions:
       contents: write
@@ -86,7 +86,7 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
   npm:
     name: Release to NPM
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: sign
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.use-npm == 'true' }}
     permissions:
@@ -114,7 +114,7 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
   npm-types:
     name: Release types to NPM
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: sign
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.use-types == 'true' }}
     permissions:
@@ -170,7 +170,7 @@ jobs:
           npm publish --access public --tag "$NPM_TAG"
   definitelytyped:
     name: Make pr to DefinitelyTyped to update `bun-types` version
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: npm-types
     if: ${{ github.event_name == 'release' || github.event.inputs.use-definitelytyped == 'true' }}
     permissions:
@@ -218,7 +218,7 @@ jobs:
           branch: ${{env.BUN_VERSION}}
   docker:
     name: Release to Dockerhub
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     needs: sign
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.use-docker == 'true' }}
     permissions:
@@ -281,7 +281,7 @@ jobs:
             BUN_VERSION=${{ env.BUN_VERSION }}
   homebrew:
     name: Release to Homebrew
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: sign
     permissions:
       contents: read
@@ -317,7 +317,7 @@ jobs:
           git push "https://x-access-token:${ROBOBUN_TOKEN}@github.com/oven-sh/homebrew-bun" HEAD:main
   s3:
     name: Upload to S3
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: sign
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.use-s3 == 'true' }}
     permissions:
@@ -347,7 +347,7 @@ jobs:
 
   notify-sentry:
     name: Notify Sentry
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     needs: s3
     steps:
       - name: Notify Sentry

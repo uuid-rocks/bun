@@ -18,7 +18,7 @@ jobs:
       github.repository == 'oven-sh/bun' &&
       contains(github.event.pull_request.labels.*.name, 'claude') &&
       (github.event.action != 'labeled' || github.event.label.name == 'claude')
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 5
     concurrency:
       group: comment-cop-${{ github.event.pull_request.number }}

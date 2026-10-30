@@ -1,0 +1,15 @@
+# Tests that .github/workflows/build-and-test.yml runs against the debug build.
+#
+# One filter per line, passed to scripts/runner.node.ts as a positional. A filter
+# selects every test file under test/ whose path (relative to test/) contains it,
+# so a directory selects everything below it and a filter that matches nothing
+# selects nothing. Blank lines and lines starting with # are ignored.
+
+# Smoke set
+js/bun/util/escapeHTML.test.js
+js/bun/util/bun-isMainThread.test.js
+js/bun/spawn/exit-code.test.ts
+js/web/workers/worker.test.ts
+
+# Concurrency (goroutines + channels)
+js/bun/concurrency/

@@ -1,0 +1,169 @@
+name: Build and test
+
+# The fork's build-and-test CI. Upstream builds and tests on Buildkite, which
+# does not run for this repository: this builds the debug (ASAN) Bun that
+# `bun bd` builds, on linux x64, and runs the tests listed in
+# .github/ci-tests.txt with it.
+#
+# The build's checkout is a Blacksmith sticky disk at $TREE, so each
+# run moves the previous run's tree to the new commit with `git checkout`:
+# only the files that changed get new mtimes, and ninja rebuilds what depends
+# on them, as it does on a developer's machine. Run it by hand with `clean` to
+# start from an empty build directory.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      clean:
+        description: "Delete the build directory and the build cache before building"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  BUN_VERSION: "1.4.4"
+  NODE_VERSION: "26.12.1"
+  LLVM_VERSION_MAJOR: "23"
+  # Keep in sync with `channel` in rust-toolchain.toml. Set, it also makes
+  # rustup ignore that file's 11 cross targets.
+  RUSTUP_TOOLCHAIN: nightly-2026-09-15
+  RUSTUP_VERSION: "1.28.2"
+  RUSTUP_SHA256: "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+  TREE: /mnt/bun-tree
+  TOOLCHAIN_DIR: /mnt/bun-toolchain
+  RUSTUP_HOME: /mnt/bun-toolchain/rustup
+  CARGO_HOME: /mnt/bun-toolchain/cargo
+  BUN_BUILD_CACHE_DIR: /mnt/bun-toolchain/build-cache
+  BUN_INSTALL_CACHE_DIR: /mnt/bun-toolchain/bun-install-cache
+  CCACHE_MAXSIZE: 20G
+  PUPPETEER_SKIP_DOWNLOAD: "1"
+
+jobs:
+  linux-x64:
+    name: linux x64 (debug, ASAN)
+    runs-on: blacksmith-32vcpu-ubuntu-2404
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: /mnt/bun-tree
+    steps:
+      # For the local actions. The disk below can't be the workspace: the
+      # runner's own processes keep that busy, and the disk is not unmounted
+      # and saved.
+      - name: Checkout .github
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Mount the source tree
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+        with:
+          key: ${{ github.repository }}-linux-x64-debug-tree
+          path: ${{ env.TREE }}
+
+      - name: Mount the toolchain and build cache
+        uses: useblacksmith/stickydisk@3f6be1451e3cad893b778bc93495c80452a5da26 # v1.7.2
+        with:
+          key: ${{ github.repository }}-linux-x64-toolchain
+          path: ${{ env.TOOLCHAIN_DIR }}
+
+      - name: Check out ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          CLEAN: ${{ inputs.clean || false }}
+        run: |
+          sudo chown "$(id -u):$(id -g)" "$TREE" "$TOOLCHAIN_DIR"
+          if [ ! -d .git ]; then
+            git init -q .
+            git remote add origin "https://github.com/$REPOSITORY"
+            # The sticky disk is a fresh ext4 filesystem, root's lost+found and all.
+            echo /lost+found >> .git/info/exclude
+          fi
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$auth" fetch --no-tags --depth=1 origin "$SHA"
+          git checkout --force --detach FETCH_HEAD
+          # Untracked files the last commit had and this one does not. Ignored
+          # files (build/, node_modules/, fetched deps) stay.
+          git clean -ffdq
+          if [ "$CLEAN" = "true" ]; then
+            rm -rf build "$BUN_BUILD_CACHE_DIR"
+          fi
+          git log -1 --format='%H %s'
+          df -h . "$TOOLCHAIN_DIR"
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install system packages
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-${LLVM_VERSION_MAJOR} main" | sudo tee /etc/apt/sources.list.d/llvm.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends -o=Dpkg::Use-Pty=0 \
+            clang-${LLVM_VERSION_MAJOR} lld-${LLVM_VERSION_MAJOR} llvm-${LLVM_VERSION_MAJOR} libclang-rt-${LLVM_VERSION_MAJOR}-dev \
+            cmake ninja-build nasm ccache golang-go pkg-config libtool perl python3 ruby
+          echo "/usr/lib/llvm-${LLVM_VERSION_MAJOR}/bin" >> "$GITHUB_PATH"
+          echo "ASAN_SYMBOLIZER_PATH=/usr/lib/llvm-${LLVM_VERSION_MAJOR}/bin/llvm-symbolizer" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        run: |
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl -fsSL --retry 5 -o "$RUNNER_TEMP/rustup-init" \
+              "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+            echo "${RUSTUP_SHA256}  $RUNNER_TEMP/rustup-init" | sha256sum -c -
+            chmod +x "$RUNNER_TEMP/rustup-init"
+            "$RUNNER_TEMP/rustup-init" -y --no-modify-path --profile minimal --default-toolchain none
+          fi
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustup" toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          "$CARGO_HOME/bin/rustc" --version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun scripts/build.ts --profile=debug
+
+      - name: Run tests
+        env:
+          BUN_DEBUG_QUIET_LOGS: "1"
+        run: |
+          mapfile -t filters < <(grep -Ev '^[[:space:]]*(#|$)' .github/ci-tests.txt)
+          printf 'filter: %s\n' "${filters[@]}"
+          node scripts/runner.node.ts --vendor=false --exec-path="$PWD/build/debug/bun-debug" "${filters[@]}"
+
+      - name: Disk usage
+        if: always()
+        run: |
+          df -h . "$TOOLCHAIN_DIR"
+          du -sh build "$TOOLCHAIN_DIR"/* 2>/dev/null || true
+
+      # The sticky disks are saved when they unmount, which fails while a
+      # process the build or the tests left behind still has files open there.
+      - name: Release the sticky disks
+        if: always()
+        working-directory: /
+        run: |
+          for disk in "$TREE" "$TOOLCHAIN_DIR"; do
+            sudo fuser -vm "$disk" 2>&1 || true
+            sudo fuser -km "$disk" || true
+          done
