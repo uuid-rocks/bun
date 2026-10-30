@@ -140,6 +140,14 @@ describe.concurrent("Bun.go with an inline function", () => {
         } catch (e) {
           console.log(e.code);
         }
+        // A closure that was refused says nothing about the next one.
+        const refusedFirst = (require: Function) => () => require("node:path").basename("/i/j");
+        try {
+          await Bun.go(refusedFirst(() => ({ basename: () => "not node:path" })));
+        } catch (e) {
+          console.log(e.code);
+        }
+        console.log(await Bun.go(refusedFirst(import.meta.require)));
         function reassignable() {
           let require: Function = import.meta.require;
           const fn = () => require("node:path").basename("/g/h");
@@ -153,6 +161,8 @@ describe.concurrent("Bun.go with an inline function", () => {
         } catch (e) {
           console.log(e.code);
         }
+        reassign(import.meta.require);
+        console.log(await Bun.go(reassigned));
       `,
       "common.cjs": `
         exports.basename = path => Bun.go(path => require("node:path").basename(path), path);
@@ -165,8 +175,11 @@ describe.concurrent("Bun.go with an inline function", () => {
         "d",
         "f",
         "ERR_GOROUTINE_NOT_SENDABLE",
+        "ERR_GOROUTINE_NOT_SENDABLE",
+        "j",
         "h",
         "ERR_GOROUTINE_NOT_SENDABLE",
+        "h",
       ].join("\n"),
     );
     expect(exitCode).toBe(0);

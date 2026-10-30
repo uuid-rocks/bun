@@ -249,7 +249,8 @@ function inlineOf(fn: Function, source: Source | undefined, bundled: boolean): T
           : undefined,
       problems,
     };
-    verdicts.$set(text, verdict);
+    // Whether `require` is the module's own depends on the closure: another closure of this code may pass.
+    if (problems === undefined || !problems.some(problem => problem[1] === "require")) verdicts.$set(text, verdict);
   }
   const { problems } = verdict;
   if (problems !== undefined) throw notSendable(fn, module, problems, bundled);
