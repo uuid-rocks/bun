@@ -1216,6 +1216,10 @@ impl EventLoop {
         if promise.status() != PromiseStatus::Pending {
             return Ok(());
         }
+        WAITING_FOR_PROMISE.set(WAITING_FOR_PROMISE.get() + 1);
+        let _waiting = scopeguard::guard((), |()| {
+            WAITING_FOR_PROMISE.set(WAITING_FOR_PROMISE.get() - 1);
+        });
         while promise.status() == PromiseStatus::Pending {
             if jsc_vm.execution_forbidden()
                 || !self.vm_ref().script_allowed()
@@ -1321,6 +1325,17 @@ impl EventLoop {
         // outlives the EventLoop.
         unsafe { self.global.unwrap_unchecked().as_ref() }
     }
+}
+
+thread_local! {
+    /// How many [`EventLoop::wait_for_promise`]s this thread is in: it waits for script even when nothing keeps its
+    /// loop alive.
+    static WAITING_FOR_PROMISE: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+
+/// This thread is in [`EventLoop::wait_for_promise`].
+pub fn is_waiting_for_promise() -> bool {
+    WAITING_FOR_PROMISE.get() > 0
 }
 
 impl EventLoop {

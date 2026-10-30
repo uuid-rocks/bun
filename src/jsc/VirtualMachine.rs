@@ -1854,10 +1854,11 @@ impl VirtualMachine {
             || !el.next_immediate_tasks.is_empty()
     }
 
-    /// `Bun.go`'s deadlock detection, on this VM's thread: nothing this VM holds can run script
-    /// by itself. No task is queued, posted or yielded, nothing keeps the loop alive but
-    /// `expected_refs`, and no poll is registered, not even an unref'd one (a socket, a pipe, a
-    /// signal listener). Timers are for the caller to check.
+    /// `Bun.go`'s deadlock detection, on this VM's thread: the VM would wait, for goroutines
+    /// (`expected_refs`) or for a promise, and nothing it holds can run script by itself. No task
+    /// is queued, posted or yielded, nothing keeps the loop alive but `expected_refs`, and no poll
+    /// is registered, not even an unref'd one (a socket, a pipe, a signal listener). Timers are
+    /// for the caller to check.
     pub fn deadlock_quiet(&self, expected_refs: u32) -> bool {
         #[cfg(unix)]
         {
@@ -1883,6 +1884,7 @@ impl VirtualMachine {
                 self.debugger.is_some(),
             );
             active == expected_refs
+                && (active > 0 || crate::event_loop::is_waiting_for_promise())
                 && !Bun__JSC__hasDeferredWork(self.jsc_vm())
                 && polls == active as i32 + held
                 && self.active_tasks == 0

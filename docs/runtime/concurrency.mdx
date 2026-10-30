@@ -103,7 +103,7 @@ A channel with a capacity, like `new Bun.Channel(16)`, makes a fast producer wai
 
 ## Waiting on several channels with `select`
 
-`Bun.select()` waits until one of several channel operations can happen, then does exactly that one. A case is a channel to receive from, or `[channel, value]` to send `value`.
+`Bun.select()` waits until one of several channel operations can happen, then does exactly that one. A case is a channel to receive from, `[channel, value]` to send `value`, or an `AbortSignal`, which is ready once it aborts.
 
 ```ts
 const result = await Bun.select([jobs, quit]);
@@ -122,15 +122,19 @@ async function produce(jobs: Bun.Channel<number>, quit: Bun.Channel<never>) {
 }
 ```
 
-With `{ default: true }`, `select()` doesn't wait: it resolves `{ index: -1 }` when no case is ready. With `{ signal }`, it stops waiting when the signal aborts, so `AbortSignal.timeout()` is a timeout:
+`AbortSignal.timeout(ms)` as a case is Go's `case <-time.After(d)`, and a cancellation signal is `case <-ctx.Done()`. The result's `value` is the signal's reason, and TypeScript narrows the result on its `index`:
 
 ```ts
-try {
-  const { value } = await Bun.select([results], { signal: AbortSignal.timeout(1000) });
-} catch (error) {
-  console.log(error.name); // => "TimeoutError"
+while (true) {
+  const result = await Bun.select([results, signal, AbortSignal.timeout(1000)]);
+  if (result.index === 0) console.log("result:", result.value);
+  else if (result.index === 1)
+    break; // cancelled
+  else console.log("nothing for a second");
 }
 ```
+
+With `{ default: true }`, `select()` doesn't wait: it resolves `{ index: -1 }` when no case is ready. With `{ signal }`, the whole `select()` rejects with the signal's reason when it aborts.
 
 ---
 
@@ -153,6 +157,20 @@ setTimeout(() => controller.abort(), 100);
 await crawler.catch(() => {}); // fetch() rejects with an AbortError
 ```
 
+A `for await` loop over a channel ends only when the channel is closed. To stop it on a signal without closing the channel for everyone else, iterate `channel.values({ signal })`: when the signal aborts, the loop throws the signal's reason, and no value is lost.
+
+```ts
+const square = Bun.go(
+  async (input: Bun.Channel<number>, output: Bun.Channel<number>, signal: AbortSignal) => {
+    for await (const n of input.values({ signal })) await output.send(n * n, { signal });
+    output.close();
+  },
+  input,
+  output,
+  controller.signal,
+);
+```
+
 Nothing stops a goroutine that computes without awaiting. Check `signal.aborted` in long loops, as the worker in `examples/concurrency/pipeline.ts` does.
 
 ---
@@ -161,29 +179,30 @@ Nothing stops a goroutine that computes without awaiting. Check `signal.aborted`
 
 A goroutine is a promise, so the tools for promises are the tools for goroutines:
 
-- `await Promise.all(goroutines)` waits for all of them, like a `sync.WaitGroup`, and rejects with the first error.
+- `await Promise.all(goroutines)` waits for all of them and gives their results, and rejects with the first error.
 - `await Promise.allSettled(goroutines)` waits for all of them, even when some fail.
 
 If a goroutine's function throws, the goroutine rejects with a copy of the error, with its name, message, stack, `cause` and `code`. A goroutine that rejects when nothing handles it is an unhandled rejection, which ends the process by default, as a panic does in Go.
 
-For Go's `errgroup`, where the first error cancels the others, give every goroutine one signal and abort it on the first error:
+`Bun.WaitGroup` is Go's `sync.WaitGroup` with its `Go` method, and `errgroup`: `group.go()` starts a goroutine and counts it, `group.wait()` waits for every goroutine and rejects with the first error, and that error aborts `group.signal`, which the other goroutines stop on. `await using` cancels and waits for whatever is still running when the scope ends.
 
 ```ts
-const controller = new AbortController();
-const goroutines = pages.map(page =>
-  Bun.go(
+await using group = new Bun.WaitGroup();
+for (const page of pages) {
+  group.go(
     async (page: number, signal: AbortSignal) => {
       const response = await fetch(`http://localhost:3000/page/${page}`, { signal });
       if (!response.ok) throw new Error(`page ${page}: ${response.status}`);
       return response.text();
     },
     page,
-    controller.signal,
-  ),
-);
-for (const goroutine of goroutines) goroutine.catch(error => controller.abort(error));
-const texts = await Promise.all(goroutines); // rejects with the first error
+    group.signal,
+  );
+}
+await group.wait(); // the first error, once the other goroutines were cancelled and ended
 ```
+
+[WaitGroup](/runtime/goroutines#waitgroup) has the details.
 
 ---
 
@@ -192,7 +211,7 @@ const texts = await Promise.all(goroutines); // rejects with the first error
 Values sent between goroutines are copies, so goroutines share nothing unless you share it:
 
 - A `SharedArrayBuffer` passed to a goroutine or sent on a channel is the same memory on both threads. Use [`Atomics`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Atomics) to read and write it safely.
-- A `Bun.Channel` passed to a goroutine is the same channel.
+- A `Bun.Channel` or a `Bun.Mutex` passed to a goroutine is the same channel or mutex.
 
 ```ts
 const counter = new Int32Array(new SharedArrayBuffer(4));
@@ -207,20 +226,33 @@ await Promise.all(
 console.log(counter[0]); // => 8000
 ```
 
-A channel with a capacity of 1 is a lock, as in Go: `send()` takes it, waiting while another goroutine has it, and `receive()` releases it. Use it for work that must not overlap, such as several writes to a shared buffer or one file:
+For work that must not overlap, such as several writes to a shared buffer or to one file, use a `Bun.Mutex`, Go's `sync.Mutex`. Waiting for it does not block the thread, and `using` unlocks it at the end of the scope:
 
 ```ts
-const lock = new Bun.Channel<void>(1);
+const mu = new Bun.Mutex();
 
-async function withLock<T>(lock: Bun.Channel<void>, fn: () => Promise<T>): Promise<T> {
-  await lock.send(); // wait for the lock
-  try {
-    return await fn();
-  } finally {
-    await lock.receive(); // release it
-  }
-}
+await Promise.all(
+  files.map(file =>
+    Bun.go(
+      async (mu: Bun.Mutex, file: string) => {
+        const text = await Bun.file(file).text();
+        using _ = await mu.lock();
+        await Bun.write("summary.txt", (await Bun.file("summary.txt").text()) + text.length + "\n");
+      },
+      mu,
+      file,
+    ),
+  ),
+);
 ```
+
+[Sharing state with a mutex](/runtime/goroutines#sharing-state-with-a-mutex) has the details.
+
+---
+
+## Deadlocks
+
+When every thread waits on a channel or a mutex and nothing else could wake one, Bun prints what waits and where, and exits with code 1, like Go's `all goroutines are asleep - deadlock!`. It reports only when it is sure: a timer, I/O, a server, a child process, a signal listener or a goroutine that still computes means there is no deadlock. Set `BUN_GO_DEADLOCK=0` to turn it off. [Deadlocks](/runtime/goroutines#deadlocks) has an example.
 
 ---
 
@@ -243,33 +275,37 @@ A goroutine written in place runs from its source, so in a bundle it must not `a
 - **Module state belongs to a thread.** A module that goroutines import runs once on each pool thread, so its top-level variables are per thread, like thread-local storage.
 - **A goroutine stays on the thread that starts it.** While the pool has room, Bun starts each goroutine on a thread that runs no other, so goroutines that compute run in parallel. Goroutines that only pass small values to each other pay for a wakeup between threads on every value; with less to compute than to send, fewer goroutines are faster.
 - **`Atomics.wait()` blocks the whole thread,** including the other goroutines on it. Wait on a channel instead when the goroutine that would wake you may share your thread.
-- **The pool doesn't keep the process alive.** A goroutine keeps alive the thread that started it until it settles, unless you call `unref()` on it. A waiting channel operation keeps nothing alive.
+- **The pool doesn't keep the process alive.** A goroutine keeps alive the thread that started it until it settles, unless you call `unref()` on it. A waiting channel operation or `lock()` keeps nothing alive.
 
 ---
 
 ## From Go to Bun
 
-| Go                                       | Bun                                                                 |
-| ---------------------------------------- | ------------------------------------------------------------------- |
-| `go f(x)`                                | `Bun.go(f, x)`                                                      |
-| `go func() { ... }()`                    | `Bun.go(() => { ... })`                                             |
-| `make(chan T)`                           | `new Bun.Channel<T>()`                                              |
-| `make(chan T, n)`                        | `new Bun.Channel<T>(n)`                                             |
-| `ch <- v`                                | `await ch.send(v)`                                                  |
-| `v := <-ch`                              | `const v = await ch.receive()`                                      |
-| `v, ok := <-ch`                          | `const { value, closed } = await Bun.select([ch])`                  |
-| `for v := range ch`                      | `for await (const v of ch)`                                         |
-| `close(ch)`, `defer close(ch)`           | `ch.close()`, `using ch = new Bun.Channel()`                        |
-| `select { case v := <-a: case b <- x: }` | `await Bun.select([a, [b, x]])`                                     |
-| `select { ... default: }`                | `await Bun.select([...], { default: true })`                        |
-| `case <-time.After(d):`                  | `Bun.select([...], { signal: AbortSignal.timeout(ms) })`            |
-| `sync.WaitGroup`                         | `await Promise.all(goroutines)`                                     |
-| `errgroup.Group`                         | `Promise.all()` and an `AbortController` aborted on the first error |
-| `context.Context`, `ctx.Done()`          | `AbortSignal`, `signal.aborted` or the signal's `abort` event       |
-| `sync.Mutex`                             | `new Bun.Channel<void>(1)`: `send()` to lock, `receive()` to unlock |
-| `sync/atomic`                            | `Atomics` on a `SharedArrayBuffer`                                  |
-| `GOMAXPROCS`                             | `GOMAXPROCS` (the environment variable)                             |
-| `panic` in a goroutine                   | an unhandled rejection of the goroutine                             |
+| Go                                             | Bun                                                              |
+| ---------------------------------------------- | ---------------------------------------------------------------- |
+| `go f(x)`                                      | `Bun.go(f, x)`                                                   |
+| `go func() { ... }()`                          | `Bun.go(() => { ... })`                                          |
+| `make(chan T)`                                 | `new Bun.Channel<T>()`                                           |
+| `make(chan T, n)`                              | `new Bun.Channel<T>(n)`                                          |
+| `ch <- v`                                      | `await ch.send(v)`                                               |
+| `v := <-ch`                                    | `const v = await ch.receive()`                                   |
+| `v, ok := <-ch`                                | `const { value, closed } = await Bun.select([ch])`               |
+| `for v := range ch`                            | `for await (const v of ch)`                                      |
+| `close(ch)`, `defer close(ch)`                 | `ch.close()`, `using ch = new Bun.Channel()`                     |
+| `select { case v := <-a: case b <- x: }`       | `await Bun.select([a, [b, x]])`                                  |
+| `select { ... default: }`                      | `await Bun.select([...], { default: true })`                     |
+| `case <-time.After(d):`                        | `Bun.select([..., AbortSignal.timeout(ms)])`                     |
+| `case <-ctx.Done():`                           | `Bun.select([..., signal])`                                      |
+| `for v := range ch` until cancelled            | `for await (const v of ch.values({ signal }))`                   |
+| `sync.WaitGroup`, `wg.Go(f)`, `wg.Wait()`      | `const wg = new Bun.WaitGroup()`, `wg.go(f)`, `await wg.wait()`  |
+| `errgroup.WithContext(ctx)`                    | `await using g = new Bun.WaitGroup({ signal })`, pass `g.signal` |
+| `context.Context`, `cancel()`                  | `AbortSignal`, `controller.abort()`                              |
+| `sync.Mutex`, `mu.Lock()`, `defer mu.Unlock()` | `const mu = new Bun.Mutex()`, `using _ = await mu.lock()`        |
+| `mu.TryLock()`                                 | `using lock = mu.tryLock()`, `undefined` while it is held        |
+| `sync/atomic`                                  | `Atomics` on a `SharedArrayBuffer`                               |
+| `GOMAXPROCS`                                   | `GOMAXPROCS` (the environment variable)                          |
+| `panic` in a goroutine                         | an unhandled rejection of the goroutine                          |
+| `all goroutines are asleep - deadlock!`        | the same, with where each operation waits                        |
 
 ---
 
