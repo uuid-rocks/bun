@@ -5,7 +5,9 @@
 //! and a channel operation in its VM's table, and is settled, aborted and torn down the same way.
 //! Unlocking hands the lock straight to the oldest waiter that can still take it, so the lock
 //! never looks free while anyone waits, and waiters take it in the order they came. A handoff
-//! whose waiter is gone by the time it arrives ([`Handoff`] dropped unsettled) unlocks again.
+//! whose waiter is gone by the time it arrives ([`Handoff`] dropped unsettled) unlocks again, and
+//! so does a thread that ends holding a lock ([`Held`]), the way a process that exits releases its
+//! file locks.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -35,8 +37,28 @@ pub(super) struct Handoff(Option<Arc<MutexCore>>);
 impl Handoff {
     /// The waiter's VM holds the lock now.
     pub(super) fn keep(mut self) {
-        self.0 = None;
+        held().0.push(self.0.take().expect("a handoff is kept once"));
     }
+}
+
+/// The mutexes a VM holds, in its `RuntimeState`. Unlocked when the VM ends.
+#[derive(Default)]
+pub(crate) struct Held(Vec<Arc<MutexCore>>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for mutex in self.0.drain(..) {
+            mutex.unlock();
+        }
+    }
+}
+
+fn held() -> &'static mut Held {
+    let state = crate::jsc_hooks::runtime_state();
+    debug_assert!(!state.is_null());
+    // SAFETY: the live per-thread `RuntimeState`; JS thread. Nothing that a use of it calls reaches
+    // it again.
+    unsafe { &mut (*state).mutexes_held }
 }
 
 impl Drop for Handoff {
@@ -118,7 +140,10 @@ impl Mutex {
         }
         let id = ops().next_id();
         Ok(match self.core.lock(|| new_waiter(global, id)) {
-            None => JSPromise::resolved_promise_value(global, JSValue::UNDEFINED),
+            None => {
+                held().0.push(Arc::clone(&self.core));
+                JSPromise::resolved_promise_value(global, JSValue::UNDEFINED)
+            }
             Some(waiter) => wait_for(
                 global,
                 OpKind::Lock,
@@ -132,13 +157,37 @@ impl Mutex {
     }
 
     pub(crate) fn try_lock(&self) -> bool {
-        self.core.try_lock()
+        let locked = self.core.try_lock();
+        if locked {
+            held().0.push(Arc::clone(&self.core));
+        }
+        locked
     }
 
-    /// Once per `lock()` or `tryLock()` that took the lock.
+    /// Once per `lock()` or `tryLock()` that took the lock, on its thread.
     pub(crate) fn unlock(&self) {
-        self.core.unlock();
+        let held = &mut held().0;
+        if let Some(i) = held.iter().position(|mutex| Arc::ptr_eq(mutex, &self.core)) {
+            held.swap_remove(i);
+            self.core.unlock();
+        }
     }
+}
+
+/// `bun:internal-for-testing`: how many entries the mutex's queue of waiters holds, live or not.
+pub(crate) fn waiters_for_testing(cx: &mut JsScope<'_>, mutex: JsLocal<'_>) -> JsResult<JSValue> {
+    let global = cx.global();
+    let Some(mutex) = mutex.to_js().as_class_ref::<Mutex>() else {
+        return Err(crate::node::util::validators::throw_err_invalid_arg_type(
+            global,
+            "mutex",
+            "Bun.Mutex",
+            mutex.to_js(),
+        ));
+    };
+    Ok(JSValue::js_number(
+        mutex.core.state.lock().waiters.len() as f64,
+    ))
 }
 
 /// The mutexes in the structured clone messages that exist, on any thread, by what the message has

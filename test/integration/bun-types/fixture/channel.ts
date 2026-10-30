@@ -62,3 +62,59 @@ Bun.select([[strings, 1]]);
 Bun.select([1]);
 // @ts-expect-error - send cases take no transfer list
 Bun.select([[ch, 1, { transfer: [] }]]);
+
+// values({ signal })
+{
+  const iterator = ch.values({ signal: AbortSignal.timeout(10) });
+  expectType(iterator).is<AsyncIterableIterator<number, undefined>>();
+  for await (const n of ch.values()) expectType(n).is<number>();
+  expectType(ch[Symbol.asyncIterator]()).is<AsyncIterableIterator<number, undefined>>();
+  // @ts-expect-error - the signal is an AbortSignal
+  ch.values({ signal: 1 });
+}
+
+// An AbortSignal is a case, which narrows on its index
+{
+  const quit = new AbortController();
+  const result = await Bun.select([ch, quit.signal, AbortSignal.timeout(10)]);
+  expectType(result.index).is<0 | 1 | 2>();
+  if (result.index === 2) {
+    expectType(result).is<{ index: 2; value: unknown; closed: false }>();
+  } else if (result.index === 0 && !result.closed) {
+    expectType(result.value).is<number>();
+  }
+  expectType(await Bun.select([AbortSignal.timeout(10)])).is<{ index: 0; value: unknown; closed: false }>();
+}
+
+// Bun.WaitGroup
+{
+  await using group = new Bun.WaitGroup({ signal: AbortSignal.timeout(10) });
+  expectType(group.signal).is<AbortSignal>();
+  expectType(group.go((a: number, b: string) => a + b.length, 1, "x")).is<Bun.Goroutine<number>>();
+  expectType(group.go(async (signal: AbortSignal) => signal.aborted, group.signal)).is<Bun.Goroutine<boolean>>();
+  expectType(group.go<string>("./task.ts", 1)).is<Bun.Goroutine<string>>();
+  expectType(group.wait()).is<Promise<void>>();
+  // @ts-expect-error - the arguments must fit the function
+  group.go((a: number) => a, "not a number");
+  // @ts-expect-error - the signal is an AbortSignal
+  new Bun.WaitGroup({ signal: 1 });
+}
+
+// Bun.Mutex
+{
+  const mu = new Bun.Mutex();
+  expectType(mu.lock()).is<Promise<Bun.MutexLock>>();
+  expectType(mu.lock({ signal: AbortSignal.timeout(10) })).is<Promise<Bun.MutexLock>>();
+  expectType(mu.tryLock()).is<Bun.MutexLock | undefined>();
+  {
+    await using lock = await mu.lock();
+    expectType(lock.unlock()).is<void>();
+  }
+  {
+    using lock = mu.tryLock();
+    if (lock) expectType(lock).is<Bun.MutexLock>();
+  }
+  await Bun.go(async (mu: Bun.Mutex) => {
+    using _ = await mu.lock();
+  }, mu);
+}

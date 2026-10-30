@@ -115,7 +115,9 @@ pub(crate) unsafe fn before_poll(vm: *const VirtualMachine, state: *const Runtim
     }
     // SAFETY: fn contract.
     let (vm_ref, state_ref) = unsafe { (&*vm, &*state) };
-    if !state_ref.timer.quiet() || !vm_ref.deadlock_quiet(state_ref.deadlock.goroutine_refs.get())
+    // A change to a file starts the program again.
+    if !matches!(vm_ref.hot_reload, bun_options_types::context::HotReload::None)
+        || !state_ref.timer.quiet() || !vm_ref.deadlock_quiet(state_ref.deadlock.goroutine_refs.get())
     {
         return false;
     }
@@ -161,7 +163,9 @@ pub(crate) fn after_poll(state: *const RuntimeState) {
 fn is_deadlocked(registry: &Registry) -> bool {
     let vms = &registry.vms;
     // A worker whose VM is starting, or whose VM is gone but whose thread is not, can still run.
+    // So can a threadsafe function an addon's thread may call.
     if registry.asleep != vms.len()
+        || crate::napi::napi_body::threadsafe_function_live_count() != 0
         || vms.len()
             != 1 + bun_jsc::web_worker::LIVE_WORKERS.load(core::sync::atomic::Ordering::SeqCst)
         || !Bun__Go__poolIsIdle()

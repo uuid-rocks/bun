@@ -415,6 +415,75 @@ describe("Bun.Channel", () => {
     for await (const n of ch) values.push(n);
     expect(values).toEqual([1, 2, 3]);
   });
+
+  test("values({ signal }): an abort rejects the loop with the reason and leaves the channel open", async () => {
+    const ch = new Bun.Channel<number>(4);
+    await ch.send(1);
+    await ch.send(2);
+    const controller = new AbortController();
+    const received: number[] = [];
+    const reason = new Error("stop");
+    const error = await (async () => {
+      for await (const value of ch.values({ signal: controller.signal })) {
+        received.push(value);
+        controller.abort(reason);
+      }
+    })().catch(e => e);
+    expect(error).toBe(reason);
+    expect(received).toEqual([1]);
+    // The value the loop did not take is still there, for any receiver.
+    expect(ch.closed).toBe(false);
+    expect(await ch.receive()).toBe(2);
+
+    // A waiting next() rejects when the signal aborts, and takes nothing.
+    const later = new AbortController();
+    const iterator = ch.values({ signal: later.signal });
+    const next = iterator.next();
+    later.abort(reason);
+    expect(await next.catch(e => e)).toBe(reason);
+    expect(await iterator.next().catch(e => e)).toBe(reason);
+    await ch.send(3);
+    expect(await ch.receive()).toBe(3);
+
+    // Without a signal it is for await's iterator; it ends on close.
+    await ch.send(4);
+    ch.close();
+    expect(await Array.fromAsync(ch.values())).toEqual([4]);
+    expect(() => ch.values({ signal: 1 as any })).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+    expect(() => ch.values(1 as any)).toThrow(expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }));
+  });
+
+  test("values({ signal }): aborts racing a goroutine's sends never lose or repeat a value", async () => {
+    const ch = new Bun.Channel<number>();
+    const count = 200;
+    const producer = Bun.go(
+      async (ch: Bun.Channel<number>, count: number) => {
+        for (let i = 0; i < count; i++) await ch.send(i);
+        ch.close();
+      },
+      ch,
+      count,
+    );
+    const received: number[] = [];
+    let aborted = 0;
+    for (let round = 0; ; round++) {
+      const controller = new AbortController();
+      const next = ch.values({ signal: controller.signal }).next();
+      // Sometimes before the value arrives, sometimes after.
+      if (round % 3 === 0) controller.abort();
+      else if (round % 3 === 1) queueMicrotask(() => controller.abort());
+      else setImmediate(() => controller.abort());
+      const result = await next.catch(() => {
+        aborted++;
+        return undefined;
+      });
+      if (result?.done) break;
+      if (result) received.push(result.value);
+    }
+    await producer;
+    expect(received).toEqual(Array.from({ length: count }, (_, i) => i));
+    expect(aborted).toBeGreaterThan(0);
+  });
 });
 
 describe.concurrent("Bun.Channel process", () => {
