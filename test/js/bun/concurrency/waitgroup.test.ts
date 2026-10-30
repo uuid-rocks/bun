@@ -110,6 +110,15 @@ describe("Bun.WaitGroup", () => {
     })().catch(e => e);
     expect(thrown.message).toBe("not waited for");
 
+    // A goroutine that fails while disposal waits for it, but not because of the abort.
+    const late = await (async () => {
+      await using group = new Bun.WaitGroup();
+      group.go(() => {
+        throw new Error("failed during disposal");
+      });
+    })().catch(e => e);
+    expect(late.message).toBe("failed during disposal");
+
     const waited = await (async () => {
       await using group = new Bun.WaitGroup();
       group.go(() => {

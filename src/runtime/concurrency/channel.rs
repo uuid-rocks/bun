@@ -259,7 +259,7 @@ pub(crate) struct ChannelOp {
     waiter: Arc<Waiter>,
     channels: Channels,
     /// A select's `AbortSignal` cases, which it follows while it waits.
-    signal_cases: Vec<Box<SignalCase>>,
+    signal_cases: Box<[SignalCase]>,
     /// The mutex a `lock()` waits for.
     mutex: Option<Arc<MutexCore>>,
     /// Where module code waits: no async function's frame shows a top-level `await`.
@@ -343,14 +343,17 @@ impl ChannelOp {
             }
         };
         let mut out = String::from(what);
-        for frame in stack.lines().filter(|line| {
-            let line = line.trim_start();
-            line.starts_with("at ") && !line.contains("(internal:")
-        }) {
-            out.push_str("\n    ");
-            out.push_str(frame.trim_start());
+        let mut frames = 0;
+        for line in bun_core::strings::split(stack.as_bytes(), b"\n") {
+            let line = line.trim_ascii();
+            if line.starts_with(b"at ") && !bun_core::strings::contains(line, b"(internal:") {
+                out.push_str("\n    ");
+                let start = line.as_ptr() as usize - stack.as_ptr() as usize;
+                out.push_str(&stack[start..start + line.len()]);
+                frames += 1;
+            }
         }
-        if let (Some((url, line, column)), false) = (&self.top_level, out.contains('\n')) {
+        if let (Some((url, line, column)), 0) = (&self.top_level, frames) {
             out.push_str(&format!("\n    at {url}:{line}:{column}"));
         }
         out
@@ -795,12 +798,10 @@ pub(super) fn wait_for(
         channels,
         signal_cases: signal_cases
             .iter()
-            .map(|&(case, _)| {
-                Box::new(SignalCase {
-                    abort_handle: AbortHandle::for_owner::<SignalCase>(),
-                    op_id: id,
-                    case,
-                })
+            .map(|&(case, _)| SignalCase {
+                abort_handle: AbortHandle::for_owner::<SignalCase>(),
+                op_id: id,
+                case,
             })
             .collect(),
         mutex,
@@ -822,7 +823,7 @@ pub(super) fn wait_for(
                 break;
             };
             let cases = &mut (*op.as_ptr()).signal_cases;
-            let case: *mut SignalCase = &mut *cases[i];
+            let case: *mut SignalCase = &raw mut cases[i];
             AbortHandle::follow_owner(case, signal);
         }
     }

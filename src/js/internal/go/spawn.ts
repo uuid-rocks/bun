@@ -449,7 +449,7 @@ class WaitGroup {
   #running = new Set<Promise<unknown>>();
   // The first goroutine that failed, and whether wait() has thrown it.
   #failure: { error: unknown; thrown: boolean } | undefined;
-  // Disposal aborted the goroutines: what they throw from then on is what it asked for.
+  // Disposal aborted the goroutines: an AbortError they throw from then on is what it asked for.
   #disposed = false;
 
   constructor(options?: { signal?: AbortSignal }) {
@@ -477,7 +477,7 @@ class WaitGroup {
       () => running.delete(goroutine),
       error => {
         running.delete(goroutine);
-        if (this.#failure !== undefined || this.#disposed) return;
+        if (this.#failure !== undefined || (this.#disposed && (error as Error | null)?.name === "AbortError")) return;
         this.#failure = { error, thrown: false };
         this.#controller.abort(error);
       },
@@ -498,7 +498,8 @@ class WaitGroup {
 
   async [Symbol.asyncDispose]() {
     this.#disposed = true;
-    this.#controller.abort($makeAbortError("The WaitGroup was disposed"));
+    // A DOMException keeps its name through the clone each goroutine's signal makes of it.
+    this.#controller.abort(new DOMException("The WaitGroup was disposed", "AbortError"));
     const running = this.#running;
     while (running.size > 0) await Promise.allSettled(running);
     const failure = this.#failure;
