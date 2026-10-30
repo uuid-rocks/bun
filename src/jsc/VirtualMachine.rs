@@ -508,6 +508,8 @@ unsafe extern "C" {
     safe fn Bun__closeAllNodeSqliteDatabasesForTermination(global: &JSGlobalObject);
     safe fn Bun__WebView__closeAllForTermination();
     safe fn Zig__GlobalObject__prepareForDestruction(global: &JSGlobalObject);
+    /// Main thread: the `Bun.go` pool's threads end; the pool grows anew as goroutines wait.
+    safe fn Bun__Go__restartPool();
     safe fn Zig__GlobalObject__forbidExecution(global: &JSGlobalObject);
     safe fn Zig__GlobalObject__stopActiveDOMObjectsForTestIsolation(global: &JSGlobalObject);
     safe fn Zig__GlobalObject__retireForTestIsolation(global: &JSGlobalObject);
@@ -4919,6 +4921,10 @@ impl VirtualMachine {
             // The hook walks the VM's cron-job list and detaches each job from
             // the old global so the new global can re-register them post-reload.
             (hooks.cron_clear_all_reload)(self);
+        }
+        // Goroutines started from now on import the modules as they are now.
+        if self.is_main_thread() {
+            Bun__Go__restartPool();
         }
         // `JSGlobalObject::reload` drains microtasks + collects async + clears
         // the JSC module loader registry.

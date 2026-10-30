@@ -5009,9 +5009,12 @@ extern "C" void Zig__GlobalObject__forbidExecution(Zig::GlobalObject* globalObje
 
 // `bun test --isolate`: the file that just finished is being retired on a live VM. Its context's
 // workers, ports, channels and sockets are stopped before anything else of the file is swept.
+extern "C" void Bun__Go__restartPool();
+
 extern "C" void Zig__GlobalObject__stopActiveDOMObjectsForTestIsolation(Zig::GlobalObject* globalObject)
 {
     Bun::retireWebViewsForTestIsolation(globalObject);
+    Bun__Go__restartPool();
     globalObject->scriptExecutionContext()->prepareForDestruction();
 }
 

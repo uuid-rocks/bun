@@ -80,9 +80,7 @@ pub struct WebWorker {
     execution_context_id: u32,
     mini: bool,
     eval_mode: bool,
-    /// Created by `node:worker_threads`' `Worker` (as opposed to the Web `Worker`
-    /// constructor): loads `node:worker_threads` before preloads and the entry point.
-    is_node_worker: bool,
+    kind: WorkerKind,
     /// Borrowed from the proxy's `WorkerOptions` (alive as long as the proxy).
     argv_ptr: *const WTFStringImpl,
     argv_len: usize,
@@ -196,6 +194,29 @@ enum EntryOutcome {
     Stop,
 }
 
+/// `WebCore::WorkerOptions::Kind`.
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum WorkerKind {
+    /// The global `Worker` constructor.
+    Web = 0,
+    /// `node:worker_threads`' `Worker`: loads `node:worker_threads` before preloads and the entry point.
+    Node = 1,
+    /// A thread of the `Bun.go` pool: runs `internal/go/runtime` instead of an entry point.
+    Goroutine = 2,
+}
+
+impl WorkerKind {
+    fn from_ffi(kind: u8) -> Self {
+        match kind {
+            0 => Self::Web,
+            1 => Self::Node,
+            2 => Self::Goroutine,
+            _ => unreachable!("WorkerOptions::Kind {kind}"),
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Copy, Clone, Eq, PartialEq, strum::IntoStaticStr)]
 pub enum Status {
@@ -225,6 +246,10 @@ unsafe extern "C" {
     /// Loads `node:worker_threads` in this VM (it rebinds process stdio and
     /// registers parentPort). May leave an exception pending.
     safe fn Bun__Worker__loadNodeWorkerThreadsModule(global: &JSGlobalObject);
+    /// Loads `internal/go/runtime`, which takes goroutines from the pool's queue for as long as
+    /// the thread runs. May leave an exception pending.
+    safe fn Bun__Worker__loadGoroutineRuntime(global: &JSGlobalObject);
+    safe fn Bun__Go__reportUncaughtError(global: &JSGlobalObject, error: JSValue);
     safe fn WebWorker__dispatchError(
         global: &JSGlobalObject,
         proxy: *mut c_void,
@@ -294,6 +319,51 @@ extern "C" fn WebWorker__getMessagingProxy(vm: &VirtualMachine) -> *mut c_void {
     vm.worker_ref()
         .map(|w| w.messaging_proxy)
         .unwrap_or(core::ptr::null_mut())
+}
+
+/// How many threads the `Bun.go` pool grows to: `GOMAXPROCS` (or `UV_THREADPOOL_SIZE`), else the CPU count.
+#[unsafe(no_mangle)]
+extern "C" fn Bun__Go__maxPoolThreads() -> u32 {
+    u32::from(bun_core::get_thread_count())
+}
+
+/// `Bun.go(specifier)`: the module a pool thread imports, resolved as `new Worker(specifier)`
+/// resolves its entry point. False with `error_message` set if it names nothing.
+///
+/// # Safety
+/// `vm` is the calling thread's live VM.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn Bun__Go__resolveModule(
+    vm: *mut VirtualMachine,
+    specifier: &BunString,
+    out: &mut BunString,
+    error_message: &mut BunString,
+) -> bool {
+    let specifier = specifier.to_utf8();
+    let mut temp_log = bun_ast::Log::default();
+    // SAFETY: fn contract; the log pointer is restored before returning.
+    let prev_log = unsafe {
+        let prev = (*vm).transpiler.log;
+        (*vm).transpiler.set_log(&raw mut temp_log);
+        prev
+    };
+    let dot_slash = OnceCell::new();
+    // SAFETY: fn contract.
+    let path = unsafe {
+        resolve_entry_point_specifier(
+            vm,
+            specifier.slice(),
+            &dot_slash,
+            error_message,
+            &mut temp_log,
+        )
+    };
+    if let Some(path) = path {
+        *out = BunString::clone_utf8(crate::compiled_program::entry_module_key(path));
+    }
+    // SAFETY: fn contract.
+    unsafe { (*vm).transpiler.set_log(prev_log) };
+    path.is_some()
 }
 
 impl Drop for WebWorker {
@@ -387,7 +457,7 @@ impl WebWorker {
         mini: bool,
         default_unref: bool,
         eval_mode: bool,
-        is_node_worker: bool,
+        kind: u8,
         argv_ptr: *const WTFStringImpl,
         argv_len: usize,
         inherit_exec_argv: bool,
@@ -450,10 +520,11 @@ impl WebWorker {
             }
         }
 
+        let kind = WorkerKind::from_ffi(kind);
         // The VM of the Worker is created for a program. The Worker resolves the specifier again and reports what is wrong with it.
         let specifier = spec_slice.slice();
-        let runs_text_beside_compiled_program = (specifier.starts_with(b"data:")
-            || specifier.starts_with(b"blob:"))
+        let runs_text_beside_compiled_program = kind != WorkerKind::Goroutine
+            && (specifier.starts_with(b"data:") || specifier.starts_with(b"blob:"))
             && crate::compiled_program::runs_worker_of_text_apart()
             && {
                 let mut ignored_message = BunString::EMPTY;
@@ -474,6 +545,10 @@ impl WebWorker {
                 })
             };
         let image = crate::compiled_program::has_image_for_each_entry_point().then(|| {
+            // A pool thread imports the modules of goroutines as the program's own code does.
+            if kind == WorkerKind::Goroutine {
+                return crate::compiled_program::image_of_worker(None);
+            }
             let mut ignored_message = BunString::EMPTY;
             let dot_slash = OnceCell::new();
             // SAFETY: as for the preloads.
@@ -556,7 +631,7 @@ impl WebWorker {
             execution_context_id: this_context_id,
             mini,
             eval_mode,
-            is_node_worker,
+            kind,
             argv_ptr,
             argv_len,
             exec_argv_ptr,
@@ -1086,7 +1161,11 @@ impl WebWorker {
 
             vm_ref.is_main_thread = false;
             VirtualMachine::set_is_main_thread_vm(false);
-            vm_ref.on_unhandled_rejection = on_unhandled_rejection;
+            vm_ref.on_unhandled_rejection = if self.kind == WorkerKind::Goroutine {
+                on_goroutine_thread_unhandled_rejection
+            } else {
+                on_unhandled_rejection
+            };
         }
 
         // Publish now (rather than at the end of startVM) so that:
@@ -1174,6 +1253,10 @@ impl WebWorker {
         // `preload: Vec<Box<[u8]>>` — clone the boxes (cheap, ≤handful).
         vm.as_mut().preload.clone_from(&self.preloads);
 
+        if self.kind == WorkerKind::Goroutine {
+            return self.spin_goroutine_runtime(vm);
+        }
+
         // Resolve the entry point on the worker thread (the parent only stored
         // the raw specifier). The returned slice is BORROWED — every exit from
         // spin() goes through shutdown() which is noreturn, so a `defer free`
@@ -1214,7 +1297,7 @@ impl WebWorker {
 
         // Node runs its worker bootstrap (parentPort, stdio, process overrides)
         // ahead of user code; ours is node:worker_threads' module body.
-        if self.is_node_worker {
+        if self.kind == WorkerKind::Node {
             let global = vm.global();
             if let Err(err) = jsc::host_fn::from_js_host_call_generic(global, || {
                 Bun__Worker__loadNodeWorkerThreadsModule(global)
@@ -1368,6 +1451,47 @@ impl WebWorker {
         }
         drop(entry_promise);
 
+        self.flush_logs(vm);
+        self.shutdown();
+    }
+
+    /// `spin()` of a pool thread: `internal/go/runtime` stands in for the entry point and keeps
+    /// the loop alive until the thread is asked to stop.
+    fn spin_goroutine_runtime(&self, vm: &VirtualMachine) {
+        let global = vm.global();
+        if let Err(err) = jsc::host_fn::from_js_host_call_generic(global, || {
+            Bun__Worker__loadGoroutineRuntime(global)
+        }) {
+            let exception = global.take_exception(err);
+            let _ = vm.as_mut().uncaught_exception(global, exception, false);
+            if !self.exit_called.load(Ordering::Relaxed) {
+                vm.as_mut().exit_handler.exit_code = 1;
+            }
+            self.flush_logs(vm);
+            WebWorker__entrySettled(global);
+            return self.shutdown();
+        }
+        WebWorker__entrySettled(global);
+        Bun__AOT__didStartThread();
+        if self.has_requested_terminate() {
+            self.flush_logs(vm);
+            return self.shutdown();
+        }
+        self.flush_logs(vm);
+        WebWorker__workerGlobalScopeStarted(self.messaging_proxy, global);
+        self.set_status(Status::Running);
+
+        vm.as_mut().tick();
+        while vm.is_event_loop_alive() {
+            vm.as_mut().tick();
+            if self.has_requested_terminate() {
+                break;
+            }
+            vm.as_mut().auto_tick_active();
+            if self.has_requested_terminate() {
+                break;
+            }
+        }
         self.flush_logs(vm);
         self.shutdown();
     }
@@ -1613,6 +1737,26 @@ fn on_unhandled_rejection(
     //
     // Instead, request the stop as `exit()` does and unwind to `spin()`'s `shutdown()`.
     vm.handle_ref().request_termination();
+}
+
+/// A pool thread runs goroutines of the whole program: what one of them leaves uncaught is the
+/// program's (`Bun__Go__reportUncaughtError`), and the thread goes on with the others.
+fn on_goroutine_thread_unhandled_rejection(
+    vm: &mut VirtualMachine,
+    _: &JSGlobalObject,
+    error_instance_or_exception: JSValue,
+) {
+    if !vm.script_allowed() || error_instance_or_exception.is_termination_exception() {
+        return;
+    }
+    // The caller counted the error as this VM's, which would end the loop; it is the main thread's.
+    vm.unhandled_error_counter = vm.unhandled_error_counter.saturating_sub(1);
+    vm.exit_handler.exit_code = 0;
+    let global = vm.global();
+    let error = error_instance_or_exception
+        .to_error()
+        .unwrap_or(error_instance_or_exception);
+    Bun__Go__reportUncaughtError(global, error);
 }
 
 /// Resolve a worker entry-point specifier to a path the module loader can

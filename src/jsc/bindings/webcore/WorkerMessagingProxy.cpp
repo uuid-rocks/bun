@@ -39,6 +39,7 @@
 #include "VectorSizeLimit.h"
 #include "Worker.h"
 #include "ZigGlobalObject.h"
+#include "BunGo.h"
 #include <JavaScriptCore/JSPromise.h>
 #include <JavaScriptCore/OwedOutOfMemoryError.h>
 #include <wtf/TZoneMallocInlines.h>
@@ -64,7 +65,7 @@ void* WebWorker__create(
     bool miniMode,
     bool unrefByDefault,
     bool evalMode,
-    bool isNodeWorker,
+    uint8_t kind,
     StringImpl** argvPtr,
     size_t argvLen,
     bool defaultExecArgv,
@@ -83,6 +84,9 @@ void WebWorker__releaseParentPollRef(void*);
 void WebWorker__join(void*);
 // Drop one ref on the thread object; the last one frees it.
 void WebWorker__deref(void*);
+
+// BunGo.cpp
+void Bun__Go__reportUncaughtError(Zig::GlobalObject*, JSC::EncodedJSValue);
 
 } // extern "C"
 
@@ -162,7 +166,7 @@ ExceptionOr<void> WorkerMessagingProxy::startWorkerGlobalScope(const String& scr
         m_options.mini,
         m_options.unref,
         m_options.evalMode,
-        m_options.kind == WorkerOptions::Kind::Node,
+        static_cast<uint8_t>(m_options.kind),
         reinterpret_cast<WTF::StringImpl**>(m_options.argv.begin()),
         m_options.argv.size(),
         !m_options.execArgv.has_value(),
@@ -185,6 +189,8 @@ void WorkerMessagingProxy::terminateWorkerGlobalScope()
     if (m_askedToTerminate)
         return;
     m_askedToTerminate = true;
+    if (m_options.kind == WorkerOptions::Kind::Goroutine)
+        Bun::Go::poolThreadWillExit(m_workerContextIdentifier);
     if (m_workerThread)
         WebWorker__requestTermination(m_workerThread);
 }
@@ -516,6 +522,9 @@ void WorkerMessagingProxy::postErrorToWorkerObject(Zig::GlobalObject& workerGlob
         if (!postSerializedErrorToWorkerObject(workerGlobalObject, error))
             postMessageErrorToWorkerObject(String { message });
         return;
+    case WorkerOptions::Kind::Goroutine:
+        Bun__Go__reportUncaughtError(&workerGlobalObject, JSC::JSValue::encode(error));
+        return;
     }
 }
 
@@ -534,6 +543,10 @@ void WorkerMessagingProxy::postOutOfMemoryErrorToWorkerObject()
         case WorkerOptions::Kind::Node:
             init.error = JSC::createOutOfMemoryError(context.globalObject(), limit);
             break;
+        case WorkerOptions::Kind::Goroutine:
+            // An exhausted heap ends the program, as it does on the main thread.
+            Bun__reportUnhandledError(context.globalObject(), JSC::JSValue::encode(JSC::createOutOfMemoryError(context.globalObject(), limit)));
+            return;
         }
         workerObject->dispatchEvent(ErrorEvent::create(eventNames().errorEvent, init, EventIsTrusted::Yes));
     });
@@ -553,6 +566,9 @@ void WorkerMessagingProxy::postFailedToStartErrorToWorkerObject()
         case WorkerOptions::Kind::Node:
             init.error = JSC::createTypeError(context.globalObject(), "Failed to spawn worker thread"_s);
             break;
+        case WorkerOptions::Kind::Goroutine:
+            // The pool grows again when goroutines wait (Bun::Go::poolThreadDidExit).
+            return;
         }
         workerObject->dispatchEvent(ErrorEvent::create(eventNames().errorEvent, init, EventIsTrusted::Yes));
     });
@@ -617,6 +633,8 @@ void WorkerMessagingProxy::workerGlobalScopeDestroyedInternal(int32_t exitCode, 
 
     releaseWorkerThread();
     m_scriptExecutionContext = nullptr;
+    if (m_options.kind == WorkerOptions::Kind::Goroutine)
+        Bun::Go::poolThreadDidExit(m_workerContextIdentifier);
 }
 
 void WorkerMessagingProxy::parentContextWillDestroy()

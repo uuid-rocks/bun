@@ -360,5 +360,7 @@ const errors: ErrorCodeMapping = [
   ["ERR_REDIS_SERVER_ERROR", Error, "RedisError"],
   ["ERR_FFI_CC_DISABLED", Error],
   ["HPE_INVALID_URL", Error],
+  ["ERR_GOROUTINE_NOT_SENDABLE", TypeError],
+  ["ERR_GOROUTINE_THREAD_EXITED", Error],
 ];
 export default errors;

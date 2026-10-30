@@ -83,4 +83,63 @@ declare module "bun" {
     /** {@link close}: `using channel = new Bun.Channel()` closes it at the end of the scope. */
     [Symbol.dispose](): void;
   }
+
+  /**
+   * A goroutine started by {@link go}: a promise for what its function returns.
+   *
+   * A goroutine keeps the event loop of the thread that started it alive until it settles. `Promise.all()` waits
+   * for several; derived promises (`.then()`, `.catch()`) are plain `Promise`s.
+   *
+   * @category Concurrency
+   */
+  interface Goroutine<T> extends Promise<T> {
+    /** Keeps the event loop alive until the goroutine settles (the default). Returns the goroutine. */
+    ref(): this;
+    /** Lets the process exit while the goroutine still runs. Returns the goroutine. */
+    unref(): this;
+  }
+
+  /**
+   * Runs a function on another thread, like Go's `go` statement.
+   *
+   * Goroutines run on a pool of threads that Bun starts as they are needed: as many as `GOMAXPROCS` (2 or more),
+   * or as the machine has CPU cores. A goroutine runs on one thread until it settles. While it awaits, its thread runs other
+   * goroutines. Goroutines on different threads run in parallel.
+   *
+   * `fn` must be a function that a module exports (ES module or CommonJS). Each pool thread imports that module
+   * once, and calls the export with `args`. Module state is per thread, and `import.meta.main` is `false` there. A
+   * closure, a bound or native function, or a function no module exports throws a `TypeError`
+   * (`ERR_GOROUTINE_NOT_SENDABLE`), because its variables can't move to another thread.
+   *
+   * The arguments and the result are structured clones, as with `postMessage()`: a `SharedArrayBuffer` or a
+   * {@link Channel} is shared, everything else is copied. Arguments that can't be cloned throw a `DataCloneError`.
+   * If the function throws, the goroutine rejects with a copy of the error (its name, message, stack, `cause` and
+   * own properties). A rejection that nothing handles is an unhandled rejection on the thread that called `go()`.
+   *
+   * @example
+   * ```ts
+   * // primes.ts
+   * export function countPrimes(from: number, to: number) {
+   *   let count = 0;
+   *   for (let n = from; n < to; n++) if (isPrime(n)) count++;
+   *   return count;
+   * }
+   *
+   * // main.ts
+   * import { countPrimes } from "./primes.ts";
+   * const counts = await Promise.all([Bun.go(countPrimes, 0, 1e6), Bun.go(countPrimes, 1e6, 2e6)]);
+   * ```
+   *
+   * @category Concurrency
+   */
+  function go<F extends (...args: any[]) => unknown>(fn: F, ...args: Parameters<F>): Goroutine<Awaited<ReturnType<F>>>;
+  /**
+   * Runs the default export of a module on another thread, like {@link go} with a function. `module` is resolved
+   * the way `new Worker(module)` resolves its entry point: a relative path against the current directory, so prefer
+   * `new URL("./task.ts", import.meta.url)`. In an executable built with `bun build --compile`, list the module as
+   * an entry point of the build.
+   *
+   * @category Concurrency
+   */
+  function go<R = unknown>(module: string | URL, ...args: unknown[]): Goroutine<R>;
 }

@@ -47,6 +47,9 @@ const seenCodeEntries = [
   "Bun.Transpiler",
   "Worker",
   "bun:jsc.startRemoteDebugger",
+  // Bun.go: a pool thread is a worker that imports the modules goroutines name.
+  "native:Cpp:BunGo.cpp:createGoRuntimeBinding",
+  "native:Cpp:BunGo.cpp:createGoSpawnBinding",
   "native:Cpp:NodeModuleModule.cpp:createStreamIterEnabledFlag",
   "native:Cpp:Worker.cpp:createNodeWorkerConstructor",
   "native:Cpp:Worker.cpp:createNodeWorkerThreadsBinding",
