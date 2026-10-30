@@ -283,11 +283,18 @@ impl ChannelOp {
                 WakeResult::Received(message) => message
                     .deserialize(global)
                     .map(|value| select_result(global, case as i32, value, false)),
-                WakeResult::Sent => Ok(select_result(global, case as i32, JSValue::UNDEFINED, false)),
+                WakeResult::Sent => Ok(select_result(
+                    global,
+                    case as i32,
+                    JSValue::UNDEFINED,
+                    false,
+                )),
                 WakeResult::Closed if sends[case as usize] => {
                     return promise.reject(global, Ok(closed_error(global)));
                 }
-                WakeResult::Closed => Ok(select_result(global, case as i32, JSValue::UNDEFINED, true)),
+                WakeResult::Closed => {
+                    Ok(select_result(global, case as i32, JSValue::UNDEFINED, true))
+                }
             };
             return promise.settle(global, value);
         }
@@ -534,7 +541,13 @@ impl Channel {
         Ok(match self.core.send(|| new_waiter(global, id), message) {
             SendStep::Done => JSPromise::resolved_promise_value(global, JSValue::UNDEFINED),
             SendStep::Closed => JSPromise::rejected_promise(global, closed_error(global)).to_js(),
-            SendStep::Wait(waiter) => wait(global, OpKind::Send, waiter, self.channels(), options.signal),
+            SendStep::Wait(waiter) => wait(
+                global,
+                OpKind::Send,
+                waiter,
+                self.channels(),
+                options.signal,
+            ),
         })
     }
 
@@ -621,7 +634,6 @@ pub(super) fn wait(
     }
     promise
 }
-
 
 /// `bun:internal-for-testing`: how many entries the channel's queues hold, live or not.
 pub(crate) fn queue_lengths_for_testing(

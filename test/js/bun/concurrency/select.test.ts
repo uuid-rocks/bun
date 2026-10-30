@@ -1,6 +1,6 @@
 import { channelQueueLengths } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
-import { isASAN, isDebug } from "harness";
+import { bunEnv, bunExe, isASAN, isDebug } from "harness";
 
 /** A Worker running `src`. Its first message, its `error` and its exit settle `ready`. */
 function startWorker(src: string, data?: unknown) {
@@ -360,6 +360,31 @@ describe("Bun.select", () => {
     const sent = ch.send("after");
     expect(await ch.receive()).toBe("after");
     await sent;
+  });
+
+  test("a waiting select does not keep the process alive", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const ch = new Bun.Channel();
+         Bun.select([ch, new Bun.Channel()]).then(r => console.log("selected " + r.index + " " + r.value));
+         ch.send(1);
+         Bun.select([new Bun.Channel(), [new Bun.Channel(), 2]]);
+         console.log("end of script");`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // The send meets the first select.
+    expect({ stdout, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+      stdout: "end of script\nselected 0 1\n",
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
   });
 
   test("duplicate channels", async () => {

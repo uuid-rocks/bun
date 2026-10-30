@@ -93,7 +93,10 @@ pub(crate) fn select(
         order.swap(i, (bun_core::fast_random() % (i as u64 + 1)) as usize);
     }
 
-    let mut locks: SmallVec<[_; 2]> = channels.iter().map(|channel| channel.state.lock()).collect();
+    let mut locks: SmallVec<[_; 2]> = channels
+        .iter()
+        .map(|channel| channel.state.lock())
+        .collect();
     let mut won = None;
     for &i in &order {
         let case = &mut read[i as usize];
