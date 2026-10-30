@@ -394,7 +394,7 @@ type Thrown = ["error", ErrorRecord] | ["value", unknown];
 function fromThread(thrown: Thrown): unknown {
   if (thrown[0] !== "error") return thrown[1];
   const record = thrown[1];
-  const { name, message, stack, props } = record;
+  const { name, message, stack, props, errors } = record;
   const options = "cause" in record ? { cause: fromThread(record.cause!) } : undefined;
   let error;
   if (record.domException) {
@@ -407,8 +407,8 @@ function fromThread(thrown: Thrown): unknown {
         enumerable: false,
       });
     }
-  } else if (record.errors !== undefined) {
-    error = new AggregateError(record.errors.map(fromThread), message, options);
+  } else if (errors !== undefined) {
+    error = new AggregateError(errors.map(fromThread), message, options);
   } else {
     const Constructor = errorConstructors[name] ?? Error;
     error = new Constructor(message, options);
