@@ -1708,11 +1708,15 @@ describe("Bun.go", () => {
         let group: any = new Bun.WaitGroup();
         group = router;
         group.go(new URL("./missing", import.meta.url));
+        // Initialized twice: not a WaitGroup either.
+        var twice: any = router;
+        twice.go(new URL("./twice", import.meta.url));
+        var twice: any = new Bun.WaitGroup();
       `,
       "tasks.ts": `export const label = "tasks";`,
     });
     const root = String(dir);
-    const expected = "settings\ntasks.ts#label\nmissing\n";
+    const expected = "settings\ntasks.ts#label\nmissing\ntwice\n";
     const bundle = await run([bunExe(), "build", "--target=bun", "navigation.ts", "--outdir", "out"], root);
     expect(bundle.stderr).toBe("");
     expect(bundle.exitCode).toBe(0);
@@ -1740,7 +1744,10 @@ describe("Bun.go", () => {
         }
         await using group = new Bun.WaitGroup();
         const other = new WaitGroup();
-        console.log(await run());
+        // A declaration without a value keeps the value.
+        var again = new Bun.WaitGroup();
+        var again;
+        console.log(await run(), await again.go(new URL("./task.ts#double", import.meta.url), 6));
       `,
       "task.ts": `export const double = (n: number) => n * 2;`,
     });
@@ -1752,7 +1759,7 @@ describe("Bun.go", () => {
     rmSync(join(root, "task.ts"));
     const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
     expect(stderr).toBe("");
-    expect(stdout).toBe("[ 8, 10 ]\n");
+    expect(stdout).toBe("[ 8, 10 ] 12\n");
     expect(exitCode).toBe(0);
   });
 
