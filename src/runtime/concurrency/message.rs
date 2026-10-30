@@ -115,7 +115,6 @@ impl ChannelMessage {
         &self.targets
     }
 
-
     /// The value, in `global`'s realm. Throws if the value cannot be made there.
     pub(crate) fn deserialize(self, global: &JSGlobalObject) -> JsResult<JSValue> {
         let message = core::mem::ManuallyDrop::new(self).message;
@@ -132,8 +131,7 @@ fn channel_ids(message: NonNull<c_void>) -> SmallVec<[u64; 4]> {
     loop {
         let capacity = ids.capacity();
         // SAFETY: a live message; `ids` has room for `capacity` ids.
-        let count =
-            unsafe { Bun__ChannelMessage__channelIds(message, ids.as_mut_ptr(), capacity) };
+        let count = unsafe { Bun__ChannelMessage__channelIds(message, ids.as_mut_ptr(), capacity) };
         if count <= capacity {
             // SAFETY: the first `count` were written.
             unsafe { ids.set_len(count) };

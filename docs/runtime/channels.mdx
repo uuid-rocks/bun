@@ -290,7 +290,7 @@ console.log((await channel.receive()).byteLength); // => 1024
 
 Each operation clones its value and settles a promise, so a channel moves a few million small values a second (3 to 6 million in `bench/concurrency`), far fewer than a Go channel. When values are small and many, send them in batches, such as arrays of a few hundred.
 
-Channels can hold each other: a channel sent into itself, or two channels sent into each other, are freed like any other garbage once nothing else refers to them. A thread refers to a channel until it collects its own garbage, so a cycle that went through a goroutine is freed after that goroutine's thread collects too.
+Channels can hold each other: a channel sent into itself, or two channels sent into each other, are freed like any other garbage once nothing else refers to them. A thread refers to a channel until it collects its own garbage, so a cycle that went through a goroutine is freed after that goroutine's thread collects too. A single cycle of more than about 250,000 channels is never freed.
 
 ---
 

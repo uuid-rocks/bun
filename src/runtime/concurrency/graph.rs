@@ -61,13 +61,15 @@ static COLLECTING: Guarded<()> = Guarded::new(());
 /// A collection runs, read without the lock.
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
-struct Collecting(#[allow(dead_code)] bun_threading::guarded::GuardedLock<'static, (), bun_threading::Mutex>);
+struct Collecting {
+    _lock: bun_threading::guarded::GuardedLock<'static, (), bun_threading::Mutex>,
+}
 
 impl Collecting {
     fn lock() -> Self {
         let lock = COLLECTING.lock();
         RUNNING.store(true, Ordering::Relaxed);
-        Collecting(lock)
+        Collecting { _lock: lock }
     }
 }
 
@@ -121,7 +123,9 @@ pub(super) fn drop_channel(channel: Arc<ChannelCore>) {
     let mut channel = Some(channel);
     let deferred = DEFERRED.try_with(|deferred| {
         if DROPPING.get() {
-            deferred.borrow_mut().push(channel.take().expect("taken once"));
+            deferred
+                .borrow_mut()
+                .push(channel.take().expect("taken once"));
         }
     });
     // Thread-locals are gone (the thread is ending), or this is the outermost drop.
