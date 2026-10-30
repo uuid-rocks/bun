@@ -779,6 +779,69 @@ describe.concurrent("Bun.go", () => {
     });
   });
 
+  test("what a cancelled goroutine left behind stays cancelled after it settles, and it can still unlock", async () => {
+    const { stdout, stderr, exitCode } = await run({
+      "main.ts": `
+        async function until(condition: () => boolean) {
+          const deadline = Date.now() + 4000;
+          while (!condition() && Date.now() < deadline) await Bun.sleep(1);
+          return condition();
+        }
+        const ch = new Bun.Channel<number>(10);
+        const mu = new Bun.Mutex();
+        // [waiting, tryLock, unlock of the lock it held, the callback's receive, settled]
+        const state = new Int32Array(new SharedArrayBuffer(20));
+        const worker = new Worker(URL.createObjectURL(new Blob([\`
+          self.onmessage = ({ data: { ch, mu, state } }) => {
+            Bun.go(async (ch, mu, state) => {
+              const held = await mu.lock();
+              Atomics.store(state, 0, 1);
+              try {
+                await ch.receive();
+              } catch {
+                try {
+                  mu.tryLock();
+                  Atomics.store(state, 1, 1);
+                } catch (error) {
+                  Atomics.store(state, 1, error.code === "ERR_GOROUTINE_THREAD_EXITED" ? 2 : 3);
+                }
+                held.unlock();
+                Atomics.store(state, 2, 1);
+                // Runs once the goroutine has settled.
+                setTimeout(async () => {
+                  try {
+                    Atomics.store(state, 3, await ch.receive());
+                  } catch (error) {
+                    Atomics.store(state, 3, error.code === "ERR_GOROUTINE_THREAD_EXITED" ? -1 : -2);
+                  }
+                });
+              }
+              Atomics.store(state, 4, 1);
+            }, ch, mu, state).catch(() => {});
+          };
+        \`])));
+        worker.postMessage({ ch, mu, state });
+        await until(() => Atomics.load(state, 0) === 1);
+        const closed = new Promise(resolve => worker.addEventListener("close", resolve));
+        worker.terminate();
+        await closed;
+        await until(() => Atomics.load(state, 4) === 1);
+        await ch.send(42);
+        await until(() => Atomics.load(state, 3) !== 0);
+        console.log("tryLock:", ["", "acquired", "threw ERR_GOROUTINE_THREAD_EXITED", "threw"][state[1]]);
+        console.log("unlocked:", state[2] === 1, !!mu.tryLock());
+        console.log("the callback's receive:", state[3] === -1 ? "cancelled" : state[3]);
+        console.log("left in the channel:", ch.length);
+      `,
+    });
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout:
+        "tryLock: threw ERR_GOROUTINE_THREAD_EXITED\nunlocked: true true\nthe callback's receive: cancelled\nleft in the channel: 1",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
   test("CommonJS exports, a module's default export, and module URLs", async () => {
     const { stdout, exitCode } = await run({
       "props.cjs": `exports.multiply = (a, b) => a * b;`,

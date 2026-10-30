@@ -230,7 +230,8 @@ describe("Bun.Channel", () => {
     const ch = new Bun.Channel<string>(1);
     const clone = structuredClone(ch);
     expect(clone).toBeInstanceOf(Bun.Channel);
-    expect(clone).not.toBe(ch);
+    // On one thread, one channel is one object.
+    expect(clone).toBe(ch);
     await clone.send("through the clone");
     expect(ch.length).toBe(1);
     expect(await ch.receive()).toBe("through the clone");
@@ -436,6 +437,44 @@ describe("Bun.Channel", () => {
     const values: string[] = [];
     for await (const v of ch) values.push(v);
     expect(values).toEqual(["handed"]);
+  });
+
+  test("a closed channel does not end while a value handed to a receiver could still come back", async () => {
+    const ch = new Bun.Channel<number>();
+    const state = new Int32Array(new SharedArrayBuffer(8));
+    const w = startWorker(
+      `self.onmessage = ({ data: { ch, state } }) => {
+        ch.receive().catch(() => {});
+        postMessage("waiting");
+        // The value is handed to the receive above, and this thread never gets to read it.
+        Atomics.wait(state, 0, 0);
+      };`,
+      { ch, state },
+    );
+    expect(await w.ready).toBe("waiting");
+    await ch.send(42);
+    ch.close();
+    const values = ch[Symbol.asyncIterator]();
+    // Waits: the worker may never read the value.
+    const first = values.next();
+    w.worker.terminate();
+    await w.closed;
+    expect(await first).toEqual({ value: 42, done: false });
+    expect(await values.next()).toEqual({ value: undefined, done: true });
+    expect(await ch.receive().catch(e => e.code)).toBe("ERR_CHANNEL_CLOSED");
+  });
+
+  test("a channel or a mutex that comes back to a thread is the same object", async () => {
+    const a = new Bun.Channel<unknown>(1);
+    await a.send(a);
+    expect(await a.receive()).toBe(a);
+    const mu = new Bun.Mutex();
+    const [channel, mutex] = await Bun.go((a: Bun.Channel<unknown>, mu: Bun.Mutex) => [a, mu], a, mu);
+    expect(channel).toBe(a);
+    expect(mutex).toBe(mu);
+    const seen = new Map([[a, "a"]]);
+    await a.send({ again: a });
+    expect(seen.get(((await a.receive()) as { again: Bun.Channel<unknown> }).again)).toBe("a");
   });
 
   test("values({ signal }): an abort rejects the loop with the reason and leaves the channel open", async () => {
@@ -706,11 +745,11 @@ describe.concurrent("Bun.Channel process", () => {
       }
       const inner = await outer.receive();
       const values = [await inner.receive(), await inner.receive(), await inner.receive()];
-      console.log(values[0], values[1].self === inner ? "itself" : "another", values[2]);
+      console.log(values[0], values[1].self === inner ? "itself" : "another channel", values[2]);
       await inner.send("still works");
       console.log(await inner.receive());
     `);
-    expect(result).toEqual({ stdout: "first another last\nstill works\n", stderr: "", exitCode: 0 });
+    expect(result).toEqual({ stdout: "first itself last\nstill works\n", stderr: "", exitCode: 0 });
   });
 
   test("a cycle made across threads is freed once no thread holds it", async () => {

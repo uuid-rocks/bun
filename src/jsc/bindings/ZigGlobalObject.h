@@ -38,6 +38,7 @@ class HandleScopeImpl;
 class JSNextTickQueue;
 class Process;
 class SecureContextCache;
+using SharedHandleWrappers = SecureContextCache;
 class GCProfilerObserver;
 
 struct ModuleGraphState;
@@ -700,6 +701,10 @@ public:
     // config digest. WeakGCMap self-registers with the heap, so no
     // visitChildren wiring needed (and it must NOT keep its values alive).
     std::unique_ptr<Bun::SecureContextCache> m_secureContextCache;
+
+    // The wrapper of each Bun.Channel and Bun.Mutex in this realm, by the address of its native
+    // core, while it is alive (ChannelMessage.cpp).
+    std::unique_ptr<Bun::SharedHandleWrappers> m_sharedHandleWrappers;
 
     std::unique_ptr<Bun::ModuleGraphState> m_moduleGraphs;
 

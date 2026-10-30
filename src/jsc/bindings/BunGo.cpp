@@ -169,7 +169,7 @@ public:
     bool hasEnded(ScriptExecutionContextIdentifier owner);
     // The owner of running goroutine `id`, or 0.
     ScriptExecutionContextIdentifier ownerOf(uint64_t id);
-    // Owners that ended while goroutines of theirs ran: what hasEnded() looks up.
+    // How many owners have ended: hasEnded() looks them up only once one has.
     std::atomic<unsigned> endedOwnerCount { 0 };
 
 private:
@@ -191,8 +191,12 @@ private:
     HashSet<ScriptExecutionContextIdentifier> m_threads WTF_GUARDED_BY_LOCK(m_lock);
     HashSet<ScriptExecutionContextIdentifier> m_retired WTF_GUARDED_BY_LOCK(m_lock);
     HashMap<uint64_t, Running> m_running WTF_GUARDED_BY_LOCK(m_lock);
-    // Owners that ended while goroutines of theirs ran, until the last one settles.
-    HashSet<ScriptExecutionContextIdentifier> m_endedOwners WTF_GUARDED_BY_LOCK(m_lock);
+    // Owners other than the main thread that started goroutines and have not ended.
+    HashSet<ScriptExecutionContextIdentifier> m_owners WTF_GUARDED_BY_LOCK(m_lock);
+    // Owners that ended, for good: callbacks their goroutines left behind still run in frames that
+    // name them, after the goroutines settle. One entry per Worker that started goroutines.
+    Lock m_endedLock;
+    HashSet<ScriptExecutionContextIdentifier> m_endedOwners WTF_GUARDED_BY_LOCK(m_endedLock);
     // Threads not retired, and of those, the ones that have not taken yet.
     unsigned m_threadCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
     unsigned m_startingCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
@@ -300,10 +304,13 @@ uint64_t Scheduler::spawn(Task&& task, Spawner spawner)
         // for the new pool. Nor is what a goroutine whose owner ended spawns.
         if (m_retired.contains(spawner.context))
             refused = threadExitedMessage;
-        else if (m_endedOwners.contains(spawner.owner))
+        else if (hasEnded(spawner.owner))
             refused = ownerExitedMessage;
-        else
+        else {
+            if (spawner.owner != mainThreadContext)
+                m_owners.add(spawner.owner);
             m_queue.append({ WTF::move(task), spawner });
+        }
     }
     if (refused)
         rejectAsThreadExited(id, spawner, *refused);
@@ -399,41 +406,31 @@ std::optional<Spawner> Scheduler::finish(uint64_t id)
     if (--load->value == 0)
         m_load.remove(load);
     m_running.remove(it);
-    if (m_endedOwners.contains(spawner.owner)) {
-        bool runsMore = std::any_of(m_running.begin(), m_running.end(), [&](auto& entry) {
-            return entry.value.spawner.owner == spawner.owner;
-        });
-        if (!runsMore) {
-            m_endedOwners.remove(spawner.owner);
-            endedOwnerCount--;
-        }
-    }
     return spawner;
 }
 
 void Scheduler::ownerEnded(ScriptExecutionContextIdentifier owner)
 {
     Vector<std::pair<uint64_t, Spawner>> dropped;
-    HashSet<ScriptExecutionContextIdentifier> threads;
+    Vector<ScriptExecutionContextIdentifier> threads;
     {
         Locker locker { m_lock };
-        if (m_endedOwners.contains(owner))
+        // An owner that never started a goroutine has nothing to cancel.
+        if (!m_owners.remove(owner))
             return;
+        {
+            Locker ended { m_endedLock };
+            m_endedOwners.add(owner);
+            endedOwnerCount++;
+        }
         m_queue.removeAllMatching([&](auto& entry) {
             if (entry.second.owner != owner)
                 return false;
             dropped.append({ entry.first.id, entry.second });
             return true;
         });
-        for (auto& entry : m_running) {
-            if (entry.value.spawner.owner == owner)
-                threads.add(entry.value.thread);
-        }
-        // Nothing of the owner's runs, so nothing can act for it any more.
-        if (!threads.isEmpty()) {
-            m_endedOwners.add(owner);
-            endedOwnerCount++;
-        }
+        // Any of them can hold what its goroutines left waiting, settled or not.
+        threads = copyToVector(m_threads);
     }
     for (auto& [id, spawner] : dropped)
         rejectAsThreadExited(id, spawner, ownerExitedMessage);
@@ -446,9 +443,9 @@ void Scheduler::ownerEnded(ScriptExecutionContextIdentifier owner)
 
 bool Scheduler::hasEnded(ScriptExecutionContextIdentifier owner)
 {
-    if (!endedOwnerCount.load(std::memory_order_relaxed))
+    if (owner == mainThreadContext || !owner || !endedOwnerCount.load(std::memory_order_acquire))
         return false;
-    Locker locker { m_lock };
+    Locker locker { m_endedLock };
     return m_endedOwners.contains(owner);
 }
 

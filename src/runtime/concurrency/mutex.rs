@@ -25,7 +25,9 @@ use bun_jsc::bindgen::{JsLocal, JsPayload as _, JsScope};
 use bun_jsc::{JSGlobalObject, JSPromise, JSValue, JsResult};
 use bun_threading::Guarded;
 
-use super::channel::{OpKind, Options, Waiter, WakeResult, new_waiter, ops, wait_for};
+use super::channel::{
+    OpKind, Options, Waiter, WakeResult, cancelled, new_waiter, ops, wait_for,
+};
 
 /// Go's `starvationThresholdNs`.
 const STARVING_AFTER: Duration = Duration::from_millis(1);
@@ -253,12 +255,16 @@ impl Mutex {
         })
     }
 
-    pub(crate) fn try_lock(&self) -> bool {
+    /// Throws in a goroutine that was cancelled, as `lock()` rejects.
+    pub(crate) fn try_lock(&self, cx: &mut JsScope<'_>) -> JsResult<bool> {
+        if let Some(error) = cancelled(cx.global()) {
+            return Err(cx.global().throw_value(error));
+        }
         let locked = self.core.try_lock();
         if locked {
             held().0.push(Arc::clone(&self.core));
         }
-        locked
+        Ok(locked)
     }
 
     /// Once per `lock()` or `tryLock()` that took the lock, on its thread.
@@ -306,6 +312,7 @@ static IN_FLIGHT: Guarded<BTreeMap<u64, Arc<MutexCore>>> = Guarded::new(BTreeMap
 /// `mutex` is a `Bun.Mutex`.
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn Mutex__retainForStructuredClone(mutex: JSValue) -> u64 {
+    let mutex_value = mutex;
     let Some(mutex) = mutex.as_class_ref::<Mutex>() else {
         return 0;
     };
@@ -313,6 +320,7 @@ pub(crate) extern "C" fn Mutex__retainForStructuredClone(mutex: JSValue) -> u64 
     bun_boringssl_sys::rand_bytes(&mut id);
     let id = u64::from_ne_bytes(id);
     IN_FLIGHT.lock().insert(id, Arc::clone(&mutex.core));
+    super::message::remember_wrapper(mutex_value, Arc::as_ptr(&mutex.core));
     id
 }
 
@@ -322,7 +330,13 @@ pub(crate) extern "C" fn Mutex__fromStructuredClone(global: &JSGlobalObject, id:
     let Some(core) = IN_FLIGHT.lock().get(&id).cloned() else {
         return JSValue::ZERO;
     };
-    Mutex { core }.into_js_wrapper(global).to_js()
+    super::message::wrapper_of(global, Arc::as_ptr(&core), || {
+        Mutex {
+            core: Arc::clone(&core),
+        }
+        .into_js_wrapper(global)
+        .to_js()
+    })
 }
 
 #[unsafe(no_mangle)]

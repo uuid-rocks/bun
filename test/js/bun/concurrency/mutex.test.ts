@@ -218,8 +218,8 @@ describe("Bun.Mutex", () => {
     const ch = new Bun.Channel<Bun.Mutex>(1);
     await ch.send(mu);
     const received = await ch.receive();
-    expect(received).not.toBe(mu);
-    expect(received).toBeInstanceOf(Bun.Mutex);
+    // On one thread, one mutex is one object.
+    expect(received).toBe(mu);
     using lock = received.tryLock();
     expect(lock).toBeDefined();
     expect(mu.tryLock()).toBeUndefined();

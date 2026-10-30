@@ -45,7 +45,7 @@ use bun_jsc::{
 use bun_threading::Guarded;
 
 use super::graph;
-use super::message::{ChannelMessage, CloneSite};
+use super::message::{self, ChannelMessage, CloneSite};
 use super::mutex::{Handoff, MutexCore, Wakeup};
 use super::ops::OpTable;
 use crate::node::util::validators;
@@ -93,6 +93,9 @@ pub(super) struct State {
     /// How many values of `buffer` and `senders` share channels: the channel's edges in the
     /// [`graph`].
     pub(super) edges: u32,
+    /// Values handed to receivers that have not read them yet ([`Delivery`]). Each may come back:
+    /// a closed channel ends only once none is out.
+    deliveries: u32,
 }
 
 /// A waiter in a channel's queue, for one case of its operation: `0` but in a select.
@@ -183,6 +186,7 @@ impl State {
         }
         while let Some(receiver) = self.receivers.pop_front() {
             if receiver.fire() {
+                self.deliveries += 1;
                 return Ok(SendNow::Handed(receiver, message));
             }
         }
@@ -209,7 +213,12 @@ impl State {
         if let Some((sender, message)) = self.pop_sender() {
             return Some(ReceiveNow::Value(message, Some(sender)));
         }
-        self.closed.then_some(ReceiveNow::Closed)
+        self.has_ended().then_some(ReceiveNow::Closed)
+    }
+
+    /// Closed, and nothing is left to receive or can come back.
+    fn has_ended(&self) -> bool {
+        self.closed && self.deliveries == 0
     }
 
     /// The oldest sender still waiting, fired.
@@ -296,7 +305,8 @@ pub(super) enum WakeResult {
 }
 
 /// A value handed to a receiver, on its way to the receiver's VM. Given back to its channel if it
-/// is dropped unread: its send happened.
+/// is dropped unread: its send happened. Counted in the channel's `deliveries` by whoever handed it,
+/// under the channel's lock.
 pub(super) struct Delivery {
     message: Option<ChannelMessage>,
     channel: Arc<ChannelCore>,
@@ -311,7 +321,9 @@ impl Delivery {
     }
 
     fn take(mut self) -> ChannelMessage {
-        self.message.take().expect("a delivery is taken once")
+        let message = self.message.take().expect("a delivery is taken once");
+        self.channel.delivered();
+        message
     }
 }
 
@@ -645,6 +657,12 @@ pub(super) fn ops() -> &'static mut OpTable<ChannelOp> {
     unsafe { &mut (*state).channel_ops }
 }
 
+/// The error of an operation of a goroutine that was cancelled, if this one was: its owner's thread
+/// ended.
+pub(super) fn cancelled(global: &JSGlobalObject) -> Option<JSValue> {
+    Bun__Go__isCancelled(global).then(|| cancelled_error(global))
+}
+
 fn cancelled_error(global: &JSGlobalObject) -> JSValue {
     global
         .err(
@@ -751,12 +769,32 @@ impl ChannelCore {
         SendStep::Wait(waiter)
     }
 
+    /// A value handed to a receiver was read. If it was the last one out of a closed channel, the
+    /// receivers that waited for it to come back find the channel ended. Nothing locked.
+    fn delivered(&self) {
+        let receivers = {
+            let mut state = self.state.lock();
+            state.deliveries -= 1;
+            if !state.has_ended() || !state.buffer.is_empty() {
+                return;
+            }
+            core::mem::take(&mut state.receivers)
+        };
+        for queued in receivers {
+            if queued.fire() {
+                queued.wake(WakeResult::Closed);
+            }
+        }
+    }
+
     /// A value handed to a receiver that went away: to the next receiver, else first in the buffer,
     /// whether or not there is room. Nothing locked.
     fn give_back(self: &Arc<Self>, message: ChannelMessage) {
         let mut state = self.state.lock();
+        state.deliveries -= 1;
         while let Some(receiver) = state.receivers.pop_front() {
             if receiver.fire() {
+                state.deliveries += 1;
                 drop(state);
                 receiver.wake(WakeResult::Received(Delivery::new(message, self)));
                 return;
@@ -806,7 +844,12 @@ impl ChannelCore {
                 .iter()
                 .map(|m| u32::from(m.carries_channels()))
                 .sum();
-            (core::mem::take(&mut state.receivers), senders)
+            // A value handed out may still come back to them.
+            let receivers = match state.has_ended() {
+                true => core::mem::take(&mut state.receivers),
+                false => VecDeque::new(),
+            };
+            (receivers, senders)
         };
         let mut waiting: Vec<Queued> = receivers
             .into_iter()
@@ -1151,8 +1194,8 @@ impl Options {
 
     /// Also if the goroutine that runs it was cancelled.
     pub(super) fn rejected_if_aborted(&self, global: &JSGlobalObject) -> Option<JSValue> {
-        if Bun__Go__isCancelled(global) {
-            return Some(JSPromise::rejected_promise(global, cancelled_error(global)).to_js());
+        if let Some(error) = cancelled(global) {
+            return Some(JSPromise::rejected_promise(global, error).to_js());
         }
         let signal = self.signal.as_ref()?;
         if !signal.aborted() {
@@ -1169,6 +1212,7 @@ static IN_FLIGHT: Guarded<BTreeMap<u64, Arc<ChannelCore>>> = Guarded::new(BTreeM
 /// `channel` is a `Bun.Channel`.
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn Channel__retainForStructuredClone(channel: JSValue) -> u64 {
+    let channel_value = channel;
     let Some(channel) = channel.as_class_ref::<Channel>() else {
         return 0;
     };
@@ -1177,6 +1221,7 @@ pub(crate) extern "C" fn Channel__retainForStructuredClone(channel: JSValue) -> 
     bun_boringssl_sys::rand_bytes(&mut id);
     let id = u64::from_ne_bytes(id);
     IN_FLIGHT.lock().insert(id, Arc::clone(&channel.core));
+    message::remember_wrapper(channel_value, Arc::as_ptr(&channel.core));
     id
 }
 
@@ -1186,11 +1231,13 @@ pub(crate) extern "C" fn Channel__fromStructuredClone(global: &JSGlobalObject, i
     let Some(core) = IN_FLIGHT.lock().get(&id).cloned() else {
         return JSValue::ZERO;
     };
-    Channel {
-        core: ManuallyDrop::new(core),
-    }
-    .into_js_wrapper(global)
-    .to_js()
+    message::wrapper_of(global, Arc::as_ptr(&core), || {
+        Channel {
+            core: ManuallyDrop::new(Arc::clone(&core)),
+        }
+        .into_js_wrapper(global)
+        .to_js()
+    })
 }
 
 /// The message with this id is gone.

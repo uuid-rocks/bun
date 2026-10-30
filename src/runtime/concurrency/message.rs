@@ -24,6 +24,34 @@ unsafe extern "C" {
     ) -> usize;
 }
 
+unsafe extern "C" {
+    safe fn Bun__SharedHandle__wrapper(global: &JSGlobalObject, address: *const c_void) -> JSValue;
+    safe fn Bun__SharedHandle__remember(wrapper: JSValue, address: *const c_void);
+}
+
+/// The wrapper `global`'s realm has for the shared native object at `address` (a channel's or a
+/// mutex's core) while it is alive, else the one `create` makes, which it then remembers: a
+/// channel that comes back to the thread it left is the same object.
+pub(crate) fn wrapper_of<T>(
+    global: &JSGlobalObject,
+    address: *const T,
+    create: impl FnOnce() -> JSValue,
+) -> JSValue {
+    let address = address.cast::<c_void>();
+    let wrapper = Bun__SharedHandle__wrapper(global, address);
+    if !wrapper.is_empty() {
+        return wrapper;
+    }
+    let wrapper = create();
+    Bun__SharedHandle__remember(wrapper, address);
+    wrapper
+}
+
+/// `wrapper` is its realm's wrapper of the shared native object at `address`.
+pub(crate) fn remember_wrapper<T>(wrapper: JSValue, address: *const T) {
+    Bun__SharedHandle__remember(wrapper, address.cast::<c_void>());
+}
+
 /// The channel operation a value is cloned for, which its `DataCloneError` names.
 #[derive(Clone, Copy)]
 pub(crate) enum CloneSite {
