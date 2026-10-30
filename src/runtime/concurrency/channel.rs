@@ -18,8 +18,16 @@
 //! ([`Queued`]) with the index of its case. The entries of a waiter that fired or was cancelled
 //! stay queued until its VM takes them out ([`ChannelCore::forget`]); until then whoever reaches
 //! one fails to fire it and drops it.
+//!
+//! A value handed to a waiting receiver is a [`Delivery`] until the receiver's VM reads it. If that
+//! VM is gone first, or the operation is, the value goes back to the channel: the sender was told
+//! its send happened, so the value is still received exactly once.
+//!
+//! Values that share channels make a graph of channels; [`graph`](super::graph) reclaims the
+//! channels that only the queues of unreachable channels hold.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::mem::ManuallyDrop;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -35,6 +43,7 @@ use bun_jsc::{
 };
 use bun_threading::Guarded;
 
+use super::graph;
 use super::message::{ChannelMessage, CloneSite};
 use super::mutex::{Handoff, MutexCore};
 use super::ops::OpTable;
@@ -43,6 +52,28 @@ use crate::node::util::validators;
 pub(crate) struct ChannelCore {
     pub(super) capacity: u32,
     pub(super) state: Guarded<State>,
+    /// In the [`graph`]'s registry. Set and cleared under `state`'s lock.
+    pub(super) registered: AtomicBool,
+}
+
+/// How many channels exist, for `bun:internal-for-testing`.
+static LIVE: AtomicU32 = AtomicU32::new(0);
+
+impl ChannelCore {
+    fn new(capacity: u32) -> Arc<Self> {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        Arc::new(ChannelCore {
+            capacity,
+            state: Guarded::new(State::default()),
+            registered: AtomicBool::new(false),
+        })
+    }
+}
+
+impl Drop for ChannelCore {
+    fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Of the entries whose waiter can still fire, and but for a select that waits both to send and
@@ -50,13 +81,17 @@ pub(crate) struct ChannelCore {
 /// waits.
 #[derive(Default)]
 pub(super) struct State {
-    /// At most `capacity` values.
+    /// At most `capacity` values, but for values given back by receivers that went away
+    /// ([`Delivery`]), which go first.
     buffer: VecDeque<ChannelMessage>,
     /// Waiting receivers, oldest first.
     pub(super) receivers: VecDeque<Queued>,
     /// Waiting senders and their values, oldest first.
-    pub(super) senders: VecDeque<(Queued, ChannelMessage)>,
+    senders: VecDeque<(Queued, ChannelMessage)>,
     closed: bool,
+    /// How many values of `buffer` and `senders` share channels: the channel's edges in the
+    /// [`graph`].
+    pub(super) edges: u32,
 }
 
 /// A waiter in a channel's queue, for one case of its operation: `0` but in a select.
@@ -95,6 +130,45 @@ pub(super) enum ReceiveNow {
 }
 
 impl State {
+    fn push_buffer(&mut self, message: ChannelMessage) {
+        self.edges += u32::from(message.carries_channels());
+        self.buffer.push_back(message);
+    }
+
+    fn pop_buffer(&mut self) -> Option<ChannelMessage> {
+        let message = self.buffer.pop_front()?;
+        self.edges -= u32::from(message.carries_channels());
+        Some(message)
+    }
+
+    pub(super) fn push_sender(&mut self, sender: Queued, message: ChannelMessage) {
+        self.edges += u32::from(message.carries_channels());
+        self.senders.push_back((sender, message));
+    }
+
+    fn pop_sender_entry(&mut self) -> Option<(Queued, ChannelMessage)> {
+        let (sender, message) = self.senders.pop_front()?;
+        self.edges -= u32::from(message.carries_channels());
+        Some((sender, message))
+    }
+
+    /// Every value it holds, for the [`graph`] to reclaim.
+    pub(super) fn values(&self) -> impl Iterator<Item = &ChannelMessage> {
+        self.buffer
+            .iter()
+            .chain(self.senders.iter().map(|(_, message)| message))
+    }
+
+    /// Empties a channel that is unreachable. Its values and entries, to drop once it is unlocked.
+    pub(super) fn take_all(&mut self) -> (VecDeque<ChannelMessage>, VecDeque<(Queued, ChannelMessage)>) {
+        self.edges = 0;
+        self.receivers.clear();
+        (
+            core::mem::take(&mut self.buffer),
+            core::mem::take(&mut self.senders),
+        )
+    }
+
     /// `Err`: the send would wait. The value back.
     pub(super) fn try_send(
         &mut self,
@@ -110,19 +184,23 @@ impl State {
             }
         }
         if self.buffer.len() < capacity as usize {
-            self.buffer.push_back(message);
+            self.push_buffer(message);
             return Ok(SendNow::Buffered);
         }
         Err(message)
     }
 
     /// `None`: the receive would wait.
-    pub(super) fn try_receive(&mut self) -> Option<ReceiveNow> {
-        if let Some(message) = self.buffer.pop_front() {
-            let sender = self.pop_sender().map(|(sender, refill)| {
-                self.buffer.push_back(refill);
-                sender
-            });
+    pub(super) fn try_receive(&mut self, capacity: u32) -> Option<ReceiveNow> {
+        if let Some(message) = self.pop_buffer() {
+            let sender = if self.buffer.len() < capacity as usize {
+                self.pop_sender().map(|(sender, refill)| {
+                    self.push_buffer(refill);
+                    sender
+                })
+            } else {
+                None
+            };
             return Some(ReceiveNow::Value(message, sender));
         }
         if let Some((sender, message)) = self.pop_sender() {
@@ -133,7 +211,7 @@ impl State {
 
     /// The oldest sender still waiting, fired.
     fn pop_sender(&mut self) -> Option<(Queued, ChannelMessage)> {
-        while let Some((sender, message)) = self.senders.pop_front() {
+        while let Some((sender, message)) = self.pop_sender_entry() {
             if sender.fire() {
                 return Some((sender, message));
             }
@@ -199,11 +277,39 @@ impl Waiter {
 }
 
 pub(super) enum WakeResult {
-    Received(ChannelMessage),
+    Received(Delivery),
     Sent,
     Closed,
     /// A `Bun.Mutex` was handed to the waiter.
     Acquired(Handoff),
+}
+
+/// A value handed to a receiver, on its way to the receiver's VM. Given back to its channel if it
+/// is dropped unread: its send happened.
+pub(super) struct Delivery {
+    message: Option<ChannelMessage>,
+    channel: Arc<ChannelCore>,
+}
+
+impl Delivery {
+    pub(super) fn new(message: ChannelMessage, channel: &Arc<ChannelCore>) -> Self {
+        Self {
+            message: Some(message),
+            channel: Arc::clone(channel),
+        }
+    }
+
+    fn take(mut self) -> ChannelMessage {
+        self.message.take().expect("a delivery is taken once")
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        if let Some(message) = self.message.take() {
+            self.channel.give_back(message);
+        }
+    }
 }
 
 /// The outcome of a waiting operation, on its way to the operation's VM.
@@ -257,13 +363,24 @@ pub(crate) struct ChannelOp {
     kind: OpKind,
     promise: JSPromiseStrong,
     waiter: Arc<Waiter>,
-    channels: Channels,
+    channels: OpChannels,
     /// A select's `AbortSignal` cases, which it follows while it waits.
     signal_cases: Box<[SignalCase]>,
     /// The mutex a `lock()` waits for.
     mutex: Option<Arc<MutexCore>>,
     /// Where module code waits: no async function's frame shows a top-level `await`.
     top_level: Option<(bun_core::String, u32, u32)>,
+}
+
+/// A waiting operation's channels, which it [releases](graph::release).
+struct OpChannels(Channels);
+
+impl Drop for OpChannels {
+    fn drop(&mut self) {
+        for channel in core::mem::take(&mut self.0) {
+            graph::release(channel);
+        }
+    }
 }
 
 /// A select's `AbortSignal` case: ready once the signal aborts, with `signal.reason` as its value.
@@ -361,7 +478,7 @@ impl ChannelOp {
 
     /// Takes the waiter out of the channels that still queue it.
     fn forget(&self) {
-        for channel in &self.channels {
+        for channel in &self.channels.0 {
             channel.forget(&self.waiter);
         }
         if let Some(mutex) = &self.mutex {
@@ -377,7 +494,8 @@ impl ChannelOp {
             self.forget();
             let promise = &mut self.promise;
             let value = match result {
-                WakeResult::Received(message) => message
+                WakeResult::Received(delivery) => delivery
+                    .take()
                     .deserialize(global)
                     .map(|value| select_result(global, i64::from(case), value, false)),
                 WakeResult::Sent => Ok(select_result(
@@ -405,8 +523,9 @@ impl ChannelOp {
             (OpKind::Send | OpKind::Receive, WakeResult::Closed) => {
                 return promise.reject(global, Ok(closed_error(global)));
             }
-            (OpKind::Receive, WakeResult::Received(message)) => message.deserialize(global),
-            (OpKind::Next, WakeResult::Received(message)) => message
+            (OpKind::Receive, WakeResult::Received(delivery)) => delivery.take().deserialize(global),
+            (OpKind::Next, WakeResult::Received(delivery)) => delivery
+                .take()
                 .deserialize(global)
                 .map(|value| iterator_result(global, value, false)),
             (OpKind::Next, WakeResult::Closed) => {
@@ -491,15 +610,20 @@ enum SendStep {
 }
 
 impl ChannelCore {
-    fn send(&self, waiter: impl FnOnce() -> Arc<Waiter>, message: ChannelMessage) -> SendStep {
+    fn send(
+        self: &Arc<Self>,
+        waiter: impl FnOnce() -> Arc<Waiter>,
+        message: ChannelMessage,
+    ) -> SendStep {
         let mut state = self.state.lock();
         let message = match state.try_send(self.capacity, message) {
             Ok(sent) => {
+                graph::register(self, &state);
                 drop(state);
                 return match sent {
                     SendNow::Closed(_) => SendStep::Closed,
                     SendNow::Handed(receiver, message) => {
-                        receiver.wake(WakeResult::Received(message));
+                        receiver.wake(WakeResult::Received(Delivery::new(message, self)));
                         SendStep::Done
                     }
                     SendNow::Buffered => SendStep::Done,
@@ -508,14 +632,31 @@ impl ChannelCore {
             Err(message) => message,
         };
         let waiter = waiter();
-        state.senders.push_back((
+        state.push_sender(
             Queued {
                 waiter: Arc::clone(&waiter),
                 case: 0,
             },
             message,
-        ));
+        );
+        graph::register(self, &state);
         SendStep::Wait(waiter)
+    }
+
+    /// A value handed to a receiver that went away: to the next receiver, else first in the buffer,
+    /// whether or not there is room. Nothing locked.
+    fn give_back(self: &Arc<Self>, message: ChannelMessage) {
+        let mut state = self.state.lock();
+        while let Some(receiver) = state.receivers.pop_front() {
+            if receiver.fire() {
+                drop(state);
+                receiver.wake(WakeResult::Received(Delivery::new(message, self)));
+                return;
+            }
+        }
+        state.edges += u32::from(message.carries_channels());
+        state.buffer.push_front(message);
+        graph::register(self, &state);
     }
 
     /// `Ok(None)`: closed and drained.
@@ -524,7 +665,7 @@ impl ChannelCore {
         waiter: impl FnOnce() -> Arc<Waiter>,
     ) -> Result<Option<ChannelMessage>, Arc<Waiter>> {
         let mut state = self.state.lock();
-        let Some(received) = state.try_receive() else {
+        let Some(received) = state.try_receive(self.capacity) else {
             let waiter = waiter();
             state.receivers.push_back(Queued {
                 waiter: Arc::clone(&waiter),
@@ -551,10 +692,9 @@ impl ChannelCore {
                 return;
             }
             state.closed = true;
-            (
-                core::mem::take(&mut state.receivers),
-                core::mem::take(&mut state.senders),
-            )
+            let senders = core::mem::take(&mut state.senders);
+            state.edges = state.buffer.iter().map(|m| u32::from(m.carries_channels())).sum();
+            (core::mem::take(&mut state.receivers), senders)
         };
         let mut waiting: Vec<Queued> = receivers
             .into_iter()
@@ -583,7 +723,10 @@ impl ChannelCore {
                 .iter()
                 .position(|(queued, _)| Arc::ptr_eq(&queued.waiter, waiter))
             {
-                dropped.extend(state.senders.remove(i).map(|(_, message)| message));
+                if let Some((_, message)) = state.senders.remove(i) {
+                    state.edges -= u32::from(message.carries_channels());
+                    dropped.push(message);
+                }
             }
         }
         // Its values, outside the lock: one can hold the last handle of another channel.
@@ -599,7 +742,14 @@ impl ChannelCore {
 
 /// `Bun.Channel`: the JS object of one VM, which shares the channel.
 pub(crate) struct Channel {
-    core: Arc<ChannelCore>,
+    core: ManuallyDrop<Arc<ChannelCore>>,
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        // SAFETY: dropping; not used again.
+        graph::release(unsafe { ManuallyDrop::take(&mut self.core) });
+    }
 }
 
 impl Channel {
@@ -617,10 +767,7 @@ impl Channel {
             )? as u32
         };
         Ok(Self {
-            core: Arc::new(ChannelCore {
-                capacity,
-                state: Guarded::new(State::default()),
-            }),
+            core: ManuallyDrop::new(ChannelCore::new(capacity)),
         })
     }
 
@@ -795,7 +942,7 @@ pub(super) fn wait_for(
         kind,
         promise: JSPromiseStrong::init(global),
         waiter,
-        channels,
+        channels: OpChannels(channels),
         signal_cases: signal_cases
             .iter()
             .map(|&(case, _)| SignalCase {
@@ -922,7 +1069,11 @@ pub(crate) extern "C" fn Channel__fromStructuredClone(global: &JSGlobalObject, i
     let Some(core) = IN_FLIGHT.lock().get(&id).cloned() else {
         return JSValue::ZERO;
     };
-    Channel { core }.into_js_wrapper(global).to_js()
+    Channel {
+        core: ManuallyDrop::new(core),
+    }
+    .into_js_wrapper(global)
+    .to_js()
 }
 
 /// The message with this id is gone.
@@ -931,5 +1082,21 @@ pub(crate) extern "C" fn Channel__releaseStructuredClone(id: u64) {
     // The channel, outside the lock: it can be the last handle, and its buffer can hold messages
     // with channels of their own.
     let core = IN_FLIGHT.lock().remove(&id);
-    drop(core);
+    if let Some(core) = core {
+        graph::release(core);
+    }
+}
+
+/// `f` of the channels that messages share, by the id each message has in its place. Nothing else
+/// is locked under it.
+pub(super) fn with_in_flight<R>(f: impl FnOnce(&BTreeMap<u64, Arc<ChannelCore>>) -> R) -> R {
+    f(&IN_FLIGHT.lock())
+}
+
+pub(crate) fn live_count_for_testing() -> f64 {
+    f64::from(LIVE.load(Ordering::Relaxed))
+}
+
+pub(crate) fn collect_for_testing() -> f64 {
+    graph::collect() as f64
 }

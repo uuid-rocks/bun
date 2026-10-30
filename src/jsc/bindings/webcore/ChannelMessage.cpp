@@ -252,6 +252,23 @@ extern "C" void Bun__ChannelMessage__destroy(MessageWithMessagePorts* message)
     delete message;
 }
 
+extern "C" void Channel__releaseStructuredClone(uint64_t id);
+
+// Writes the ids of the Bun.Channel handles `message` holds (Channel__retainForStructuredClone's)
+// into `out`, up to `capacity` of them, and returns how many it holds. Any thread.
+extern "C" size_t Bun__ChannelMessage__channelIds(const MessageWithMessagePorts* message, uint64_t* out, size_t capacity)
+{
+    size_t count = 0;
+    for (auto& handle : message->message->serializedHandles()) {
+        if (handle.release != Channel__releaseStructuredClone)
+            continue;
+        if (count < capacity)
+            out[count] = handle.id;
+        count++;
+    }
+    return count;
+}
+
 // `{ value, done }` of a channel's async iterator, with the structure JSC's iterators use.
 extern "C" EncodedJSValue Bun__Channel__iteratorResult(JSGlobalObject* globalObject, EncodedJSValue value, bool done)
 {

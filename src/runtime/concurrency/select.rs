@@ -20,9 +20,10 @@ use bun_jsc::{
 };
 
 use super::channel::{
-    Channel, ChannelCore, Channels, OpKind, Options, Queued, ReceiveNow, SendNow, WakeResult,
-    closed_error, new_waiter, ops, select_result, shuffle, wait,
+    Channel, ChannelCore, Channels, Delivery, OpKind, Options, Queued, ReceiveNow, SendNow,
+    WakeResult, closed_error, new_waiter, ops, select_result, shuffle, wait,
 };
+use super::graph;
 use super::message::{ChannelMessage, CloneSite};
 use crate::node::util::validators;
 
@@ -145,9 +146,12 @@ pub(crate) fn select(
         };
         let state = &mut *locks[case.lock];
         let done = match case.send.take() {
-            None => state.try_receive().map(Won::Received),
+            None => state.try_receive(case.channel.capacity).map(Won::Received),
             Some(message) => match state.try_send(case.channel.capacity, message) {
-                Ok(sent) => Some(Won::Sent(sent)),
+                Ok(sent) => {
+                    graph::register(&case.channel, state);
+                    Some(Won::Sent(sent))
+                }
                 Err(message) => {
                     case.send = Some(message);
                     None
@@ -182,7 +186,10 @@ pub(crate) fn select(
             };
             let state = &mut *locks[case.lock];
             match case.send.take() {
-                Some(message) => state.senders.push_back((queued, message)),
+                Some(message) => {
+                    state.push_sender(queued, message);
+                    graph::register(&case.channel, state);
+                }
                 None => state.receivers.push_back(queued),
             }
         }
@@ -209,9 +216,10 @@ pub(crate) fn select(
         ));
     };
     drop(locks);
-    let reason = match (&won, &read[index as usize]) {
-        (Won::Aborted, Read::Signal(signal)) => signal.js_reason(global),
-        _ => JSValue::UNDEFINED,
+    let (reason, channel) = match (&won, &read[index as usize]) {
+        (Won::Aborted, Read::Signal(signal)) => (signal.js_reason(global), None),
+        (_, Read::Channel(case)) => (JSValue::UNDEFINED, Some(Arc::clone(&case.channel))),
+        _ => (JSValue::UNDEFINED, None),
     };
     // The values of the cases that lost, outside the locks.
     drop(read);
@@ -227,7 +235,8 @@ pub(crate) fn select(
         }
         Won::Received(ReceiveNow::Closed) => select_result(global, index, JSValue::UNDEFINED, true),
         Won::Sent(SendNow::Handed(receiver, message)) => {
-            receiver.wake(WakeResult::Received(message));
+            let channel = channel.expect("a send case is a channel's");
+            receiver.wake(WakeResult::Received(Delivery::new(message, &channel)));
             select_result(global, index, JSValue::UNDEFINED, false)
         }
         Won::Sent(SendNow::Buffered) => select_result(global, index, JSValue::UNDEFINED, false),

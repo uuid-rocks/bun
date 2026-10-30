@@ -96,6 +96,12 @@ export const channelQueueLengths = $bindgen("channel_testing.bind.ts", "queueLen
   channel: import("bun").Channel<any>,
 ) => { receivers: number; senders: number };
 
+/** How many `Bun.Channel`s exist, on every thread. */
+export const channelLiveCount = $bindgen("channel_testing.bind.ts", "liveCountForTesting") as () => number;
+
+/** Reclaims, now, the channels that only the queues of unreachable channels hold; returns how many. */
+export const collectChannels = $bindgen("channel_testing.bind.ts", "collectForTesting") as () => number;
+
 /** The entries a `Bun.Mutex`'s queue of waiters holds, including those of `lock()`s that were aborted. */
 export const mutexWaiters = $bindgen("mutex_testing.bind.ts", "waitersForTesting") as (
   mutex: import("bun").Mutex,
