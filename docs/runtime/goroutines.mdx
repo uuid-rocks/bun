@@ -407,7 +407,7 @@ It writes a `Bun.go()` call with the URL of that entry point's output, and the e
 Bun.go(new URL("./primes.js#countPrimes", import.meta.url), 0, 5e5);
 ```
 
-For `group.go()`, the build has to know that `group` is a `WaitGroup`: a variable of the same module, declared with `new Bun.WaitGroup()` or `new WaitGroup()` of `"bun"`, and never assigned another value. Any other `.go()` call builds exactly as written, the way it would without goroutines, whether or not it is Bun's: a `WaitGroup` passed to a helper as a parameter, one stored in a property such as `this.group`, or a router's `go()`. A `WaitGroup` reached that way gets a function the build didn't trace (see below), and a URL that names a source file, which `--compile` can't import (`ERR_MODULE_NOT_FOUND`). There, pass the imported function instead of a URL, list its module as an entry point of the build, and build with `--splitting`.
+For `group.go()`, the build has to know that `group` is a `WaitGroup`: a variable of the same module, declared with `new Bun.WaitGroup()` or `new WaitGroup()` of `"bun"`, and never assigned another value. Any other `.go()` call builds exactly as written, the way it would without goroutines, whether or not it is Bun's: a `WaitGroup` passed to a helper as a parameter, one stored in a property such as `this.group`, or a router's `go()`. A `WaitGroup` reached that way gets a function the build didn't trace (see below), and a URL as written. That URL names a source file, which the output may not have, so it throws `ERR_MODULE_NOT_FOUND`. There, pass the imported function instead of a URL, list its module as an entry point of the build, and build with `--splitting`.
 
 An imported binding passed to a call the build knows is passed as it is, so `Bun.go(WORKER)` of a constant `WORKER = "./worker.ts"` still gets the string. The build doesn't know until run time whether the binding holds a function, so its module becomes an entry point either way.
 
@@ -435,6 +435,6 @@ The build can't tell which module a function comes from when it arrives any othe
 bun build --compile --splitting ./main.ts ./tasks/*.ts --outfile app
 ```
 
-A module named by a computed URL, as in ``Bun.go(new URL(`./tasks/${name}.ts`, import.meta.url))``, needs only the entry points.
+A module named by a computed URL needs only the entry points. Name the `.js` file the build writes, as in ``Bun.go(new URL(`./tasks/${name}.js`, import.meta.url))``: run from source, Bun resolves it to `./tasks/${name}.ts`. A bundle built with `--outdir` has no `.ts` files.
 
 A function from a package that the build leaves external is passed as it is. The package's module is imported from `node_modules` at run time.
