@@ -71,6 +71,7 @@ pub mod task_tag {
         BundleV2PluginLoadAnswered, // bun.bundle_v2.Load (hop back to the bundle's loop)
         BundleV2PluginLoadDeferred, // bun.bundle_v2.Load (`.defer()` notice to the bundle's loop)
         BundleV2ParseTaskResult,  // bun.bundle_v2.ParseTask.Result
+        ChannelWake,              // bun_runtime::concurrency::channel::ChannelWake (a Bun.Channel op settled on another thread)
         ChromePipeEvent,
         CopyFileWindowsMkdirp,
         WriteFileWindowsMkdirp,

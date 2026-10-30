@@ -422,6 +422,13 @@ declare module "bun" {
 }
 
 declare module "bun" {
+  // src/runtime/concurrency/channel.bind.ts: what `for await` receives with.
+  interface Channel<T> {
+    $channelNext(): Promise<IteratorResult<T, undefined>>;
+  }
+}
+
+declare module "bun" {
   // `Bun.connect` in terms of the native socket class, as src/js/internal/debugger.ts calls it.
   function connect<Data>(options: {
     unix?: string;

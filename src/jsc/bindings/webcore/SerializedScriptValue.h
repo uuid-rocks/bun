@@ -63,6 +63,12 @@ public:
 };
 
 // A flat object whose property values are only primitives or strings (no nesting).
+// What a native object's retain hook returned at serialize time, and the hook that releases it.
+struct SerializedHandle {
+    void (*release)(uint64_t);
+    uint64_t id;
+};
+
 struct SimpleCloneableObject {
     WTF::FixedVector<SimpleInMemoryPropertyTableEntry> properties;
 };
@@ -176,8 +182,8 @@ private:
     // Raw `*mut BlockList` pointers whose refcount was bumped at serialize
     // time so they outlive the wire buffer; released in the destructor.
     Vector<void*> m_serializedBlockListRefs;
-    // What `Histogram__retainForStructuredClone` returned at serialize time; released in the destructor.
-    Vector<uint64_t> m_serializedHistogramIds;
+    // Native objects the clone shares (histograms, channels), released in the destructor.
+    Vector<SerializedHandle> m_serializedHandles;
 #if ENABLE(WEBASSEMBLY)
     std::unique_ptr<WasmModuleArray> m_wasmModulesArray;
     std::unique_ptr<WasmMemoryHandleArray> m_wasmMemoryHandlesArray;
