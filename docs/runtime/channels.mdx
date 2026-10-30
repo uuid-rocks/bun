@@ -46,6 +46,26 @@ self.onmessage = async ({ data: { jobs, results } }) => {
 
 Any number of threads can send on and receive from the same channel. Each value goes to exactly one receiver.
 
+Channels also connect [goroutines](/runtime/goroutines): pass a channel to `Bun.go()`, and the goroutine uses the same channel.
+
+```ts numbers.ts icon="/icons/typescript.svg"
+export async function produce(out: Bun.Channel<number>, count: number) {
+  for (let i = 1; i <= count; i++) await out.send(i);
+  out.close();
+}
+```
+
+```ts main.ts icon="/icons/typescript.svg"
+import { produce } from "./numbers.ts";
+
+const numbers = new Bun.Channel<number>();
+Bun.go(produce, numbers, 3);
+for await (const n of numbers) console.log(n);
+// => 1
+// => 2
+// => 3
+```
+
 ---
 
 ## Capacity

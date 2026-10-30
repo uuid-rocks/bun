@@ -524,8 +524,7 @@ impl WebWorker {
         // The VM of the Worker is created for a program. The Worker resolves the specifier again and reports what is wrong with it.
         let specifier = spec_slice.slice();
         let runs_text_beside_compiled_program = kind != WorkerKind::Goroutine
-            && (specifier.starts_with(b"data:")
-            || specifier.starts_with(b"blob:"))
+            && (specifier.starts_with(b"data:") || specifier.starts_with(b"blob:"))
             && crate::compiled_program::runs_worker_of_text_apart()
             && {
                 let mut ignored_message = BunString::EMPTY;
