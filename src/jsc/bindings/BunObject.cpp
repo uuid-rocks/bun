@@ -65,6 +65,7 @@
 #include "GeneratedParsedShellScript.h"
 #include "GeneratedPasswordObject.h"
 #include "GeneratedS3Client.h"
+#include "GeneratedSelect.h"
 #include "GeneratedSemverObject.h"
 #include "GeneratedSink.h"
 #include "GeneratedTOMLObject.h"
@@ -1085,6 +1086,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     resolve                                        Bun::Bindgen::Generated::BunObject::jsResolve                       DontDelete|Function 1
     resolveSync                                    Bun::Bindgen::Generated::BunObject::jsResolveSync                   DontDelete|Function 1
     revision                                       constructBunRevision                                                ReadOnly|DontDelete|PropertyCallback
+    select                                         Bun::Bindgen::Generated::Select::jsSelect                           DontDelete|Function 1
     semver                                         Bun::Bindgen::Generated::SemverObject::createSemver                 ReadOnly|DontDelete|PropertyCallback
     sql                                            defaultBunSQLObject                                                 DontDelete|PropertyCallback
     postgres                                       defaultBunSQLObject                                                 DontDelete|PropertyCallback

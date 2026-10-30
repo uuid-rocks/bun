@@ -142,4 +142,101 @@ declare module "bun" {
    * @category Concurrency
    */
   function go<R = unknown>(module: string | URL, ...args: unknown[]): Goroutine<R>;
+
+  /**
+   * A case of {@link select}: a channel to receive from, or `[channel, value]` to send `value` on it.
+   *
+   * @category Concurrency
+   */
+  type SelectCase = Channel<any> | readonly [Channel<any>, unknown];
+
+  /** @category Concurrency */
+  interface SelectOptions {
+    /**
+     * Stops waiting: the promise rejects with `signal.reason`, and no case happens. Pass `AbortSignal.timeout(ms)`
+     * for a timeout. A case that happened before the signal aborted stays done.
+     */
+    signal?: AbortSignal;
+    /** Resolve with `{ index: -1 }` at once if no case is ready, like Go's `default:`. */
+    default?: boolean;
+  }
+
+  /**
+   * What {@link select} resolves to for the case at index `I`.
+   *
+   * @category Concurrency
+   */
+  type SelectCaseResult<Case, I extends number> = Case extends readonly [Channel<any>, unknown]
+    ? { index: I; value: undefined; closed: false }
+    : Case extends Channel<infer T>
+      ? { index: I; value: T; closed: false } | { index: I; value: undefined; closed: true }
+      : never;
+
+  /**
+   * What {@link select} resolves to: the result of the case that happened, typed by its index in `C`.
+   *
+   * @category Concurrency
+   */
+  type SelectResult<C extends readonly SelectCase[]> = number extends C["length"]
+    ? SelectCaseResult<C[number], number>
+    : { [K in keyof C]: K extends `${infer I extends number}` ? SelectCaseResult<C[K], I> : never }[number];
+
+  /**
+   * What {@link select} resolves to with `default: true` when no case is ready.
+   *
+   * @category Concurrency
+   */
+  type SelectDefault = { index: -1; value: undefined; closed: false };
+
+  /** The value of each send case is a `T` of its channel. */
+  type SelectCases<C extends readonly SelectCase[]> = {
+    [K in keyof C]: C[K] extends readonly [Channel<infer T>, unknown] ? readonly [Channel<T>, T] : C[K];
+  };
+
+  /**
+   * Waits until one of several channel operations can happen, and does exactly that one, like Go's `select`.
+   *
+   * Each case is a channel to receive from, or `[channel, value]` to send `value` on it. When several cases are
+   * ready, one of them is picked at random; the others do nothing. The result says which case happened, by its
+   * index in `cases`:
+   *
+   * - A receive: `{ index, value, closed: false }`, or `{ index, value: undefined, closed: true }` once the channel
+   *   is closed and drained.
+   * - A send: `{ index, value: undefined, closed: false }`. A send on a closed channel rejects with
+   *   `ERR_CHANNEL_CLOSED` if it is picked.
+   *
+   * Every send value is cloned when `select()` is called, also for the cases that lose. Send cases take no
+   * `transfer` list, so a losing case never detaches a buffer.
+   *
+   * A waiting `select()` does not keep the process alive.
+   *
+   * @example
+   * ```ts
+   * const jobs = new Bun.Channel<string>();
+   * const quit = new Bun.Channel<void>();
+   *
+   * while (true) {
+   *   const result = await Bun.select([jobs, quit], { signal: AbortSignal.timeout(1000) });
+   *   if (result.index === 1 || result.closed) break;
+   *   console.log("job", result.value);
+   * }
+   * ```
+   *
+   * @param cases The operations to wait for. An empty list waits until `options.signal` aborts, or resolves at once
+   * with `default: true`; without either it rejects with `ERR_INVALID_ARG_VALUE`.
+   *
+   * @category Concurrency
+   */
+  function select<const C extends readonly SelectCase[]>(
+    cases: C & SelectCases<C>,
+    options: SelectOptions & { default: true },
+  ): Promise<SelectResult<C> | SelectDefault>;
+  function select<const C extends readonly SelectCase[]>(
+    cases: C & SelectCases<C>,
+    options?: SelectOptions & { default?: false },
+  ): Promise<SelectResult<C>>;
+  function select<const C extends readonly SelectCase[]>(
+    cases: C & SelectCases<C>,
+    options?: SelectOptions,
+  ): Promise<SelectResult<C> | SelectDefault>;
 }

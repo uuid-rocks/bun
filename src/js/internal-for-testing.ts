@@ -91,6 +91,11 @@ export const napiThreadsafeFunctionLiveCount = $bindgen("napi_body.bind.ts", "th
 
 export const bundlerWorkerLiveCount = $bindgen("JSBundler.bind.ts", "workerLiveCount");
 
+/** The entries a `Bun.Channel`'s queues hold, including those of operations that already settled. */
+export const channelQueueLengths = $bindgen("channel_testing.bind.ts", "queueLengthsForTesting") as (
+  channel: import("bun").Channel<any>,
+) => { receivers: number; senders: number };
+
 export const semverIntersects = $bindgen("SemverObjectInternals.bind.ts", "intersects") as (
   left: string,
   right: string,
