@@ -5,8 +5,8 @@ description: Run functions in parallel on a pool of threads with Bun.go
 
 `Bun.go(fn, ...args)` runs a function on another thread, the way Go's `go` statement does. It returns a `Goroutine`: a promise for what the function returns.
 
-```ts primes.ts icon="/icons/typescript.svg"
-export function countPrimes(from: number, to: number) {
+```ts main.ts icon="/icons/typescript.svg"
+function countPrimes(from: number, to: number) {
   let count = 0;
   for (let n = Math.max(from, 2); n < to; n++) {
     let prime = true;
@@ -20,10 +20,6 @@ export function countPrimes(from: number, to: number) {
   }
   return count;
 }
-```
-
-```ts main.ts icon="/icons/typescript.svg"
-import { countPrimes } from "./primes.ts";
 
 const counts = await Promise.all([
   Bun.go(countPrimes, 0, 250_000),
@@ -34,7 +30,17 @@ const counts = await Promise.all([
 console.log(counts.reduce((a, b) => a + b)); // => 78498
 ```
 
-The four calls run at the same time on four threads.
+The four calls run at the same time on four threads. The function can also be written in place:
+
+```ts
+const total = await Bun.go(
+  async (url: string) => {
+    const response = await fetch(url);
+    return (await response.text()).length;
+  },
+  "https://example.com",
+);
+```
 
 ---
 
@@ -54,16 +60,48 @@ Bun.go(watchForever).unref(); // the process can exit while it runs
 
 ## Which functions can run
 
-`fn` must be a function that a module exports, from an ES module or a CommonJS module. Each pool thread imports that module once. Then it calls the export with the arguments.
+A goroutine's function runs on another thread, which has only the function's own code and the globals. So `fn` is one of these:
 
-A closure can't run on another thread, because the variables it captures stay on its own thread. `Bun.go()` throws a `TypeError` with the code `ERR_GOROUTINE_NOT_SENDABLE` for a closure, a bound or native function, or a function that its module does not export.
+- **A function that uses only its parameters, what it declares, and globals.** Bun sends its source to the pool thread, which compiles it once. Globals such as `Bun`, `fetch`, `Atomics` and `structuredClone` are there. This is the usual way to start a goroutine.
+- **A function that a module exports** (ES module or CommonJS). Each pool thread imports that module once, then calls the export. Use this for large code, or code that shares its module's imports and helpers with other code. When a function is exported, Bun runs it this way.
+
+A function written in place can't use the variables of the code around it: they stay on their own thread. `Bun.go()` throws a `TypeError` with the code `ERR_GOROUTINE_NOT_SENDABLE` that names each variable and its line:
 
 ```ts
-const limit = 10;
-Bun.go(() => limit * 2); // TypeError: ERR_GOROUTINE_NOT_SENDABLE
+const config = { limit: 10 };
+Bun.go(() => config.limit * 2);
+// TypeError: Bun.go() can't run this function on another thread: it uses "config" (/app/main.ts:2),
+// which is neither its own nor a global. Pass it as an argument, or import it inside the function
+// with `await import()`.
 ```
 
-Export the function instead, and pass what it needs as arguments.
+Pass values as arguments instead:
+
+```ts
+const config = { limit: 10 };
+await Bun.go(config => config.limit * 2, config); // => 20
+```
+
+The same goes for an arrow function that uses the `this` or `arguments` of the code around it, and a function that uses `import.meta`. A method, a class, and a bound or native function throw `ERR_GOROUTINE_NOT_SENDABLE` too.
+
+To use a module, import it inside the function. `await import()` and `require()` resolve from the file the function is written in, as they would there:
+
+```ts main.ts icon="/icons/typescript.svg"
+const digest = await Bun.go(async (text: string) => {
+  const { hash } = await import("./hash.ts"); // ./hash.ts next to main.ts
+  return hash(text);
+}, "hello");
+```
+
+TypeScript works in either form: the function runs as Bun transpiled it, and errors and stack traces name the lines of your source.
+
+<Note>
+  A function written in place is compiled again on the pool thread from its source, the way `new Function()` compiles
+  a string. When code generation from strings is disallowed (`--disallow-code-generation-from-strings`), only exported
+  functions and module URLs can run.
+</Note>
+
+### Modules as goroutines
 
 `Bun.go()` also takes the URL of a module, and runs the module's default export:
 
@@ -77,7 +115,7 @@ Bun resolves a module URL the way `new Worker()` resolves its entry point. It re
 
 A module that a goroutine imports runs once on each pool thread. Its top-level variables belong to that thread, like thread-local storage. In a pool thread, `Bun.isMainThread` and `import.meta.main` are `false`.
 
-A goroutine's function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine. Guard its top-level work with `import.meta.main`:
+A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine. Guard its top-level work with `import.meta.main`:
 
 ```ts main.ts icon="/icons/typescript.svg"
 export function double(n: number) {
@@ -97,6 +135,7 @@ Arguments and results are [structured clones](https://developer.mozilla.org/en-U
 
 - `SharedArrayBuffer` and `WebAssembly.Memory` are shared: both threads see the same memory.
 - A [`Bun.Channel`](/runtime/channels) is shared: the goroutine uses the same channel.
+- An `AbortSignal` arrives as a signal that aborts when the original does (see [Cancelling goroutines](#cancelling-goroutines)).
 - Everything else is copied.
 
 Arguments that can't be cloned, such as functions, throw a `DataCloneError` from `Bun.go()`. A result that can't be cloned rejects the goroutine with a `DataCloneError`.
@@ -107,17 +146,9 @@ Arguments that can't be cloned, such as functions, throw a `DataCloneError` from
 
 If the function throws, the goroutine rejects with a copy of the error. The copy has the error's name, message, stack, `cause` and own properties such as `code`.
 
-```ts task.ts icon="/icons/typescript.svg"
-export function parse(text: string) {
-  return JSON.parse(text);
-}
-```
-
-```ts main.ts icon="/icons/typescript.svg"
-import { parse } from "./task.ts";
-
+```ts
 try {
-  await Bun.go(parse, "{");
+  await Bun.go((text: string) => JSON.parse(text), "{");
 } catch (error) {
   console.log(error instanceof SyntaxError); // => true
 }
@@ -133,8 +164,8 @@ A goroutine is a promise. `Promise.all()` waits for several, as a `sync.WaitGrou
 
 Goroutines that started other goroutines can wait for them too: a goroutine can call `Bun.go()`.
 
-```ts tree.ts icon="/icons/typescript.svg"
-export async function sum(from: number, to: number): Promise<number> {
+```ts
+async function sum(from: number, to: number): Promise<number> {
   if (to - from <= 1000) {
     let total = 0;
     for (let n = from; n < to; n++) total += n;
@@ -146,40 +177,70 @@ export async function sum(from: number, to: number): Promise<number> {
 }
 ```
 
+`sum` can call itself: a function's own name is its own.
+
 ---
 
 ## Goroutines and channels
 
-Pass a channel to goroutines to connect them. In this pipeline, one goroutine produces numbers, another squares them, and a third adds them up:
-
-```ts pipeline.ts icon="/icons/typescript.svg"
-export async function produce(out: Bun.Channel<number>, count: number) {
-  for (let i = 1; i <= count; i++) await out.send(i);
-  out.close();
-}
-
-export async function square(input: Bun.Channel<number>, out: Bun.Channel<number>) {
-  for await (const n of input) await out.send(n * n);
-  out.close();
-}
-
-export async function sum(input: Bun.Channel<number>) {
-  let total = 0;
-  for await (const n of input) total += n;
-  return total;
-}
-```
+Pass a channel to goroutines to connect them. In this pipeline, one goroutine produces numbers, three square them, and the main thread adds them up:
 
 ```ts main.ts icon="/icons/typescript.svg"
-import { produce, square, sum } from "./pipeline.ts";
-
-const numbers = new Bun.Channel<number>();
+const numbers = new Bun.Channel<number>(16);
 const squares = new Bun.Channel<number>(16);
 
-Bun.go(produce, numbers, 100);
-Bun.go(square, numbers, squares);
-console.log(await Bun.go(sum, squares)); // => 338350
+Bun.go(
+  async (out: Bun.Channel<number>, count: number) => {
+    for (let i = 1; i <= count; i++) await out.send(i);
+    out.close();
+  },
+  numbers,
+  100,
+);
+
+const workers = Array.from({ length: 3 }, () =>
+  Bun.go(
+    async (input: Bun.Channel<number>, out: Bun.Channel<number>) => {
+      for await (const n of input) await out.send(n * n);
+    },
+    numbers,
+    squares,
+  ),
+);
+Promise.all(workers).then(() => squares.close());
+
+let total = 0;
+for await (const square of squares) total += square;
+console.log(total); // => 338350
 ```
+
+---
+
+## Cancelling goroutines
+
+Pass an `AbortSignal` to a goroutine to tell it to stop. In the goroutine, the signal aborts when the original aborts, with a copy of its reason, so it works with `fetch()`, channel operations and `abort` listeners there. A goroutine stops only where its code checks the signal or passes it on: nothing interrupts code that computes.
+
+```ts
+const controller = new AbortController();
+
+const goroutine = Bun.go(
+  async (signal: AbortSignal, urls: string[]) => {
+    const pages = [];
+    for (const url of urls) {
+      signal.throwIfAborted();
+      pages.push(await (await fetch(url, { signal })).text());
+    }
+    return pages;
+  },
+  controller.signal,
+  ["https://example.com/a", "https://example.com/b"],
+);
+
+controller.abort();
+console.log(await goroutine.catch(error => error.name)); // => "AbortError"
+```
+
+A signal sent over a [channel](/runtime/channels) works the same way. A signal that has already aborted arrives aborted. A reason that can't be cloned arrives as an `AbortError` `DOMException`. `AbortSignal.timeout()` and `AbortSignal.any()` work too.
 
 ---
 

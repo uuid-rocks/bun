@@ -198,9 +198,12 @@ describe.concurrent("Bun.go", () => {
       `,
       "main.ts": `
         import { exported } from "./task.ts";
-        function local() {}
+        let captured = 1;
+        function local() {
+          return captured;
+        }
         const attempts = {
-          closure: () => Bun.go(() => 1),
+          closure: () => Bun.go(() => captured),
           local: () => Bun.go(local),
           bound: () => Bun.go(exported.bind(null)),
           native: () => Bun.go(Math.max),
@@ -219,7 +222,7 @@ describe.concurrent("Bun.go", () => {
         try {
           Bun.go(local);
         } catch (e) {
-          console.log(e.message.includes('"local" is not exported by'), e.message.includes("main.ts"));
+          console.log(e.message.includes('"captured"'), e.message.includes("main.ts:5"));
         }
         await Bun.go("./task.ts").catch(e => console.log("default", e.name, e.code));
       `,
