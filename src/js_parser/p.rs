@@ -1278,12 +1278,6 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     /// Remembers what initializes a local, for `is_wait_group`. Called on each visited
     /// declaration with a value; one without (`var group;`) keeps the value it has.
     pub(crate) fn note_bun_go_initializer(&mut self, binding: Ref, value: Expr) {
-        if matches!(
-            value.data,
-            js_ast::ExprData::EUndefined(_) | js_ast::ExprData::EMissing(_)
-        ) {
-            return;
-        }
         let binding = js_ast::symbol::follow_symbols(&self.symbols, binding);
         let state = match self.bun_go_bindings.get(&binding) {
             // Initialized again (`var`)

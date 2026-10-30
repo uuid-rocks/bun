@@ -432,6 +432,7 @@ describe.concurrent("Bun.go", () => {
       "main.ts": `
         // import.meta.main
         const text = "Bun.main, require.main";
+        if (text) /import.meta.main/.test(text);
         export function work(x: number) {
           return x * 2;
         }

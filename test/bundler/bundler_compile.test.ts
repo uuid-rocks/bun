@@ -1712,6 +1712,10 @@ describe("Bun.go", () => {
         var twice: any = router;
         twice.go(new URL("./twice", import.meta.url));
         var twice: any = new Bun.WaitGroup();
+        // Initialized with undefined after a WaitGroup: not one either.
+        var maybe: any = new Bun.WaitGroup();
+        var maybe: any = undefined;
+        maybe?.go(new URL("./undefined", import.meta.url));
       `,
       "tasks.ts": `export const label = "tasks";`,
     });

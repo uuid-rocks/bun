@@ -685,13 +685,19 @@ class WaitGroup {
   // aborted signal, as it would have without a limit.
   #next() {
     const queue = this.#queue;
+    // A failure after disposal leaves the signal's reason as disposal's.
     const signal = this.#signal;
-    const cancelled = signal.aborted && (this.#disposal === undefined || signal.reason !== this.#disposal);
-    while (this.#queueHead < queue.length && (this.#active.size < this.#limit || cancelled)) {
+    const cancelled =
+      this.#failure !== undefined
+        ? { reason: this.#failure.error }
+        : signal.aborted && (this.#disposal === undefined || signal.reason !== this.#disposal)
+          ? { reason: signal.reason }
+          : undefined;
+    while (this.#queueHead < queue.length && (this.#active.size < this.#limit || cancelled !== undefined)) {
       const { goroutine, task, target, args } = queue[this.#queueHead];
       queue[this.#queueHead++] = undefined!;
-      if (cancelled) {
-        Goroutine.fail(goroutine, signal.reason);
+      if (cancelled !== undefined) {
+        Goroutine.fail(goroutine, cancelled.reason);
         continue;
       }
       try {

@@ -336,6 +336,23 @@ describe("Bun.WaitGroup", () => {
       expect(aborted[9]).toBe(1);
     });
 
+    test("a failure while disposal waits still keeps what waits for a slot from starting", async () => {
+      const ran = new Int32Array(new SharedArrayBuffer(4));
+      const gate = new Bun.Channel<void>(1);
+      const disposed = (async () => {
+        await using group = new Bun.WaitGroup({ limit: 1 });
+        group.go(async (gate: Bun.Channel<void>) => {
+          await gate.receive();
+          throw new Error("late failure");
+        }, gate);
+        group.go((ran: Int32Array) => Atomics.store(ran, 0, 1), ran);
+      })().catch(e => e);
+      // The scope has ended: disposal waits for the first goroutine.
+      await gate.send();
+      expect((await disposed).message).toBe("late failure");
+      expect(ran[0]).toBe(0);
+    });
+
     test("a goroutine that waits for a slot throws from go() at once if it can't start", () => {
       const group = new Bun.WaitGroup({ limit: 1 });
       const gate = new Bun.Channel<void>(1);

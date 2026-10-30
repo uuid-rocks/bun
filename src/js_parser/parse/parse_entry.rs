@@ -188,6 +188,9 @@ pub fn reads_whether_main(text: &[u8]) -> Option<bool> {
     // The brace depth at each `${` of the templates the scan is inside.
     let mut templates: Vec<u32> = Vec::new();
     let mut braces: u32 = 0;
+    // Whether each open parenthesis is a statement's condition, as in `if (...)`: an expression
+    // starts after it.
+    let mut parens: Vec<bool> = Vec::new();
     loop {
         let token = lexer.token;
         let word: &[u8] = match token {
@@ -223,6 +226,9 @@ pub fn reads_whether_main(text: &[u8]) -> Option<bool> {
                 }
             }
             T::TCloseBrace => braces = braces.saturating_sub(1),
+            T::TOpenParen => {
+                parens.push(matches!(previous, T::TIf | T::TWhile | T::TFor | T::TWith))
+            }
             // A `/` where an expression starts begins a regular expression.
             T::TSlash | T::TSlashEquals
                 if !matches!(
@@ -248,7 +254,10 @@ pub fn reads_whether_main(text: &[u8]) -> Option<bool> {
             }
             _ => {}
         }
-        previous = lexer.token;
+        previous = match lexer.token {
+            T::TCloseParen if parens.pop().unwrap_or(false) => T::TSemicolon,
+            token => token,
+        };
         lexer.next().ok()?;
     }
 }
