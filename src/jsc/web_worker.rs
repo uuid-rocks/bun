@@ -435,7 +435,7 @@ impl Drop for WebWorker {
 }
 
 impl WebWorker {
-    pub(crate) fn has_requested_terminate(&self) -> bool {
+    pub fn has_requested_terminate(&self) -> bool {
         self.requested_terminate.load(Ordering::Acquire)
     }
 

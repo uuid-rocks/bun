@@ -16,6 +16,7 @@
 #include "ScriptExecutionContext.h"
 #include "SerializedScriptValue.h"
 #include "ZigGlobalObject.h"
+#include "SharedHandleWrappers.h"
 #include "BunClientData.h"
 #include <JavaScriptCore/ErrorInstance.h>
 #include <JavaScriptCore/IteratorOperations.h>
@@ -252,8 +253,47 @@ extern "C" void Bun__ChannelMessage__destroy(MessageWithMessagePorts* message)
     delete message;
 }
 
+extern "C" void Channel__releaseStructuredClone(uint64_t id);
+
+// Writes the ids of the Bun.Channel handles `message` holds (Channel__retainForStructuredClone's)
+// into `out`, up to `capacity` of them, and returns how many it holds. Any thread.
+extern "C" size_t Bun__ChannelMessage__channelIds(const MessageWithMessagePorts* message, uint64_t* out, size_t capacity)
+{
+    size_t count = 0;
+    for (auto& handle : message->message->serializedHandles()) {
+        if (handle.release != Channel__releaseStructuredClone)
+            continue;
+        if (count < capacity)
+            out[count] = handle.id;
+        count++;
+    }
+    return count;
+}
+
 // `{ value, done }` of a channel's async iterator, with the structure JSC's iterators use.
 extern "C" EncodedJSValue Bun__Channel__iteratorResult(JSGlobalObject* globalObject, EncodedJSValue value, bool done)
 {
     return JSValue::encode(JSC::createIteratorResultObject(globalObject, JSValue::decode(value), done));
+}
+
+// The wrapper this realm has for the Bun.Channel or Bun.Mutex whose native core is at `address`,
+// while it is alive, or empty: a channel received on the thread that sent it is the same object.
+extern "C" EncodedJSValue Bun__SharedHandle__wrapper(JSGlobalObject* globalObject, const void* address)
+{
+    auto& wrappers = defaultGlobalObject(globalObject)->m_sharedHandleWrappers;
+    JSObject* wrapper = wrappers ? wrappers->get(reinterpret_cast<uintptr_t>(address)) : nullptr;
+    return JSValue::encode(wrapper ? JSValue(wrapper) : JSValue());
+}
+
+// `wrapper` is its realm's wrapper of the core at `address`.
+extern "C" void Bun__SharedHandle__remember(EncodedJSValue encodedWrapper, const void* address)
+{
+    JSObject* wrapper = JSValue::decode(encodedWrapper).getObject();
+    if (!wrapper)
+        return;
+    auto* globalObject = defaultGlobalObject(wrapper->globalObject());
+    auto& wrappers = globalObject->m_sharedHandleWrappers;
+    if (!wrappers)
+        wrappers = makeUnique<Bun::SharedHandleWrappers>();
+    wrappers->set(reinterpret_cast<uintptr_t>(address), wrapper);
 }

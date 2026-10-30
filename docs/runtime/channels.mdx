@@ -274,7 +274,7 @@ Every send value is cloned when `select()` is called, also for the cases that lo
 Every value is a [structured clone](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm), made the way `postMessage()` makes one. This is true on one thread too, so a receiver never shares an object with its sender.
 
 - `SharedArrayBuffer` and `WebAssembly.Memory` are shared: both threads see the same memory.
-- Channels are shared: the receiver gets a handle to the same channel.
+- Channels and mutexes are shared: the receiver gets a handle to the same channel. On the thread where a channel already has an object, it gets that object back, so `(await a.receive()) === a` and a channel works as a `Map` key. Each thread has its own object for a channel, and drops it like any other object it no longer uses: a `WeakMap` or `WeakRef` keyed by a channel loses its entry then, even though the channel lives on elsewhere and may come back. Key long-lived data by a `Map` or by an id of your own.
 - An `AbortSignal` arrives as a signal that aborts when the original does, with a copy of its reason (see [Cancelling goroutines](/runtime/goroutines#cancelling-goroutines)). `postMessage()` still refuses an `AbortSignal`.
 - `ArrayBuffer`s listed in `transfer` move to the receiver and are detached for the sender.
 - Everything else is copied. Functions and other values that cannot be cloned reject with a `DataCloneError`.
@@ -290,10 +290,10 @@ console.log((await channel.receive()).byteLength); // => 1024
 
 Each operation clones its value and settles a promise, so a channel moves a few million small values a second (3 to 6 million in `bench/concurrency`), far fewer than a Go channel. When values are small and many, send them in batches, such as arrays of a few hundred.
 
-A channel that holds a value containing a handle to itself is freed only once that value is received.
+Channels can hold each other: a channel sent into itself, or two channels sent into each other, are freed like any other garbage once nothing else refers to them. A thread refers to a channel until it collects its own garbage, so a cycle that went through a goroutine is freed after that goroutine's thread collects too. A collection looks at no more than 262,144 channels at once, and does not look past a channel that something outside the cycle still refers to. A cycle of more channels than that is freed by a collection without the limit, which runs about a second later, and less often (down to once a minute) while such a large group of channels is still in use.
 
 ---
 
 ## The event loop
 
-A waiting `send()`, `receive()` or `select()` does not keep the process alive. When every thread waits on a channel or a mutex and nothing else can wake one, Bun reports a [deadlock](/runtime/goroutines#deadlocks) and exits. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel.
+A waiting `send()`, `receive()` or `select()` does not keep the process alive. When every thread waits on a channel or a mutex and nothing else can wake one, Bun reports a [deadlock](/runtime/goroutines#deadlocks) and exits. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel. A value on its way to a receive on that worker when it is asked to stop goes back to the channel, to the next receiver: the sender saw its `send()` succeed, so the value is still received once. Once the worker's receive has the value (its `receive()` or `select()` promise settled, or its `for await` loop got it), the value is the worker's, as a message the worker already received is. `terminate()` stops the worker's code wherever it is, which can be after a loop got a value and before the first statement of its body runs. To account for every value, receive on a thread that is not terminated, such as the main thread or a goroutine it starts, or stop the worker by closing a channel or aborting a signal rather than with `terminate()`.

@@ -2,7 +2,9 @@
 // settled(true, result) or settled(false, what it threw). A private builtin's frame shows in no
 // stack trace, and nothing of the pool's runtime is under it.
 $visibility = "Private";
-export function runGoroutine(fn: Function, args: unknown[], settled: Function) {
+export function runGoroutine(fn: Function, argsAndSettled: any) {
+  const args = argsAndSettled[0];
+  const settled = argsAndSettled[1];
   let result;
   try {
     result = fn.$apply(undefined, args);

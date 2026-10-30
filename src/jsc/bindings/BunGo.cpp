@@ -23,6 +23,7 @@
 #include "JSCommonJSModule.h"
 #include "WebCoreJSBuiltins.h"
 #include "MessageWithMessagePorts.h"
+#include "ModuleGraph.h"
 #include "ZigGlobalObject.h"
 #include "webcore/Worker.h"
 #include "webcore/WorkerOptions.h"
@@ -52,6 +53,8 @@ extern "C" uint32_t Bun__Go__maxPoolThreads();
 extern "C" void Bun__Deadlock__goroutineRef(int32_t delta);
 extern "C" void Bun__Deadlock__describe(Zig::GlobalObject*);
 extern "C" void Bun__Deadlock__exit(Zig::GlobalObject*);
+// bun_runtime::concurrency::channel: rejects this thread's operations that goroutines of `owner` wait in.
+extern "C" void Bun__Go__cancelOwner(JSC::JSGlobalObject*, uint32_t owner);
 // ChannelMessage.cpp
 extern "C" WebCore::MessageWithMessagePorts* Bun__ChannelMessage__create(JSC::JSGlobalObject*, JSC::EncodedJSValue value, JSC::EncodedJSValue transfer);
 extern "C" JSC::EncodedJSValue Bun__ChannelMessage__deserialize(JSC::JSGlobalObject*, WebCore::MessageWithMessagePorts*);
@@ -127,6 +130,9 @@ enum class Outcome : int32_t {
 struct Spawner {
     ScriptExecutionContextIdentifier context;
     BunLoopKind loopKind;
+    // The thread whose end cancels the goroutine: the main thread or Worker that started it, or
+    // that started the goroutine that started it.
+    ScriptExecutionContextIdentifier owner;
 };
 
 struct Running {
@@ -158,6 +164,13 @@ public:
     void dispatch(Grow = Grow::Yes);
     // Nothing is queued, and no thread is starting or was woken and has not taken yet.
     bool isIdle();
+    // The owner's thread is ending: drop what it queued, and cancel what it runs. Any thread.
+    void ownerEnded(ScriptExecutionContextIdentifier owner);
+    bool hasEnded(ScriptExecutionContextIdentifier owner);
+    // The owner of running goroutine `id`, or 0.
+    ScriptExecutionContextIdentifier ownerOf(uint64_t id);
+    // How many owners have ended: hasEnded() looks them up only once one has.
+    std::atomic<unsigned> endedOwnerCount { 0 };
 
 private:
     void retireLocked(ScriptExecutionContextIdentifier, Vector<std::pair<uint64_t, Spawner>>& lost) WTF_REQUIRES_LOCK(m_lock);
@@ -178,6 +191,12 @@ private:
     HashSet<ScriptExecutionContextIdentifier> m_threads WTF_GUARDED_BY_LOCK(m_lock);
     HashSet<ScriptExecutionContextIdentifier> m_retired WTF_GUARDED_BY_LOCK(m_lock);
     HashMap<uint64_t, Running> m_running WTF_GUARDED_BY_LOCK(m_lock);
+    // Owners other than the main thread that started goroutines and have not ended.
+    HashSet<ScriptExecutionContextIdentifier> m_owners WTF_GUARDED_BY_LOCK(m_lock);
+    // Owners that ended, for good: callbacks their goroutines left behind still run in frames that
+    // name them, after the goroutines settle. One entry per Worker that started goroutines.
+    Lock m_endedLock;
+    HashSet<ScriptExecutionContextIdentifier> m_endedOwners WTF_GUARDED_BY_LOCK(m_endedLock);
     // Threads not retired, and of those, the ones that have not taken yet.
     unsigned m_threadCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
     unsigned m_startingCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
@@ -267,26 +286,34 @@ bool Scheduler::shouldGrow(bool onMainThread)
     return true;
 }
 
-// A goroutine whose thread ended before it settled.
-void rejectAsThreadExited(uint64_t id, Spawner spawner);
+constexpr auto threadExitedMessage = "The thread running this goroutine exited before it settled"_s;
+constexpr auto ownerExitedMessage = "The Worker that started this goroutine exited"_s;
+
+// A goroutine whose thread, or owner, ended before it settled.
+void rejectAsThreadExited(uint64_t id, Spawner spawner, ASCIILiteral message = threadExitedMessage);
 
 uint64_t Scheduler::spawn(Task&& task, Spawner spawner)
 {
     uint64_t id;
-    bool refused = false;
+    std::optional<ASCIILiteral> refused;
     {
         Locker locker { m_lock };
         id = m_nextId++;
         task.id = id;
         // A thread of a pool that was reset runs on only until it notices: what it spawns is not
-        // for the new pool.
-        if (!m_retired.contains(spawner.context))
+        // for the new pool. Nor is what a goroutine whose owner ended spawns.
+        if (m_retired.contains(spawner.context))
+            refused = threadExitedMessage;
+        else if (hasEnded(spawner.owner))
+            refused = ownerExitedMessage;
+        else {
+            if (spawner.owner != mainThreadContext)
+                m_owners.add(spawner.owner);
             m_queue.append({ WTF::move(task), spawner });
-        else
-            refused = true;
+        }
     }
     if (refused)
-        rejectAsThreadExited(id, spawner);
+        rejectAsThreadExited(id, spawner, *refused);
     else
         dispatch();
     return id;
@@ -380,6 +407,53 @@ std::optional<Spawner> Scheduler::finish(uint64_t id)
         m_load.remove(load);
     m_running.remove(it);
     return spawner;
+}
+
+void Scheduler::ownerEnded(ScriptExecutionContextIdentifier owner)
+{
+    Vector<std::pair<uint64_t, Spawner>> dropped;
+    Vector<ScriptExecutionContextIdentifier> threads;
+    {
+        Locker locker { m_lock };
+        // An owner that never started a goroutine has nothing to cancel.
+        if (!m_owners.remove(owner))
+            return;
+        {
+            Locker ended { m_endedLock };
+            m_endedOwners.add(owner);
+            endedOwnerCount++;
+        }
+        m_queue.removeAllMatching([&](auto& entry) {
+            if (entry.second.owner != owner)
+                return false;
+            dropped.append({ entry.first.id, entry.second });
+            return true;
+        });
+        // Any of them can hold what its goroutines left waiting, settled or not.
+        threads = copyToVector(m_threads);
+    }
+    for (auto& [id, spawner] : dropped)
+        rejectAsThreadExited(id, spawner, ownerExitedMessage);
+    for (auto thread : threads) {
+        ScriptExecutionContext::postTaskTo(thread, BunLoopKind::Regular, [owner](ScriptExecutionContext& context) {
+            Bun__Go__cancelOwner(context.jsGlobalObject(), owner);
+        });
+    }
+}
+
+bool Scheduler::hasEnded(ScriptExecutionContextIdentifier owner)
+{
+    if (owner == mainThreadContext || !owner || !endedOwnerCount.load(std::memory_order_acquire))
+        return false;
+    Locker locker { m_endedLock };
+    return m_endedOwners.contains(owner);
+}
+
+ScriptExecutionContextIdentifier Scheduler::ownerOf(uint64_t id)
+{
+    Locker locker { m_lock };
+    auto it = m_running.find(id);
+    return it == m_running.end() ? 0 : it->value.spawner.owner;
 }
 
 void Scheduler::threadFailedToStart()
@@ -524,9 +598,9 @@ void settleOnSpawner(ScriptExecutionContext& context, uint64_t id, Outcome outco
     }
 }
 
-void rejectAsThreadExited(uint64_t id, Spawner spawner)
+void rejectAsThreadExited(uint64_t id, Spawner spawner, ASCIILiteral message)
 {
-    ScriptExecutionContext::postTaskTo(spawner.context, spawner.loopKind, [id](ScriptExecutionContext& context) {
+    ScriptExecutionContext::postTaskTo(spawner.context, spawner.loopKind, [id, message](ScriptExecutionContext& context) {
         auto* globalObject = defaultGlobalObject(context.jsGlobalObject());
         auto& vm = globalObject->vm();
         auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
@@ -537,7 +611,7 @@ void rejectAsThreadExited(uint64_t id, Spawner spawner)
         MarkedArgumentBuffer args;
         args.append(jsNumber(id));
         args.append(jsNumber(static_cast<int32_t>(Outcome::Failed)));
-        args.append(createError(globalObject, ErrorCode::ERR_GOROUTINE_THREAD_EXITED, "The thread running this goroutine exited before it settled"_s));
+        args.append(createError(globalObject, ErrorCode::ERR_GOROUTINE_THREAD_EXITED, message));
         JSC::call(globalObject, settle, args, "Bun.go"_s);
         if (JSC::Exception* exception = scope.exception(); exception && !vm.isTerminationException(exception)) {
             (void)scope.tryClearException();
@@ -549,6 +623,38 @@ void rejectAsThreadExited(uint64_t id, Spawner spawner)
 ScriptExecutionContext& contextOf(JSGlobalObject* lexicalGlobalObject)
 {
     return *defaultGlobalObject(lexicalGlobalObject)->scriptExecutionContext();
+}
+
+// The owner of the goroutine whose code runs now, or 0 off a pool thread. A goroutine of a Worker
+// runs in a frame that names it (jsGoRun); one with none is the main thread's.
+ScriptExecutionContextIdentifier currentOwner(Zig::GlobalObject* globalObject)
+{
+    JSObject* storage = globalObject->m_goroutineFrameStorage.get();
+    if (!storage)
+        return 0;
+    if (!globalObject->isAsyncContextTrackingEnabled())
+        return mainThreadContext;
+    auto& vm = globalObject->vm();
+    auto& names = WebCore::builtinNames(vm);
+    for (JSObject* frame = globalObject->m_asyncContextData.get()->getInternalField(0).getObject(); frame;) {
+        JSValue frameStorage = frame->getDirect(vm, names.storagePublicName());
+        if (!frameStorage)
+            break;
+        if (frameStorage == storage) {
+            JSValue owner = frame->getDirect(vm, vm.propertyNames->value);
+            return owner && owner.isUInt32() ? owner.asUInt32() : 0;
+        }
+        JSValue previous = frame->getDirect(vm, names.prevPublicName());
+        frame = previous ? previous.getObject() : nullptr;
+    }
+    return mainThreadContext;
+}
+
+Spawner spawnerOf(JSGlobalObject* lexicalGlobalObject)
+{
+    auto& context = contextOf(lexicalGlobalObject);
+    auto owner = currentOwner(defaultGlobalObject(lexicalGlobalObject));
+    return Spawner { context.identifier(), context.currentLoopKind(), owner ? owner : context.identifier() };
 }
 
 } // namespace
@@ -567,6 +673,11 @@ void poolThreadDidExit(ScriptExecutionContextIdentifier thread)
     scheduler().dispatch();
 }
 
+void ownerWillExit(ScriptExecutionContextIdentifier context)
+{
+    scheduler().ownerEnded(context);
+}
+
 // spawn(module, exportName, fromCommonJSExports, args): queue a goroutine; returns its id.
 // Throws (DataCloneError) if `args` can't be cloned.
 JSC_DEFINE_HOST_FUNCTION(jsGoSpawn, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
@@ -580,9 +691,8 @@ JSC_DEFINE_HOST_FUNCTION(jsGoSpawn, (JSGlobalObject * lexicalGlobalObject, CallF
     bool fromCommonJSExports = callFrame->argument(2).toBoolean(lexicalGlobalObject);
     auto args = serialize(lexicalGlobalObject, callFrame->argument(3));
     RETURN_IF_EXCEPTION(scope, {});
-    auto& context = contextOf(lexicalGlobalObject);
     Task task { 0, WTF::move(module).isolatedCopy(), WTF::move(exportName).isolatedCopy(), fromCommonJSExports, WTF::move(args) };
-    uint64_t id = scheduler().spawn(WTF::move(task), Spawner { context.identifier(), context.currentLoopKind() });
+    uint64_t id = scheduler().spawn(WTF::move(task), spawnerOf(lexicalGlobalObject));
     return JSValue::encode(jsNumber(id));
 }
 
@@ -604,11 +714,10 @@ JSC_DEFINE_HOST_FUNCTION(jsGoSpawnInline, (JSGlobalObject * lexicalGlobalObject,
     bool strict = callFrame->argument(4).toBoolean(lexicalGlobalObject);
     auto args = serialize(lexicalGlobalObject, callFrame->argument(5));
     RETURN_IF_EXCEPTION(scope, {});
-    auto& context = contextOf(lexicalGlobalObject);
     BunString path = Bun::toString(module);
     SourceMap sourceMap { Bun__Go__retainSourceMap(defaultGlobalObject(lexicalGlobalObject)->bunVM(), &path) };
     Task task { 0, WTF::move(module).isolatedCopy(), String(), false, WTF::move(args), WTF::move(source).isolatedCopy(), line, column, strict, WTF::move(sourceMap) };
-    uint64_t id = scheduler().spawn(WTF::move(task), Spawner { context.identifier(), context.currentLoopKind() });
+    uint64_t id = scheduler().spawn(WTF::move(task), spawnerOf(lexicalGlobalObject));
     return JSValue::encode(jsNumber(id));
 }
 
@@ -1081,8 +1190,25 @@ JSC_DEFINE_HOST_FUNCTION(jsGoResolveModule, (JSGlobalObject * lexicalGlobalObjec
 // runtime is under the goroutine's.
 JSC_DEFINE_HOST_FUNCTION(jsGoRun, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
-    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunInvokeJobWithArguments, 0, lexicalGlobalObject, callFrame->argument(0), callFrame->argument(1), callFrame->argument(2), callFrame->argument(3) };
-    lexicalGlobalObject->vm().queueMicrotask(WTF::move(task));
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    // A Worker's goroutine runs in a frame that names its owner (currentOwner), which every promise
+    // reaction of its code carries on. The main thread's needs none: its end is the process's.
+    JSValue frame = globalObject->m_asyncContextData.get()->getInternalField(0);
+    auto owner = scheduler().ownerOf(static_cast<uint64_t>(callFrame->argument(4).asNumber()));
+    if (owner && owner != mainThreadContext && globalObject->m_goroutineFrameStorage) {
+        globalObject->setAsyncContextTrackingEnabled(true);
+        frame = Bun::createAsyncContextFrame(globalObject, globalObject->m_goroutineFrameStorage.get(), jsNumber(owner), frame);
+    }
+    MarkedArgumentBuffer argsAndSettled;
+    argsAndSettled.append(callFrame->argument(2));
+    argsAndSettled.append(callFrame->argument(3));
+    JSArray* packed = constructArray(globalObject, static_cast<ArrayAllocationProfile*>(nullptr), argsAndSettled);
+    RETURN_IF_EXCEPTION(scope, {});
+    // BunPerformMicrotaskJob: job, asyncContext, fn, [args, settled]
+    JSC::QueuedTask task { nullptr, JSC::InternalMicrotask::BunPerformMicrotaskJob, 0, globalObject, callFrame->argument(0), frame.isEmpty() ? jsUndefined() : frame, callFrame->argument(1), packed };
+    vm.queueMicrotask(WTF::move(task));
     return JSValue::encode(jsUndefined());
 }
 
@@ -1158,7 +1284,9 @@ JSValue createGoRuntimeBinding(Zig::GlobalObject* globalObject)
     auto& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
     JSObject* binding = constructEmptyObject(globalObject, globalObject->objectPrototype(), 6);
-    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "run"_s), 4, Bun::Go::jsGoRun, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "run"_s), 5, Bun::Go::jsGoRun, ImplementationVisibility::Public, NoIntrinsic, 0);
+    if (!globalObject->m_goroutineFrameStorage)
+        globalObject->m_goroutineFrameStorage.set(vm, globalObject, constructEmptyObject(vm, globalObject->nullPrototypeObjectStructure()));
     binding->putDirect(vm, Identifier::fromString(vm, "job"_s), JSFunction::create(vm, globalObject, goroutineRunGoroutineCodeGenerator(vm), globalObject), 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "take"_s), 0, Bun::Go::jsGoTake, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "describe"_s), 1, Bun::Go::jsGoDescribe, ImplementationVisibility::Public, NoIntrinsic, 0);
@@ -1298,4 +1426,25 @@ extern "C" void Bun__Go__reportUncaughtError(Zig::GlobalObject* globalObject, JS
     });
 }
 
+}
+
+// The goroutine whose code runs now: its owner (Bun::Go::Spawner), or 0 if it runs in none.
+extern "C" uint32_t Bun__Go__currentOwner(JSC::JSGlobalObject* globalObject)
+{
+    return Bun::Go::currentOwner(defaultGlobalObject(globalObject));
+}
+
+// The goroutine whose code runs now was cancelled: its owner's thread ended.
+extern "C" bool Bun__Go__isCancelled(JSC::JSGlobalObject* globalObject)
+{
+    auto& scheduler = Bun::Go::scheduler();
+    if (!scheduler.endedOwnerCount.load(std::memory_order_relaxed))
+        return false;
+    auto owner = Bun::Go::currentOwner(defaultGlobalObject(globalObject));
+    return owner && scheduler.hasEnded(owner);
+}
+
+extern "C" bool Bun__Go__ownerEnded(uint32_t owner)
+{
+    return Bun::Go::scheduler().hasEnded(owner);
 }

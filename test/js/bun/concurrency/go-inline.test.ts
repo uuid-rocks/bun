@@ -462,6 +462,85 @@ describe.concurrent("an AbortSignal sent to a goroutine", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("channel, select and mutex operations that are always ready see the abort", async () => {
+    const { stdout, stderr, exitCode } = await run({
+      "main.ts": `
+        // [iterations, give up]
+        const state = new Int32Array(new SharedArrayBuffer(8));
+        async function abortWhileLooping(controller: AbortController, looping: Promise<unknown>) {
+          Atomics.store(state, 0, 0);
+          Atomics.store(state, 1, 0);
+          while (Atomics.load(state, 0) < 100) await Bun.sleep(1);
+          controller.abort(new Error("stop"));
+          // Without the abort, the loop never ends: stop it once it has gone on long enough.
+          const at = Atomics.load(state, 0);
+          let settled = false;
+          looping.finally(() => (settled = true));
+          while (!settled && Atomics.load(state, 0) - at < 200_000) await Bun.sleep(1);
+          Atomics.store(state, 1, 1);
+          return await looping;
+        }
+        const loops = {
+          // A buffer that always holds a value
+          receive: async (ch: Bun.Channel<number>, mu: Bun.Mutex, signal: AbortSignal, state: Int32Array) => {
+            try {
+              while (!Atomics.load(state, 1)) {
+                await ch.send(await ch.receive({ signal }));
+                Atomics.add(state, 0, 1);
+              }
+              return "never saw the abort";
+            } catch (error) {
+              return (error as Error).message;
+            }
+          },
+          select: async (ch: Bun.Channel<number>, mu: Bun.Mutex, signal: AbortSignal, state: Int32Array) => {
+            while (!Atomics.load(state, 1)) {
+              const ready = await Bun.select([ch, signal]);
+              if (ready.index === 1) return (ready.value as Error).message;
+              await ch.send(ready.value as number);
+              Atomics.add(state, 0, 1);
+            }
+            return "never saw the abort";
+          },
+          values: async (ch: Bun.Channel<number>, mu: Bun.Mutex, signal: AbortSignal, state: Int32Array) => {
+            try {
+              for await (const value of ch.values({ signal })) {
+                await ch.send(value);
+                Atomics.add(state, 0, 1);
+                if (Atomics.load(state, 1)) return "never saw the abort";
+              }
+            } catch (error) {
+              return (error as Error).message;
+            }
+          },
+          // A mutex that is always free
+          lock: async (ch: Bun.Channel<number>, mu: Bun.Mutex, signal: AbortSignal, state: Int32Array) => {
+            try {
+              while (!Atomics.load(state, 1)) {
+                using _ = await mu.lock({ signal });
+                Atomics.add(state, 0, 1);
+              }
+              return "never saw the abort";
+            } catch (error) {
+              return (error as Error).message;
+            }
+          },
+        };
+        for (const [name, loop] of Object.entries(loops)) {
+          const ch = new Bun.Channel<number>(1);
+          await ch.send(1);
+          const controller = new AbortController();
+          console.log(name, await abortWhileLooping(controller, Bun.go(loop, ch, new Bun.Mutex(), controller.signal, state)));
+        }
+      `,
+    });
+    expect({ stdout, stderr }).toEqual({
+      stdout: ["receive stop", "select stop", "values stop", "lock stop"].join("\n"),
+      stderr: "",
+    });
+    expect(exitCode).toBe(0);
+  });
+
   test("an aborted signal arrives aborted, over a channel too, and an uncloneable reason arrives as an AbortError", async () => {
     const { stdout, exitCode } = await run({
       "main.ts": `

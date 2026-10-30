@@ -154,6 +154,7 @@ public:
     const Vector<uint8_t>& wireBytes() const { return m_data; }
 
     size_t memoryCost() const { return m_memoryCost; }
+    const Vector<SerializedHandle>& serializedHandles() const { return m_serializedHandles; }
 
     WEBCORE_EXPORT ~SerializedScriptValue();
 

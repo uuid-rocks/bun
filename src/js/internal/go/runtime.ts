@@ -5,9 +5,9 @@
 
 const { take, settle, compile, describe, run, job } = $cpp("BunGo.cpp", "createGoRuntimeBinding") as {
   take(): Task | Failed | undefined;
-  // job(fn, args, settled) on a microtask with no frame of this module under it: fn(...args), then
-  // settled(true, result) or settled(false, what it threw).
-  run(job: Function, fn: Function, args: unknown[], settled: (ok: boolean, value: unknown) => void): void;
+  // job(fn, [args, settled]) on a microtask with no frame of this module under it, in the async
+  // context of goroutine `id`: fn(...args), then settled(true, result) or settled(false, what it threw).
+  run(job: Function, fn: Function, args: unknown[], settled: (ok: boolean, value: unknown) => void, id: number): void;
   job: Function;
   describe(value: unknown): [path: string, what: string] | undefined;
   settle(id: number, outcome: 0 | 1, value: unknown): void;
@@ -186,23 +186,29 @@ async function start(task: Task) {
     return;
   }
   const args = task[1];
-  run(job, fn, args, (ok, value) => {
-    if (!ok) {
-      fail(id, value, args);
-      return;
-    }
-    // Not awaited by an async function of this module: its frames stay out of the goroutine's.
-    Promise.$resolve(value).then(
-      value => {
-        try {
-          settle(id, 0, value);
-        } catch (error) {
-          fail(id, resultCloneError(error, value));
-        }
-      },
-      error => fail(id, error, args),
-    );
-  });
+  run(
+    job,
+    fn,
+    args,
+    (ok, value) => {
+      if (!ok) {
+        fail(id, value, args);
+        return;
+      }
+      // Not awaited by an async function of this module: its frames stay out of the goroutine's.
+      Promise.$resolve(value).then(
+        value => {
+          try {
+            settle(id, 0, value);
+          } catch (error) {
+            fail(id, resultCloneError(error, value));
+          }
+        },
+        error => fail(id, error, args),
+      );
+    },
+    id,
+  );
 }
 
 // Also called by BunGo.cpp when this thread was idle and something is queued.

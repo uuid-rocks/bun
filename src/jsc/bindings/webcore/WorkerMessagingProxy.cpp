@@ -191,6 +191,8 @@ void WorkerMessagingProxy::terminateWorkerGlobalScope()
     m_askedToTerminate = true;
     if (m_options.kind == WorkerOptions::Kind::Goroutine)
         Bun::Go::poolThreadWillExit(m_workerContextIdentifier);
+    else
+        Bun::Go::ownerWillExit(m_workerContextIdentifier);
     if (m_workerThread)
         WebWorker__requestTermination(m_workerThread);
 }
@@ -635,6 +637,8 @@ void WorkerMessagingProxy::workerGlobalScopeDestroyedInternal(int32_t exitCode, 
     m_scriptExecutionContext = nullptr;
     if (m_options.kind == WorkerOptions::Kind::Goroutine)
         Bun::Go::poolThreadDidExit(m_workerContextIdentifier);
+    else
+        Bun::Go::ownerWillExit(m_workerContextIdentifier);
 }
 
 void WorkerMessagingProxy::parentContextWillDestroy()

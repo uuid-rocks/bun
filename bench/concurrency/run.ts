@@ -1,7 +1,7 @@
 // Runs the concurrency benchmarks, each in a fresh process, and prints a Markdown table of the
 // median and range of the samples. Use a release build: a debug build measures its assertions.
 //
-//   bun run.ts [--samples 5] [--only spawn,memory,channel,select,pipeline]
+//   bun run.ts [--samples 5] [--only spawn,memory,channel,select,mutex,pipeline]
 //   BUN=/path/to/bun bun run.ts       # benchmark another build
 
 import { parseArgs } from "node:util";
@@ -10,7 +10,7 @@ import { availableParallelism, cpus, release } from "node:os";
 const { values } = parseArgs({
   options: {
     samples: { type: "string", default: "5" },
-    only: { type: "string", default: "spawn,memory,channel,select,pipeline" },
+    only: { type: "string", default: "spawn,memory,channel,select,mutex,pipeline" },
   },
 });
 const samples = Number(values.samples);
@@ -38,7 +38,7 @@ function record(name: string, value: number) {
   row[1].push(value);
 }
 
-for (const name of ["spawn", "memory", "channel", "select"]) {
+for (const name of ["spawn", "memory", "channel", "select", "mutex"]) {
   if (!only.has(name)) continue;
   for (let i = 0; i < samples; i++) {
     const result = JSON.parse(await sample([`${name}.ts`]));

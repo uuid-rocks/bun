@@ -1,5 +1,6 @@
 import { mutexWaiters } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe } from "harness";
 
 /** Polls until `condition()` holds. */
 async function until(condition: () => boolean) {
@@ -73,7 +74,50 @@ describe("Bun.Mutex", () => {
     expect(new Set(threads).size).toBe(goroutines);
   });
 
-  test("unlocking hands the lock to a waiter on another thread without freeing it in between", async () => {
+  test("unlocking frees the lock: a lock() before the woken waiter's turn takes it, and the waiter waits again", async () => {
+    const mu = new Bun.Mutex();
+    const first = await mu.lock();
+    const waiting = mu.lock();
+    first.unlock();
+    // The waiter is woken on this thread's loop, which has not had a turn.
+    const barged = mu.tryLock();
+    expect(barged).toBeDefined();
+    expect(mutexWaiters(mu)).toBe(0);
+    barged!.unlock();
+    using second = await waiting;
+    expect(mu.tryLock()).toBeUndefined();
+  });
+
+  test("a waiter on another thread gets the lock from a thread that keeps relocking it", async () => {
+    const mu = new Bun.Mutex();
+    const done = new Int32Array(new SharedArrayBuffer(4));
+    let lock = await mu.lock();
+    const goroutine = Bun.go(
+      async (mu: Bun.Mutex, done: Int32Array) => {
+        using _ = await mu.lock();
+        Atomics.store(done, 0, 1);
+      },
+      mu,
+      done,
+    );
+    await until(() => mutexWaiters(mu) === 1);
+    // Unlocked and locked again at once, every time: the waiter only gets in once it has waited long
+    // enough to be handed the lock.
+    let relocked = 0;
+    while (!Atomics.load(done, 0)) {
+      lock.unlock();
+      lock = await mu.lock();
+      relocked++;
+    }
+    lock.unlock();
+    await goroutine;
+    expect(relocked).toBeGreaterThan(0);
+    expect(mutexWaiters(mu)).toBe(0);
+    using free = mu.tryLock();
+    expect(free).toBeDefined();
+  });
+
+  test("an unlocked mutex goes to whoever locks it first, and a woken waiter that lost waits again", async () => {
     const mu = new Bun.Mutex();
     const lock = await mu.lock();
     const order = new Bun.Channel<number>(2);
@@ -92,9 +136,9 @@ describe("Bun.Mutex", () => {
       ),
     );
     await until(() => mutexWaiters(mu) === 2);
+    // This thread or the woken waiter, whichever locks first.
     lock.unlock();
-    // On its way to a waiter, or held by it: never free.
-    expect(mu.tryLock()).toBeUndefined();
+    mu.tryLock()?.unlock();
     const first = await order.receive();
     expect(mu.tryLock()).toBeUndefined();
     await release.send();
@@ -175,12 +219,73 @@ describe("Bun.Mutex", () => {
     const ch = new Bun.Channel<Bun.Mutex>(1);
     await ch.send(mu);
     const received = await ch.receive();
-    expect(received).not.toBe(mu);
-    expect(received).toBeInstanceOf(Bun.Mutex);
+    // On one thread, one mutex is one object.
+    expect(received).toBe(mu);
     using lock = received.tryLock();
     expect(lock).toBeDefined();
     expect(mu.tryLock()).toBeUndefined();
     expect(await Bun.go((mu: Bun.Mutex) => mu.tryLock() === undefined, mu)).toBe(true);
+  });
+
+  test("a lock() whose signal aborts while the lock is handed to it rejects, and the lock goes on", async () => {
+    const mu = new Bun.Mutex();
+    const controller = new AbortController();
+    const first = mu.tryLock()!;
+    const waiting = mu.lock({ signal: controller.signal });
+    // It waits long enough to be handed the lock once it loses to a lock() that barged in.
+    await Bun.sleep(5);
+    first.unlock();
+    const barged = mu.tryLock()!;
+    expect(barged).toBeDefined();
+    await Bun.sleep(5);
+    // Hands the lock to the waiter, then its signal aborts before the handoff arrives.
+    barged.unlock();
+    controller.abort(new Error("gave up"));
+    expect(
+      await waiting.then(
+        () => "locked",
+        error => (error as Error).message,
+      ),
+    ).toBe("gave up");
+    expect(mutexWaiters(mu)).toBe(0);
+    using free = mu.tryLock();
+    expect(free).toBeDefined();
+  });
+
+  test("an abort listener that ends a waiting lock() while it is woken to try again is safe", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+        // The abort lands between the wakeup of the lock() and its try for the lock in some rounds.
+        for (let i = 0; i < 300; i++) {
+          const ch = new Bun.Channel(1);
+          const controller = new AbortController();
+          // A signal linked to the controller's, as a goroutine gets.
+          await ch.send(controller.signal);
+          const signal = await ch.receive();
+          const graph = new Bun.ModuleGraph();
+          const mu = new Bun.Mutex();
+          const lock = await mu.lock();
+          // Disposing the graph ends the lock() that waits in it.
+          signal.addEventListener("abort", () => graph.dispose());
+          const waiting = graph.run(() => mu.lock({ signal }));
+          waiting.then(lock => lock.unlock(), () => {});
+          setTimeout(() => controller.abort(new Error("stop")), 0);
+          lock.unlock();
+          await Bun.sleep(2);
+          graph.dispose();
+        }
+        console.log("done");
+        `,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: "done\n", stderr: "", exitCode: 0 });
   });
 
   test("Bun.inspect() shows whether it is locked and how many wait, not its methods", async () => {

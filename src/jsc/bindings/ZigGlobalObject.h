@@ -38,6 +38,7 @@ class HandleScopeImpl;
 class JSNextTickQueue;
 class Process;
 class SecureContextCache;
+class SharedHandleWrappers;
 class GCProfilerObserver;
 
 struct ModuleGraphState;
@@ -441,6 +442,8 @@ public:
     /* process.stdin/stdout/stderr are built over these lazily (BunProcess.cpp constructStd*). */            \
     V(private, WriteBarrier<JSObject>, m_nodeWorkerStdioPorts)                                               \
     V(private, LazyPropertyOfGlobalObject<Structure>, m_moduleGraphFrameStructure)                           \
+    /* A Bun.go pool thread's: the storage of the frame each goroutine runs in (BunGo.cpp). */               \
+    V(public, WriteBarrier<JSObject>, m_goroutineFrameStorage)                                               \
                                                                                                              \
     /* The original, unmodified Error.prepareStackTrace. */                                                  \
     /* */                                                                                                    \
@@ -698,6 +701,10 @@ public:
     // config digest. WeakGCMap self-registers with the heap, so no
     // visitChildren wiring needed (and it must NOT keep its values alive).
     std::unique_ptr<Bun::SecureContextCache> m_secureContextCache;
+
+    // The wrapper of each Bun.Channel and Bun.Mutex in this realm, by the address of its native
+    // core, while it is alive (ChannelMessage.cpp).
+    std::unique_ptr<Bun::SharedHandleWrappers> m_sharedHandleWrappers;
 
     std::unique_ptr<Bun::ModuleGraphState> m_moduleGraphs;
 

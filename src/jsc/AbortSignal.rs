@@ -28,6 +28,7 @@ bun_opaque::opaque_ffi! {
 // or out-param keep raw pointers and stay `unsafe fn`.
 unsafe extern "C" {
     safe fn WebCore__AbortSignal__aborted(arg0: &AbortSignal) -> bool;
+    safe fn WebCore__AbortSignal__observeLinkedAbort(arg0: &AbortSignal);
     // safe: `arg1` is an opaque round-trip pointer C++ stores into the listener
     // entry and forwards to `arg_fn2` on abort (never dereferenced as Rust
     // data) — same contract as `cleanNativeBindings` / `queueMicrotaskCallback`.
@@ -97,6 +98,13 @@ impl AbortSignal {
 
     pub fn pending_activity_unref(&self) {
         WebCore__AbortSignal__decrementPendingActivity(self)
+    }
+
+    /// A signal linked to one on another thread (or that follows one) takes in an abort of its
+    /// original now, rather than when the abort's task reaches this thread. May run abort
+    /// listeners. JS thread.
+    pub fn observe_linked_abort(&self) {
+        WebCore__AbortSignal__observeLinkedAbort(self)
     }
 
     /// This function is not threadsafe. aborted is a boolean, not an atomic!
