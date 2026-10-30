@@ -582,7 +582,10 @@ impl ChannelOp {
         let mutex = Arc::clone(mutex);
         let aborted = signal
             .as_ref()
-            .filter(|signal| signal.aborted())
+            .filter(|signal| {
+                signal.observe_linked_abort();
+                signal.aborted()
+            })
             .map(|signal| signal.js_reason(global));
         match aborted {
             // The next waiter tries instead.
@@ -658,7 +661,10 @@ impl ChannelOp {
                     .mutex
                     .as_ref()
                     .and_then(|(_, signal)| signal.as_ref())
-                    .filter(|signal| signal.aborted());
+                    .filter(|signal| {
+                        signal.observe_linked_abort();
+                        signal.aborted()
+                    });
                 if let Some(signal) = aborted {
                     // The lock goes on to the next waiter.
                     drop(handoff);
@@ -1267,6 +1273,9 @@ impl Options {
             return Some(JSPromise::rejected_promise(global, error).to_js());
         }
         let signal = self.signal.as_ref()?;
+        // An abort on another thread counts now: a goroutine whose operations are always ready
+        // never gives its loop a turn to receive it.
+        signal.observe_linked_abort();
         if !signal.aborted() {
             return None;
         }

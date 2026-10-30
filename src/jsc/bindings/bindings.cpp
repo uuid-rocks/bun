@@ -6146,6 +6146,11 @@ extern "C" JSC::EncodedJSValue WebCore__AbortSignal__reasonIfAborted(WebCore::Ab
     return {};
 }
 
+extern "C" void WebCore__AbortSignal__observeLinkedAbort(WebCore::AbortSignal* signal)
+{
+    signal->observeLinkedAbort();
+}
+
 extern "C" bool WebCore__AbortSignal__aborted(WebCore::AbortSignal* arg0)
 {
     WebCore::AbortSignal* abortSignal = reinterpret_cast<WebCore::AbortSignal*>(arg0);

@@ -113,6 +113,12 @@ pub(crate) fn select(
     if ending(global) {
         return Ok(never(global));
     }
+    // An abort on another thread counts now, and can run listeners: before the channels lock.
+    for case in &read {
+        if let Read::Signal(signal) = case {
+            signal.observe_linked_abort();
+        }
+    }
     if !default && parsed.signal.is_none() && read.iter().all(|case| matches!(case, Read::Never)) {
         return Err(validators::throw_err_invalid_arg_value(
             global,
