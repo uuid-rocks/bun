@@ -581,6 +581,9 @@ class WaitGroup {
   #active = new Set<Promise<unknown>>();
   #queue: Queued[] = [];
   #queueHead = 0;
+  // What waits for a slot rejects once the signal aborts, not once a slot frees. Listens only while something
+  // waits: a listener on a signal of AbortSignal.any() keeps the group alive as long as the parent signal.
+  #onAbort = () => this.#next();
 
   constructor(options?: { signal?: AbortSignal; limit?: number }) {
     let parent: AbortSignal | undefined;
@@ -601,8 +604,6 @@ class WaitGroup {
     }
     // AbortSignal.any() holds what it makes weakly: a long-lived parent does not keep this alive.
     this.#signal = parent === undefined ? this.#controller.signal : AbortSignal.any([parent, this.#controller.signal]);
-    // What waits for a slot rejects once the signal aborts, not once a slot frees.
-    if (this.#limit !== Infinity) this.#signal.addEventListener("abort", () => this.#next(), { once: true });
     ownedByThisThread(this, kWaitGroupHint);
   }
 
@@ -623,6 +624,7 @@ class WaitGroup {
         }
         const uncloneable = uncloneableArgument("WaitGroup.go", args);
         if (uncloneable !== undefined) throw uncloneable;
+        if (this.#queueHead === this.#queue.length) this.#signal.addEventListener("abort", this.#onAbort);
         this.#queue.push({ goroutine, task: fn, target, args });
         if (this.#signal.aborted) this.#next();
       }
@@ -671,9 +673,10 @@ class WaitGroup {
         Goroutine.fail(goroutine, error);
       }
     }
-    if (this.#queueHead === queue.length) {
+    if (this.#queueHead === queue.length && queue.length > 0) {
       queue.length = 0;
       this.#queueHead = 0;
+      this.#signal.removeEventListener("abort", this.#onAbort);
     }
   }
 

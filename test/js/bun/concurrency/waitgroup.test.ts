@@ -258,6 +258,32 @@ describe("Bun.WaitGroup", () => {
       expect(await group.wait().catch(e => e)).toBe(reason);
     });
 
+    test("a group with a limit and a long-lived parent signal can be collected once nothing waits in it", async () => {
+      const parent = new AbortController();
+      const refs: WeakRef<Bun.WaitGroup>[] = [];
+      const make = async () => {
+        for (let i = 0; i < 100; i++) {
+          const group = new Bun.WaitGroup({ limit: 1, signal: parent.signal });
+          const gate = new Bun.Channel<void>(1);
+          group.go((gate: Bun.Channel<void>) => gate.receive(), gate);
+          // Waits for the slot, then runs.
+          group.go(() => 1);
+          await gate.send();
+          await group.wait();
+          refs.push(new WeakRef(group));
+        }
+      };
+      await make();
+      let alive = refs.length;
+      for (let i = 0; i < 20 && alive > 10; i++) {
+        Bun.gc(true);
+        await Promise.resolve();
+        alive = refs.filter(ref => ref.deref() !== undefined).length;
+      }
+      expect(alive).toBeLessThanOrEqual(10);
+      parent.abort();
+    });
+
     test("a goroutine that waits for a slot throws from go() at once if it can't start", () => {
       const group = new Bun.WaitGroup({ limit: 1 });
       const gate = new Bun.Channel<void>(1);
