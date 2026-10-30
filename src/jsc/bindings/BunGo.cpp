@@ -39,6 +39,7 @@
 #include <JavaScriptCore/JSSymbolTableObject.h>
 #include <JavaScriptCore/JSWithScope.h>
 #include <JavaScriptCore/SourceProvider.h>
+#include <JavaScriptCore/StackVisitor.h>
 #include <wtf/Deque.h>
 #include <wtf/HashMap.h>
 #include <wtf/HashSet.h>
@@ -46,6 +47,10 @@
 #include <wtf/NeverDestroyed.h>
 
 extern "C" uint32_t Bun__Go__maxPoolThreads();
+// bun_runtime::concurrency::deadlock
+extern "C" void Bun__Deadlock__goroutineRef(int32_t delta);
+extern "C" void Bun__Deadlock__describe(Zig::GlobalObject*);
+extern "C" void Bun__Deadlock__exit(Zig::GlobalObject*);
 // ChannelMessage.cpp
 extern "C" WebCore::MessageWithMessagePorts* Bun__ChannelMessage__create(JSC::JSGlobalObject*, JSC::EncodedJSValue value, JSC::EncodedJSValue transfer);
 extern "C" JSC::EncodedJSValue Bun__ChannelMessage__deserialize(JSC::JSGlobalObject*, WebCore::MessageWithMessagePorts*);
@@ -149,6 +154,8 @@ public:
         Yes };
     // Wake an idle thread for what is queued, or grow the pool. Called without the lock.
     void dispatch(Grow = Grow::Yes);
+    // Nothing is queued, and no thread is starting or was woken and has not taken yet.
+    bool isIdle();
 
 private:
     void retireLocked(ScriptExecutionContextIdentifier, Vector<std::pair<uint64_t, Spawner>>& lost) WTF_REQUIRES_LOCK(m_lock);
@@ -351,6 +358,12 @@ std::optional<Task> Scheduler::take(ScriptExecutionContextIdentifier thread)
     m_running.add(task.id, Running { thread, spawner });
     m_load.add(thread, 0).iterator->value++;
     return WTF::move(task);
+}
+
+bool Scheduler::isIdle()
+{
+    Locker locker { m_lock };
+    return m_queue.isEmpty() && !m_startingCount && m_woken.isEmpty();
 }
 
 std::optional<Spawner> Scheduler::finish(uint64_t id)
@@ -965,10 +978,13 @@ JSC_DEFINE_HOST_FUNCTION(jsGoCompile, (JSGlobalObject * lexicalGlobalObject, Cal
 JSC_DEFINE_HOST_FUNCTION(jsGoKeepAlive, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
     auto& context = contextOf(lexicalGlobalObject);
-    if (callFrame->argument(0).asNumber() > 0)
+    if (callFrame->argument(0).asNumber() > 0) {
         context.refEventLoop();
-    else
+        Bun__Deadlock__goroutineRef(1);
+    } else {
         context.unrefEventLoop();
+        Bun__Deadlock__goroutineRef(-1);
+    }
     return JSValue::encode(jsUndefined());
 }
 
@@ -1131,6 +1147,7 @@ extern "C" void Bun__Go__restartPool()
 extern "C" void Bun__Worker__loadGoroutineRuntime(Zig::GlobalObject* globalObject)
 {
     globalObject->scriptExecutionContext()->refEventLoop();
+    Bun__Deadlock__goroutineRef(1);
     BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalGoRuntime, "Bun.go");
 }
 
@@ -1155,6 +1172,58 @@ extern "C" void Bun__Go__exitProcess(uint8_t code)
             (void)scope.tryClearException();
             Bun__reportUnhandledError(globalObject, JSValue::encode(exception->value()));
         }
+    });
+}
+
+// Where module code that called into native code is: a top-level `await` there runs in no async
+// function, so a deadlock's report finds it only from this. False for any other caller.
+extern "C" bool Bun__Go__moduleCallSite(JSC::JSGlobalObject* globalObject, BunString* outSourceURL, unsigned* outLine, unsigned* outColumn)
+{
+    auto& vm = globalObject->vm();
+    std::optional<JSC::LineColumn> lineColumn;
+    String sourceURL;
+    StackVisitor::visit(vm.topCallFrame, vm, [&](StackVisitor& visitor) -> IterationStatus {
+        if (Zig::isImplementationVisibilityPrivate(visitor) || !visitor->hasLineAndColumnInfo())
+            return IterationStatus::Continue;
+        if (auto* function = dynamicDowncast<JSFunction>(visitor->callee().asCell()); function && function->isBuiltinFunction())
+            return IterationStatus::Continue;
+        if (visitor->codeType() == StackVisitor::Frame::Module) {
+            lineColumn = visitor->computeLineAndColumn();
+            sourceURL = Zig::sourceURL(visitor);
+        }
+        return IterationStatus::Done;
+    });
+    if (!lineColumn || sourceURL.isEmpty())
+        return false;
+    Bun::OwnedZigStackFrames remappedFrames(1);
+    ZigStackFrame& frame = remappedFrames[0];
+    frame.position.line_zero_based = OrdinalNumber::fromOneBasedInt(lineColumn->line).zeroBasedInt();
+    frame.position.column_zero_based = OrdinalNumber::fromOneBasedInt(lineColumn->column).zeroBasedInt();
+    frame.source_url = Bun::toStringRef(sourceURL);
+    remappedFrames.remap(Bun::vm(globalObject));
+    *outSourceURL = Bun::toStringRef(frame.source_url.toWTFString());
+    *outLine = OrdinalNumber::fromZeroBasedInt(frame.position.line_zero_based).oneBasedInt();
+    *outColumn = OrdinalNumber::fromZeroBasedInt(frame.position.column_zero_based).oneBasedInt();
+    return true;
+}
+
+// bun_runtime::concurrency::deadlock found that no thread can run again.
+extern "C" bool Bun__Go__poolIsIdle()
+{
+    return Bun::Go::scheduler().isIdle();
+}
+
+extern "C" bool Bun__Go__postDeadlockDescribe(ScriptExecutionContextIdentifier context)
+{
+    return ScriptExecutionContext::postTaskTo(context, BunLoopKind::Regular, [](ScriptExecutionContext& context) {
+        Bun__Deadlock__describe(defaultGlobalObject(context.jsGlobalObject()));
+    });
+}
+
+extern "C" void Bun__Go__postDeadlockExit()
+{
+    ScriptExecutionContext::postTaskTo(Bun::Go::mainThreadContext, BunLoopKind::Regular, [](ScriptExecutionContext& context) {
+        Bun__Deadlock__exit(defaultGlobalObject(context.jsGlobalObject()));
     });
 }
 

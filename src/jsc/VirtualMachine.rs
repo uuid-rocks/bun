@@ -64,6 +64,20 @@ pub type ExceptionList = Vec<crate::exception_list::JsException>;
 // VirtualMachine struct (file-level @This())
 // ──────────────────────────────────────────────────────────────────────────
 
+bun_core::declare_scope!(deadlock, hidden);
+
+unsafe extern "C" {
+    safe fn Bun__JSC__hasDeferredWork(vm: &VM) -> bool;
+}
+
+/// [`VirtualMachine::thread_kind`].
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum ThreadKind {
+    Main,
+    Goroutine,
+    Worker,
+}
+
 #[derive(Default)]
 pub struct EntryPointResult {
     pub value: crate::strong::Optional, // jsc.Strong.Optional
@@ -1838,6 +1852,86 @@ impl VirtualMachine {
         self.is_event_loop_alive_excluding_immediates()
             || !el.immediate_tasks.is_empty()
             || !el.next_immediate_tasks.is_empty()
+    }
+
+    /// `Bun.go`'s deadlock detection, on this VM's thread: nothing this VM holds can run script
+    /// by itself. No task is queued, posted or yielded, nothing keeps the loop alive but
+    /// `expected_refs`, and no poll is registered, not even an unref'd one (a socket, a pipe, a
+    /// signal listener). Timers are for the caller to check.
+    pub fn deadlock_quiet(&self, expected_refs: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let el = self.event_loop_shared();
+            // SAFETY: the VM's own loop, on its thread.
+            let loop_ = unsafe { &*el.usockets_loop() };
+            let (active, polls) = (loop_.active.get(), loop_.num_polls.get());
+            // The one poll `tick_possibly_forever` holds so that the loop parks.
+            let held = i32::from(el.holds_forever_poll);
+            bun_core::scoped_log!(
+                deadlock,
+                "quiet? active={} expected={} polls={} held={} tasks={} immediates={} yields={} active_tasks={} posted={} signals={} debugger={}",
+                active,
+                expected_refs,
+                polls,
+                held,
+                el.has_pending_tasks(),
+                el.immediate_tasks.len() + el.next_immediate_tasks.len(),
+                el.yield_tasks.len(),
+                self.active_tasks,
+                self.has_posted_work(),
+                el.signal_handler.is_some(),
+                self.debugger.is_some(),
+            );
+            active == expected_refs
+                && !Bun__JSC__hasDeferredWork(self.jsc_vm())
+                && polls == active as i32 + held
+                && self.active_tasks == 0
+                && !el.has_pending_tasks()
+                && el.immediate_tasks.is_empty()
+                && el.next_immediate_tasks.is_empty()
+                && el.yield_tasks.is_empty()
+                && !self.has_posted_work()
+                && el.signal_handler.is_none()
+                && self.debugger.is_none()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = expected_refs;
+            false
+        }
+    }
+
+    /// Any thread: another thread posted work to this VM, or changed what keeps its loop alive,
+    /// and the VM has not taken it yet.
+    pub fn has_posted_work(&self) -> bool {
+        let el = self.event_loop_shared();
+        el.has_concurrent_tasks()
+            || el.concurrent_ref.load(core::sync::atomic::Ordering::SeqCst) != 0
+            || self
+                .pending_unref_counter
+                .load(core::sync::atomic::Ordering::SeqCst)
+                != 0
+    }
+
+    /// The identifier of the `ScriptExecutionContext` of the VM's global, which posts reach it by.
+    pub fn root_context_id(&self) -> u32 {
+        self.root_context.id().raw()
+    }
+
+    /// The main thread, a thread of the `Bun.go` pool, or a `Worker`'s.
+    pub fn thread_kind(&self) -> ThreadKind {
+        match self.worker {
+            None => ThreadKind::Main,
+            Some(worker) => {
+                // SAFETY: a worker's VM points at its `WebWorker`, which outlives it.
+                let worker = unsafe { &*worker.cast::<crate::web_worker::WebWorker>() };
+                if worker.is_goroutine() {
+                    ThreadKind::Goroutine
+                } else {
+                    ThreadKind::Worker
+                }
+            }
+        }
     }
 
     pub fn wakeup(&mut self) {

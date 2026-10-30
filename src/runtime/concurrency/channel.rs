@@ -36,6 +36,7 @@ use bun_jsc::{
 use bun_threading::Guarded;
 
 use super::message::{ChannelMessage, CloneSite};
+use super::mutex::{Handoff, MutexCore};
 use super::ops::OpTable;
 use crate::node::util::validators;
 
@@ -155,7 +156,7 @@ const CANCELLED: u32 = 2;
 
 impl Waiter {
     /// Wins the waiter for a result. Any thread.
-    fn fire(&self) -> bool {
+    pub(super) fn fire(&self) -> bool {
         self.state
             .compare_exchange(WAITING, FIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -169,7 +170,7 @@ impl Waiter {
     }
 
     /// Posts the result of a waiter this thread [fired](Self::fire) to its VM. Nothing locked.
-    fn wake(&self, case: u32, result: WakeResult) {
+    pub(super) fn wake(&self, case: u32, result: WakeResult) {
         let wake = bun_core::heap::into_raw(Box::new(ChannelWake {
             op_id: self.op_id,
             case,
@@ -201,6 +202,8 @@ pub(super) enum WakeResult {
     Received(ChannelMessage),
     Sent,
     Closed,
+    /// A `Bun.Mutex` was handed to the waiter.
+    Acquired(Handoff),
 }
 
 /// The outcome of a waiting operation, on its way to the operation's VM.
@@ -240,6 +243,8 @@ pub(super) enum OpKind {
     Next,
     /// `Bun.select`: `{ index, value, closed }`. Which cases send.
     Select(Box<[bool]>),
+    /// `Bun.Mutex`'s `lock()`.
+    Lock,
 }
 
 /// The channels a waiter is queued in, each once.
@@ -253,7 +258,48 @@ pub(crate) struct ChannelOp {
     promise: JSPromiseStrong,
     waiter: Arc<Waiter>,
     channels: Channels,
+    /// A select's `AbortSignal` cases, which it follows while it waits.
+    signal_cases: Vec<Box<SignalCase>>,
+    /// The mutex a `lock()` waits for.
+    mutex: Option<Arc<MutexCore>>,
+    /// Where module code waits: no async function's frame shows a top-level `await`.
+    top_level: Option<(bun_core::String, u32, u32)>,
 }
+
+/// A select's `AbortSignal` case: ready once the signal aborts, with `signal.reason` as its value.
+pub(super) struct SignalCase {
+    abort_handle: AbortHandle,
+    op_id: u64,
+    case: u32,
+}
+
+bun_jsc::impl_abort_handle_owner!(SignalCase, abort_handle, |this, cause| {
+    // Followed, never armed in a context: the select's own handle is.
+    let AbortCause::Signal(reason) = cause else {
+        return;
+    };
+    // SAFETY: trait contract — `this` is live, owned by its operation in the table.
+    let (id, case) = unsafe { ((*this).op_id, (*this).case) };
+    let Some(op) = ops().get(id) else {
+        return;
+    };
+    // SAFETY: in the table, so live.
+    if !unsafe { op.as_ref() }.waiter.cancel() {
+        // Another case won; its outcome is on its way.
+        return;
+    }
+    let op = ops()
+        .remove(id)
+        .expect("an operation is in the table until it settles");
+    op.forget();
+    let global = VirtualMachine::get().global();
+    // The rest of the operation, `this` among it, drops at the end of this scope.
+    let mut promise = op.promise;
+    let _ = promise.settle(
+        global,
+        Ok(select_result(global, i64::from(case), reason, false)),
+    );
+});
 
 bun_jsc::impl_abort_handle_owner!(ChannelOp, abort_handle, |this, cause| {
     // SAFETY: trait contract — `this` is live, in the table.
@@ -275,10 +321,48 @@ bun_jsc::impl_abort_handle_owner!(ChannelOp, abort_handle, |this, cause| {
 });
 
 impl ChannelOp {
+    /// What waits, and the async functions that await it, for a deadlock's report.
+    pub(super) fn describe(&self, global: &JSGlobalObject) -> String {
+        let what = match self.kind {
+            OpKind::Send => "Channel.send()",
+            OpKind::Receive => "Channel.receive()",
+            OpKind::Next => "for await on a Channel",
+            OpKind::Select(_) => "Bun.select()",
+            OpKind::Lock => "Mutex.lock()",
+        };
+        let error = global.create_error_instance(format_args!("{what}"));
+        error.attach_async_stack_from_promise(global, self.promise.get());
+        let stack = match error
+            .get(global, "stack")
+            .and_then(|stack| stack.unwrap_or(JSValue::UNDEFINED).to_bun_string(global))
+        {
+            Ok(stack) => stack.to_string(),
+            Err(_) => {
+                global.clear_exception();
+                String::new()
+            }
+        };
+        let mut out = String::from(what);
+        for frame in stack.lines().filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("at ") && !line.contains("(internal:")
+        }) {
+            out.push_str("\n    ");
+            out.push_str(frame.trim_start());
+        }
+        if let (Some((url, line, column)), false) = (&self.top_level, out.contains('\n')) {
+            out.push_str(&format!("\n    at {url}:{line}:{column}"));
+        }
+        out
+    }
+
     /// Takes the waiter out of the channels that still queue it.
     fn forget(&self) {
         for channel in &self.channels {
             channel.forget(&self.waiter);
+        }
+        if let Some(mutex) = &self.mutex {
+            mutex.forget(&self.waiter);
         }
     }
 
@@ -308,6 +392,7 @@ impl ChannelOp {
                     JSValue::UNDEFINED,
                     true,
                 )),
+                WakeResult::Acquired(_) => unreachable!("only a lock is handed a mutex"),
             };
             return promise.settle(global, value);
         }
@@ -324,14 +409,35 @@ impl ChannelOp {
             (OpKind::Next, WakeResult::Closed) => {
                 Ok(iterator_result(global, JSValue::UNDEFINED, true))
             }
+            (OpKind::Lock, WakeResult::Acquired(handoff)) => {
+                handoff.keep();
+                Ok(JSValue::UNDEFINED)
+            }
             (OpKind::Send, WakeResult::Received(_))
             | (OpKind::Receive | OpKind::Next, WakeResult::Sent) => {
                 unreachable!("a sender is only sent to, a receiver only received from")
+            }
+            (OpKind::Lock, _) | (_, WakeResult::Acquired(_)) => {
+                unreachable!("only a lock is handed a mutex")
             }
             (OpKind::Select(_), _) => unreachable!("settled above"),
         };
         promise.settle(global, value)
     }
+}
+
+unsafe extern "C" {
+    safe fn Bun__Go__moduleCallSite(
+        global: &JSGlobalObject,
+        url: &mut bun_core::String,
+        line: &mut u32,
+        column: &mut u32,
+    ) -> bool;
+}
+
+fn module_call_site(global: &JSGlobalObject) -> Option<(bun_core::String, u32, u32)> {
+    let (mut url, mut line, mut column) = (bun_core::String::default(), 0, 0);
+    Bun__Go__moduleCallSite(global, &mut url, &mut line, &mut column).then_some((url, line, column))
 }
 
 /// This VM's waiting channel operations.
@@ -569,6 +675,7 @@ impl Channel {
                 waiter,
                 self.channels(),
                 options.signal,
+                Vec::new(),
             ),
         })
     }
@@ -579,9 +686,26 @@ impl Channel {
         self.receive_as(global, OpKind::Receive, options)
     }
 
-    pub(crate) fn next(&self, cx: &mut JsScope<'_>) -> JsResult<JSValue> {
+    /// `signal`: `values({ signal })`'s, which validated it.
+    pub(crate) fn next(&self, cx: &mut JsScope<'_>, signal: JsLocal<'_>) -> JsResult<JSValue> {
         let global = cx.global();
-        self.receive_as(global, OpKind::Next, Options::NONE)
+        let signal = signal.to_js();
+        let options = Options {
+            signal: if signal.is_undefined() {
+                None
+            } else {
+                Some(AbortSignal::ref_from_js(signal).ok_or_else(|| {
+                    validators::throw_err_invalid_arg_type(
+                        global,
+                        "options.signal",
+                        "AbortSignal",
+                        signal,
+                    )
+                })?)
+            },
+            ..Options::NONE
+        };
+        self.receive_as(global, OpKind::Next, options)
     }
 
     fn receive_as(
@@ -610,7 +734,14 @@ impl Channel {
                 ),
                 _ => JSPromise::rejected_promise(global, closed_error(global)).to_js(),
             }),
-            Err(waiter) => Ok(wait(global, kind, waiter, self.channels(), options.signal)),
+            Err(waiter) => Ok(wait(
+                global,
+                kind,
+                waiter,
+                self.channels(),
+                options.signal,
+                Vec::new(),
+            )),
         }
     }
 }
@@ -640,6 +771,19 @@ pub(super) fn wait(
     waiter: Arc<Waiter>,
     channels: Channels,
     signal: Option<AbortSignalRef>,
+    signal_cases: Vec<(u32, AbortSignalRef)>,
+) -> JSValue {
+    wait_for(global, kind, waiter, channels, None, signal, signal_cases)
+}
+
+pub(super) fn wait_for(
+    global: &JSGlobalObject,
+    kind: OpKind,
+    waiter: Arc<Waiter>,
+    channels: Channels,
+    mutex: Option<Arc<MutexCore>>,
+    signal: Option<AbortSignalRef>,
+    signal_cases: Vec<(u32, AbortSignalRef)>,
 ) -> JSValue {
     let id = waiter.op_id;
     let op = Box::new(ChannelOp {
@@ -649,16 +793,37 @@ pub(super) fn wait(
         promise: JSPromiseStrong::init(global),
         waiter,
         channels,
+        signal_cases: signal_cases
+            .iter()
+            .map(|&(case, _)| {
+                Box::new(SignalCase {
+                    abort_handle: AbortHandle::for_owner::<SignalCase>(),
+                    op_id: id,
+                    case,
+                })
+            })
+            .collect(),
+        mutex,
+        top_level: module_call_site(global),
     });
     let promise = op.promise.value();
     let op = ops().insert(id, op).as_ptr();
     let vm = global.bun_vm();
-    // SAFETY: `op` is in the table, which frees it only through `remove`; the handle is
-    // disarmed when it drops.
+    // SAFETY: `op` is in the table, which frees it only through `remove`; the handles are
+    // disarmed when they drop. A signal that has aborted settles the operation before
+    // `follow_owner` returns, and then the rest are not followed.
     unsafe {
         AbortHandle::arm_owner(op, vm.context_of_caller());
         if let Some(signal) = signal {
             AbortHandle::follow_owner(op, signal);
+        }
+        for (i, (_, signal)) in signal_cases.into_iter().enumerate() {
+            let Some(op) = ops().get(id) else {
+                break;
+            };
+            let cases = &mut (*op.as_ptr()).signal_cases;
+            let case: *mut SignalCase = &mut *cases[i];
+            AbortHandle::follow_owner(case, signal);
         }
     }
     promise

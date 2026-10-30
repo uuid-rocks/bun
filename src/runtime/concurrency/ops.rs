@@ -34,6 +34,20 @@ impl<T> OpTable<T> {
         op
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        // SAFETY: each is live until `remove`, which takes `&mut self`.
+        self.ops.values().map(|op| unsafe { op.as_ref() })
+    }
+
+    /// Stays the operation's until [`remove`](Self::remove).
+    pub(crate) fn get(&self, id: u64) -> Option<NonNull<T>> {
+        self.ops.get(&id).copied()
+    }
+
     pub(crate) fn remove(&mut self, id: u64) -> Option<Box<T>> {
         let op = self.ops.remove(&id)?;
         // SAFETY: `insert` made it from a `Box`, and the table held it alone.

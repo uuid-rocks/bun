@@ -191,6 +191,16 @@ static void runPendingWork(const ::BunVmHandleRef* vmHandle, Bun::JSCTaskSchedul
     delete job;
 }
 
+// Script's async work that JSC tracks (Atomics.waitAsync, WebAssembly.compile, a
+// FinalizationRegistry's cleanup), finished or not: Bun.go's deadlock detection does not
+// report a thread that has any.
+extern "C" bool Bun__JSC__hasDeferredWork(JSC::VM* vm)
+{
+    auto& scheduler = WebCore::clientData(*vm)->deferredWorkTimer;
+    Locker<Lock> holder { scheduler.m_lock };
+    return !scheduler.m_pendingTicketsKeepingEventLoopAlive.isEmpty() || !scheduler.m_pendingTicketsOther.isEmpty();
+}
+
 extern "C" void Bun__runDeferredWork(Bun::JSCDeferredWorkTask* job)
 {
     runPendingWork(job->clientData->vmHandle, job->clientData->deferredWorkTimer, job);

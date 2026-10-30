@@ -16,6 +16,7 @@ export const Channel = b.class({
     "@@dispose": { rustName: "close" },
     "@@asyncIterator": { builtin: true, length: 0 },
     "@@inspectCustom": { builtin: true, length: 2 },
-    __next: { ...op, privateSymbol: "channelNext" },
+    values: { builtin: true, length: 0 },
+    __next: { ...op, args: { signal: b.any }, privateSymbol: "channelNext" },
   },
 });

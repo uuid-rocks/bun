@@ -120,6 +120,8 @@ new!(pub BUN_FEATURE_FLAG_DUMP_CODE: string, "BUN_FEATURE_FLAG_DUMP_CODE", {});
 new!(pub BUN_GC_RUNS_UNTIL_SKIP_RELEASE_ACCESS: unsigned, "BUN_GC_RUNS_UNTIL_SKIP_RELEASE_ACCESS", {});
 new!(pub BUN_GC_TIMER_DISABLE: boolean, "BUN_GC_TIMER_DISABLE", {});
 new!(pub BUN_GC_TIMER_INTERVAL: unsigned, "BUN_GC_TIMER_INTERVAL", {});
+// `0` turns off `Bun.go`'s deadlock detection (`src/runtime/concurrency/deadlock.rs`).
+new!(pub BUN_GO_DEADLOCK: boolean, "BUN_GO_DEADLOCK", {});
 new!(pub BUN_IDLE_GC_SECONDS: string, "BUN_IDLE_GC_SECONDS", {});
 // TODO(markovejnovic): It's unclear why the default here is 100_000, but this was legacy behavior
 // so we'll keep it for now.

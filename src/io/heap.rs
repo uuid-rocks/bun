@@ -96,6 +96,17 @@ impl<T: HeapNode, Context: HeapContext<T>> Intrusive<T, Context> {
         max_so_far
     }
 
+    /// Whether every node satisfies `f`. O(N).
+    ///
+    /// # Safety
+    /// All nodes reachable from `self.root` must be valid.
+    pub unsafe fn all(&self, mut f: impl FnMut(*mut T) -> bool) -> bool {
+        let mut all = true;
+        // SAFETY: fn contract.
+        unsafe { self.for_each(|node| all = all && f(node)) };
+        all
+    }
+
     /// Visits every node depth-first without recursion. A heap can degenerate
     /// into a single chain, so recursing could overflow the stack.
     ///

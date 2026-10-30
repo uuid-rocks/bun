@@ -252,6 +252,13 @@ impl TimerHeap {
         if r.is_null() { None } else { Some(r) }
     }
 
+    /// Whether every timer in the heap has a tag `f` accepts.
+    pub(crate) fn all_tags(&self, f: impl Fn(EventLoopTimerTag) -> bool) -> bool {
+        // SAFETY: all reachable nodes were inserted via `insert()` and remain live for the heap's
+        // lifetime (intrusive invariant maintained by `All`).
+        unsafe { self.0.all(|timer| f((*timer).tag)) }
+    }
+
     #[inline]
     pub(crate) fn count(&self) -> usize {
         // SAFETY: all reachable nodes were inserted via `insert()` and remain
@@ -537,6 +544,14 @@ pub(crate) struct All {
 }
 
 impl All {
+    /// `Bun.go`'s deadlock detection: no timer of this VM can run script, not even an unref'd one.
+    /// The garbage collector's timers (`GcRepeating`, and JSC's own, which are the WTF timers) are
+    /// not such timers; script's async work in JSC is the VM's to check.
+    pub(crate) fn quiet(&self) -> bool {
+        self.timers.all_tags(|tag| tag == EventLoopTimerTag::GcRepeating)
+            && self.immediate_ref_count == 0
+    }
+
     pub(crate) fn init() -> Self {
         Self {
             last_id: 1,

@@ -424,7 +424,13 @@ declare module "bun" {
 declare module "bun" {
   // src/runtime/concurrency/channel.bind.ts: what `for await` receives with.
   interface Channel<T> {
-    $channelNext(): Promise<IteratorResult<T, undefined>>;
+    $channelNext(signal: AbortSignal | undefined): Promise<IteratorResult<T, undefined>>;
+  }
+  // src/runtime/concurrency/mutex.bind.ts: what `lock()` and `tryLock()` (src/js/builtins/Mutex.ts) call.
+  interface Mutex {
+    $mutexLock(options: { signal?: AbortSignal } | undefined): Promise<void>;
+    $mutexTryLock(): boolean;
+    $mutexUnlock(): void;
   }
 }
 
