@@ -1,14 +1,51 @@
 // Bun.go: start a goroutine on the pool (BunGo.cpp), on any JS thread.
 
-const { spawn, keepAlive, moduleOf, resolveModule } = $cpp("BunGo.cpp", "createGoSpawnBinding") as {
+const {
+  spawn,
+  spawnInline,
+  keepAlive,
+  moduleOf,
+  resolveModule,
+  sourceOf,
+  check,
+  codeGenerationAllowed,
+} = $cpp("BunGo.cpp", "createGoSpawnBinding") as {
   spawn(module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]): number;
+  spawnInline(source: string, module: string, line: number, column: number, strict: boolean, args: unknown[]): number;
   keepAlive(delta: number): void;
   moduleOf(fn: Function): [url: string, namespace: object | undefined] | undefined;
   resolveModule(specifier: string): string;
+  sourceOf(fn: Function): Source | undefined;
+  check(fn: Function, source: string, module: string, line: number, column: number): Checked;
+  codeGenerationAllowed(): boolean;
 };
 
-// [module key, export name, the export is a property of a CommonJS module's `module.exports`]
-type Target = [module: string, exportName: string, fromCommonJSExports: boolean];
+// A function's text, and where it starts in its module (zero-based).
+type Source = [source: string, module: string, line: number, column: number, strict: boolean];
+type ProblemKind =
+  | "unparsable"
+  | "class"
+  | "this"
+  | "arguments"
+  | "import.meta"
+  | "captured"
+  | "imported"
+  | "undeclared";
+// The line is one-based, in the module's own text.
+type Problem = [kind: ProblemKind, name: string, line: number];
+// Where the function starts in its module's own text (zero-based), which Bun may have transpiled,
+// and what keeps it from running on another thread.
+type Checked = [line: number, column: number, problems?: Problem[]];
+
+const enum TargetKind {
+  // [module key, export name, the export is a property of a CommonJS module's `module.exports`]
+  Export = 0,
+  // A function no module exports, sent as its source.
+  Inline = 1,
+}
+type Target =
+  | [TargetKind.Export, module: string, exportName: string, fromCommonJSExports: boolean]
+  | [TargetKind.Inline, ...Source];
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -18,6 +55,11 @@ type Pending = {
 
 const pending = new Map<number, Pending>();
 const targets = new WeakMap<Function, Target>();
+// What `check` found for the code of a function no module exports, by its source: an inline
+// function is a new object each time the code around it runs.
+type Verdict = { module: string; line: number; column: number; target: Target | undefined; problems?: Problem[] };
+const verdicts = new Map<string, Verdict>();
+const kMaxVerdicts = 1024;
 
 class Goroutine<T> extends Promise<T> {
   #id = 0;
@@ -70,43 +112,119 @@ function keyOf(object: object, fn: Function): string | undefined {
   }
 }
 
-function notSendable(fn: Function, url: string | undefined) {
-  const label = fn.name ? `"${fn.name}"` : "This function";
-  if (url === undefined) {
-    return $ERR_GOROUTINE_NOT_SENDABLE(
-      `${label} has no module of its own (it is native or bound), so Bun.go() can't load it on another thread. Pass a function that a module exports.`,
-    );
-  }
-  return $ERR_GOROUTINE_NOT_SENDABLE(
-    `${label} is not exported by ${url}, so Bun.go() can't load it on another thread (a closure's variables can't move between threads). Export it from its module and pass data as arguments, or pass the module's URL to run its default export: Bun.go(new URL("./task.ts", import.meta.url)).`,
-  );
+function list(items: string[]) {
+  return items.length === 1 ? items[0] : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 }
 
-// The exported function of a module: its module's key and the name it is exported under.
-function exportOf(fn: Function): Target {
-  let target = targets.get(fn);
-  if (target !== undefined) return target;
-  const source = moduleOf(fn);
-  if (source !== undefined) {
-    const [url, namespace] = source;
-    if (namespace !== undefined) {
-      const key = keyOf(namespace, fn);
-      if (key !== undefined) target = [url, key, false];
-    }
-    if (target === undefined) {
-      const module = $requireMap.$get(url);
-      if (module !== undefined) {
-        const exports = module.exports;
-        if (exports === fn) {
-          target = [url, "default", false];
-        } else if ($isObject(exports) || $isCallable(exports)) {
-          const key = keyOf(exports, fn);
-          if (key !== undefined) target = [url, key, true];
-        }
-      }
+function notSendable(fn: Function, url: string | undefined, problems?: Problem[]) {
+  const label = fn.name ? `"${fn.name}"` : "this function";
+  if (url === undefined) {
+    return $ERR_GOROUTINE_NOT_SENDABLE(
+      `Bun.go() can't run ${label} on another thread: it has no source of its own (it is native or bound). Pass a function written in your code.`,
+    );
+  }
+  if (problems === undefined) {
+    return $ERR_GOROUTINE_NOT_SENDABLE(
+      `Bun.go() can't run ${label} on another thread: no module exports it, and its source can't be compiled again there while code generation from strings is disallowed. Export it from its module.`,
+    );
+  }
+  const [kind] = problems[0];
+  if (kind === "unparsable" || kind === "class") {
+    return $ERR_GOROUTINE_NOT_SENDABLE(
+      `Bun.go() can't run ${label} on another thread: it is ${kind === "class" ? "a class" : "a method"}. Pass a function or an arrow function.`,
+    );
+  }
+  const at = (line: number) => `${url}:${line}`;
+  const outside: string[] = [];
+  const reasons: string[] = [];
+  for (const [kind, name, line] of problems) {
+    switch (kind) {
+      case "captured":
+      case "imported":
+      case "undeclared":
+        outside.push(`"${name}" (${at(line)})`);
+        break;
+      case "this":
+        reasons.push(`the arrow function uses the \`this\` of the code around it (${at(line)}): pass it as an argument`);
+        break;
+      case "arguments":
+        reasons.push(
+          `the arrow function uses the \`arguments\` of the function around it (${at(line)}): pass them as arguments`,
+        );
+        break;
+      case "import.meta":
+        reasons.push(`it uses \`import.meta\` (${at(line)}): pass what it needs from it as an argument`);
+        break;
     }
   }
-  if (target === undefined) throw notSendable(fn, source?.[0]);
+  if (outside.length > 0) {
+    const one = outside.length === 1;
+    reasons.unshift(
+      `it uses ${list(outside)}, which ${one ? "is neither its own nor a global" : "are neither its own nor globals"}. ${one ? "Pass it as an argument" : "Pass them as arguments"}, or import ${one ? "it" : "them"} inside the function with \`await import()\``,
+    );
+  }
+  return $ERR_GOROUTINE_NOT_SENDABLE(`Bun.go() can't run ${label} on another thread: ${reasons.join("; ")}.`);
+}
+
+// The function a module exports: its module's key and the name it is exported under.
+function exportOf(fn: Function): Target | undefined {
+  const source = moduleOf(fn);
+  if (source === undefined) return;
+  const [url, namespace] = source;
+  if (namespace !== undefined) {
+    const key = keyOf(namespace, fn);
+    if (key !== undefined) return [TargetKind.Export, url, key, false];
+  }
+  const module = $requireMap.$get(url);
+  if (module === undefined) return;
+  const exports = module.exports;
+  if (exports === fn) return [TargetKind.Export, url, "default", false];
+  if ($isObject(exports) || $isCallable(exports)) {
+    const key = keyOf(exports, fn);
+    if (key !== undefined) return [TargetKind.Export, url, key, true];
+  }
+}
+
+// A function that uses nothing but its parameters, what it declares, and globals: its source.
+function inlineOf(fn: Function, source: Source | undefined): Target {
+  if (source === undefined) throw notSendable(fn, undefined);
+  const [text, module, line, column, strict] = source;
+  let verdict = verdicts.$get(text);
+  if (verdict === undefined || verdict.module !== module || verdict.line !== line || verdict.column !== column) {
+    if (verdicts.size >= kMaxVerdicts) verdicts.clear();
+    const [originalLine, originalColumn, problems] = check(fn, text, module, line, column);
+    verdict = {
+      module,
+      line,
+      column,
+      target: problems === undefined ? [TargetKind.Inline, text, module, originalLine, originalColumn, strict] : undefined,
+      problems,
+    };
+    verdicts.$set(text, verdict);
+  }
+  if (verdict.problems !== undefined) throw notSendable(fn, module, verdict.problems);
+  if (!codeGenerationAllowed()) throw notSendable(fn, module);
+  return verdict.target!;
+}
+
+function targetOf(fn: Function): Target {
+  let target = targets.get(fn);
+  if (target !== undefined) return target;
+  const source = sourceOf(fn);
+  if (source !== undefined) {
+    // Code that made a function no module exports makes another: no need to look for it in the
+    // module's exports.
+    const verdict = verdicts.$get(source[0]);
+    if (
+      verdict?.target !== undefined &&
+      verdict.module === source[1] &&
+      verdict.line === source[2] &&
+      verdict.column === source[3]
+    ) {
+      return verdict.target;
+    }
+  }
+  target = exportOf(fn) ?? inlineOf(fn, source);
   targets.set(fn, target);
   return target;
 }
@@ -114,15 +232,26 @@ function exportOf(fn: Function): Target {
 function go(task: unknown, ...args: unknown[]) {
   let target: Target;
   if ($isCallable(task)) {
-    target = exportOf(task as Function);
+    target = targetOf(task as Function);
   } else if (typeof task === "string") {
-    target = [resolveModule(task.startsWith("file:") ? Bun.fileURLToPath(task) : task), "default", false];
+    target = [
+      TargetKind.Export,
+      resolveModule(task.startsWith("file:") ? Bun.fileURLToPath(task) : task),
+      "default",
+      false,
+    ];
   } else if (task instanceof URL) {
-    target = [resolveModule(task.protocol === "file:" ? Bun.fileURLToPath(task) : task.href), "default", false];
+    target = [
+      TargetKind.Export,
+      resolveModule(task.protocol === "file:" ? Bun.fileURLToPath(task) : task.href),
+      "default",
+      false,
+    ];
   } else {
     throw $ERR_INVALID_ARG_TYPE("fn", ["function", "string", "URL"], task);
   }
-  return Goroutine.start(spawn(target[0], target[1], target[2], args));
+  if (target[0] === TargetKind.Export) return Goroutine.start(spawn(target[1], target[2], target[3], args));
+  return Goroutine.start(spawnInline(target[1], target[2], target[3], target[4], target[5], args));
 }
 
 const errorConstructors = {

@@ -129,6 +129,45 @@ pub fn parse_only_text<R>(
     parser.parse_only(f).ok()
 }
 
+/// What the text of one function is, for `Bun.go(fn)`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum FunctionTextKind {
+    /// Not one function expression: a method, a getter, or code that only parses inside a class.
+    #[default]
+    Other = 0,
+    Function = 1,
+    Arrow = 2,
+    Class = 3,
+}
+
+/// What a function uses that it does not declare itself. Offsets are in bytes of the text.
+#[derive(Default, Debug)]
+pub struct FunctionFreeNames {
+    pub kind: FunctionTextKind,
+    /// Each identifier nothing in the function declares, where it first appears, in order.
+    pub free: Vec<(Box<[u8]>, u32)>,
+    /// Where an arrow function first uses the `this` of the code around it.
+    pub this: Option<u32>,
+    pub import_meta: Option<u32>,
+}
+
+/// Binds the symbols of `text`, which is meant to be one function expression, and reports what in
+/// it is not its own. Returns `None` on a parse error.
+pub fn function_free_names(text: &[u8]) -> Option<FunctionFreeNames> {
+    let arena = bun_alloc::Arena::new();
+    let mut ast_memory_allocator = bun_ast::ASTMemoryAllocator::borrowing(&arena);
+    let _ast_scope = ast_memory_allocator.enter();
+    let source = bun_ast::Source::init_path_string(&b"function.js"[..], text);
+    let mut options = Options::init(Default::default(), bun_ast::Loader::Js);
+    options.features.no_macros = true;
+    options.suppress_warnings_about_weird_code = true;
+    let define = Define::default();
+    let mut log = bun_ast::Log::init();
+    let parser = Parser::init(options, &mut log, &source, &define, &arena).ok()?;
+    parser.free_names_of_function().ok()
+}
+
 pub struct Parser<'a> {
     pub(crate) options: Options<'a>,
     pub(crate) lexer: js_lexer::Lexer<'a>,
@@ -505,6 +544,90 @@ impl<'a> Parser<'a> {
             stmts: stmts.as_slice(),
             p,
         }))
+    }
+
+    /// `function_free_names`: parses, then binds symbols as `parse` does, and reads what is left unbound.
+    #[cold]
+    fn free_names_of_function(mut self) -> Result<FunctionFreeNames, Error> {
+        type Pi<'a> = P<'a, false, false>;
+        let lexer = core::mem::replace(
+            &mut self.lexer,
+            js_lexer::Lexer::init_without_reading(
+                self.bump.alloc(bun_ast::Log::default()),
+                self.source,
+                self.bump,
+            ),
+        );
+        let options = core::mem::take(&mut self.options);
+        let mut __p = init_p!(Pi<'_>;
+            self.bump, self.log, self.source, self.define, lexer, options);
+        // SAFETY: `init_p!` only yields after `init` succeeded.
+        let p: &mut Pi<'_> = unsafe { __p.assume_init_mut() };
+        if p.log().errors > self.orig_error_count {
+            return Err(crate::Error::SyntaxError);
+        }
+        let mut opts = ParseStatementOptions {
+            scope: StatementScope::Module,
+            ..Default::default()
+        };
+        let stmts = p
+            .parse_stmts_up_to(js_lexer::T::TEndOfFile, &mut opts)?
+            .into_bump_slice_mut();
+        if p.log().errors > self.orig_error_count {
+            return Err(crate::Error::SyntaxError);
+        }
+        let kind = match &*stmts {
+            [stmt] => match &stmt.data {
+                js_ast::StmtData::SExpr(expr) => match expr.value.data {
+                    js_ast::ExprData::EArrow(_) => FunctionTextKind::Arrow,
+                    js_ast::ExprData::EFunction(_) => FunctionTextKind::Function,
+                    js_ast::ExprData::EClass(_) => FunctionTextKind::Class,
+                    _ => FunctionTextKind::Other,
+                },
+                _ => FunctionTextKind::Other,
+            },
+            _ => FunctionTextKind::Other,
+        };
+        let mut out = FunctionFreeNames {
+            kind,
+            ..Default::default()
+        };
+        if !matches!(kind, FunctionTextKind::Function | FunctionTextKind::Arrow) {
+            return Ok(out);
+        }
+
+        p.prepare_for_visit_pass()?;
+        // The names a CommonJS module's wrapper declares are the module's, not the function's: with
+        // them gone, a use of one is unbound where it is.
+        let declared = core::mem::take(&mut p.module_scope_mut().members);
+        for (name, member) in declared.iter() {
+            if !matches!(
+                name,
+                b"exports" | b"module" | b"require" | b"__dirname" | b"__filename"
+            ) {
+                // SAFETY: `name` was a member's name already, so it outlives the scope.
+                unsafe { p.module_scope_mut().members.put(name, *member) };
+            }
+        }
+        let mut parts = BumpVec::<js_ast::Part>::new_in(p.arena);
+        p.append_part(&mut parts, stmts)?;
+        if p.log().errors > self.orig_error_count {
+            return Err(crate::Error::SyntaxError);
+        }
+
+        for (name, member) in p.module_scope().members.iter() {
+            if p.symbols[member.ref_.inner_index() as usize].kind == js_ast::symbol::Kind::Unbound
+            {
+                out.free.push((name.into(), member.loc.start as u32));
+            }
+        }
+        out.free.sort_unstable_by_key(|(_, at)| *at);
+        out.this = p.top_level_this.map(|loc| loc.start as u32);
+        if p.has_import_meta {
+            // The parser keeps the last `import.meta`.
+            out.import_meta = Some(p.esm_import_keyword.loc.start as u32);
+        }
+        Ok(out)
     }
 
     /// Bundler-only scan pass (see `bundler/cache.rs`). Never reached from
