@@ -298,9 +298,15 @@ pub(super) fn collect_large(now: bool) -> usize {
 /// `batch` reached more channels than one collection locks.
 fn note_large(batch: Vec<Weak<ChannelCore>>) {
     let mut large = LARGE.lock();
-    // A few members find the rest of a component.
-    let room = BATCH.saturating_sub(large.candidates.len());
-    large.candidates.extend(batch.into_iter().take(room));
+    // All of them: one that is left out may be the only way to a component nothing else releases.
+    large.candidates.extend(batch);
+    large
+        .candidates
+        .retain(|candidate| candidate.strong_count() > 0);
+    large
+        .candidates
+        .sort_unstable_by_key(|candidate| candidate.as_ptr() as usize);
+    large.candidates.dedup_by(|a, b| Weak::ptr_eq(a, b));
     if large.due.is_none() {
         large.due = Some(Instant::now() + large.backoff);
     }

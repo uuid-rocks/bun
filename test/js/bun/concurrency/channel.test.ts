@@ -843,6 +843,32 @@ describe.concurrent("Bun.Channel process", () => {
     expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   }, 60_000);
 
+  test("a large cycle that is still in use does not keep a later large cycle from being freed", async () => {
+    const result = await runReclaiming(`
+      setChannelCollectReach(256);
+      async function ring(length) {
+        const channels = Array.from({ length }, () => new Bun.Channel(1));
+        for (let i = 0; i < length; i++) await channels[i].send({ next: channels[(i + 1) % length] });
+        return channels[0];
+      }
+      async function collect(rounds, until = () => false) {
+        for (let i = 0; i < rounds && !until(); i++) {
+          Bun.gc(true);
+          collectChannels();
+          await Bun.sleep(5);
+        }
+      }
+      // Too large for one collection, and in use: its channels wait for a collection without the
+      // limit, again and again.
+      const kept = await ring(3000);
+      await collect(10);
+      await ring(3000).then(() => {});
+      await collect(100, () => channelLiveCount() - base === 3000);
+      console.log(channelLiveCount() - base, kept.length);
+    `);
+    expect(result).toEqual({ stdout: "3000 1\n", stderr: "", exitCode: 0 });
+  });
+
   test("a small cycle that refers to a large live channel is freed, and the large one is left alone", async () => {
     const result = await runReclaiming(`
       setChannelCollectReach(256);
