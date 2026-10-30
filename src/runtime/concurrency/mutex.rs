@@ -25,9 +25,7 @@ use bun_jsc::bindgen::{JsLocal, JsPayload as _, JsScope};
 use bun_jsc::{JSGlobalObject, JSPromise, JSValue, JsResult};
 use bun_threading::Guarded;
 
-use super::channel::{
-    OpKind, Options, Waiter, WakeResult, cancelled, new_waiter, ops, wait_for,
-};
+use super::channel::{OpKind, Options, Waiter, WakeResult, cancelled, new_waiter, ops, wait_for};
 
 /// Go's `starvationThresholdNs`.
 const STARVING_AFTER: Duration = Duration::from_millis(1);
