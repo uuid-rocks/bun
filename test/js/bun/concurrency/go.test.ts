@@ -683,6 +683,57 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("the goroutines a terminated Worker started stop waiting, and take no more values", async () => {
+    const { stdout, stderr, exitCode } = await run({
+      "main.ts": `
+        import { channelQueueLengths } from "bun:internal-for-testing";
+        async function until(condition: () => boolean) {
+          const deadline = Date.now() + 4000;
+          while (!condition() && Date.now() < deadline) await Bun.sleep(1);
+          return condition();
+        }
+        const ch = new Bun.Channel<number>();
+        // [rejected as cancelled, then rejected again at once, values taken]
+        const counts = new Int32Array(new SharedArrayBuffer(12));
+        const worker = new Worker(URL.createObjectURL(new Blob([\`
+          self.onmessage = ({ data: { ch, counts } }) => {
+            for (let i = 0; i < 4; i++) {
+              // A goroutine of a goroutine is the Worker's too.
+              Bun.go(async (ch, counts) => {
+                await Bun.go(async (ch, counts) => {
+                  try {
+                    for await (const v of ch) Atomics.add(counts, 2, 1);
+                  } catch (error) {
+                    if (error.code === "ERR_GOROUTINE_THREAD_EXITED") Atomics.add(counts, 0, 1);
+                    // Nothing it waits for waits any more.
+                    await ch.receive().catch(error => {
+                      if (error.message === "The Worker that started this goroutine exited") Atomics.add(counts, 1, 1);
+                    });
+                  }
+                }, ch, counts);
+              }, ch, counts).catch(() => {});
+            }
+          };
+        \`])));
+        worker.postMessage({ ch, counts });
+        console.log("waiting:", await until(() => channelQueueLengths(ch).receivers === 4));
+        const closed = new Promise(resolve => worker.addEventListener("close", resolve));
+        worker.terminate();
+        await closed;
+        const received = ch.receive();
+        await ch.send(42);
+        console.log("received:", await received);
+        console.log("cancelled:", await until(() => counts[0] === 4 && counts[1] === 4 && channelQueueLengths(ch).receivers === 0));
+        console.log("taken by them:", counts[2]);
+      `,
+    });
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout: "waiting: true\nreceived: 42\ncancelled: true\ntaken by them: 0",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
   test("CommonJS exports, a module's default export, and module URLs", async () => {
     const { stdout, exitCode } = await run({
       "props.cjs": `exports.multiply = (a, b) => a * b;`,

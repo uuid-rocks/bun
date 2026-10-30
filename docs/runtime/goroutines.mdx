@@ -349,6 +349,10 @@ const stage = Bun.go(
 
 [`Bun.WaitGroup`](#waitgroup) gives a group of goroutines one signal that aborts on the first error.
 
+### When a Worker ends
+
+The goroutines a `Worker` started, and the goroutines they started, are cancelled when the `Worker` ends, whether it was terminated, called `process.exit()`, or failed. The ones that have not started yet never start. In the ones that are running, every channel, `select()` and mutex operation rejects with `ERR_GOROUTINE_THREAD_EXITED`. That covers the operations they wait in when the `Worker` ends and every one they start afterwards, as does `Bun.go()`. A cancelled goroutine takes no value from a channel and no lock, so the rest of the program does not lose any to it. Code that computes, and other async work such as timers or `fetch()`, run on until they finish or reach one of those operations. Goroutines of the main thread end with the process.
+
 ---
 
 ## Deadlocks

@@ -175,6 +175,10 @@ private:
 // be called: it was handed over inside the context of a graph that has since been disposed.
 bool shouldDropCallbackOfStoppedModuleGraph(Zig::GlobalObject*, JSC::JSValue asyncContext);
 
+// A frame of the async context chain (async_hooks.ts's Frame) that binds `storage`, an object no
+// AsyncLocalStorage is, to `value`, on top of `previous`.
+JSC::JSObject* createAsyncContextFrame(Zig::GlobalObject*, JSC::JSObject* storage, JSC::JSValue value, JSC::JSValue previous);
+
 // Returns `asyncContext` with the frames that enter or leave a graph's context removed, leaving only the
 // AsyncLocalStorage stores. Use it for long-lived objects (e.g. an open WebSocket) that save an async context but
 // must not keep the graph alive. Their callbacks restore this context, then use a ModuleGraphContextScope.

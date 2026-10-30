@@ -391,6 +391,8 @@ pub(crate) struct ChannelOp {
     mutex: Option<(Arc<MutexCore>, Option<AbortSignalRef>)>,
     /// Where module code waits: no async function's frame shows a top-level `await`.
     top_level: Option<(bun_core::String, u32, u32)>,
+    /// The owner of the goroutine that waits (BunGo.cpp), or 0.
+    owner: u32,
 }
 
 /// A waiting operation's channels, which it [releases](graph::release).
@@ -601,6 +603,10 @@ impl ChannelOp {
 }
 
 unsafe extern "C" {
+    /// BunGo.cpp: the owner of the goroutine whose code runs now, or 0.
+    safe fn Bun__Go__currentOwner(global: &JSGlobalObject) -> u32;
+    /// BunGo.cpp: the goroutine whose code runs now was cancelled: its owner's thread ended.
+    safe fn Bun__Go__isCancelled(global: &JSGlobalObject) -> bool;
     safe fn Bun__Go__moduleCallSite(
         global: &JSGlobalObject,
         url: &mut bun_core::String,
@@ -621,6 +627,36 @@ pub(super) fn ops() -> &'static mut OpTable<ChannelOp> {
     // SAFETY: the live per-thread `RuntimeState`; JS thread. Every use is one statement, and
     // nothing it calls reaches the table.
     unsafe { &mut (*state).channel_ops }
+}
+
+fn cancelled_error(global: &JSGlobalObject) -> JSValue {
+    global
+        .err(
+            ErrorCode::GOROUTINE_THREAD_EXITED,
+            format_args!("The Worker that started this goroutine exited"),
+        )
+        .to_js()
+}
+
+/// BunGo.cpp: the thread of `owner`, a Worker that started goroutines, ended. Rejects the operations
+/// of this thread that its goroutines wait in. A wake on its way to one finds nothing, and passes
+/// on what it carries: a value, a lock.
+#[unsafe(no_mangle)]
+pub(crate) extern "C" fn Bun__Go__cancelOwner(global: &JSGlobalObject, owner: u32) {
+    let ids: Vec<u64> = ops()
+        .iter()
+        .filter(|op| op.owner == owner)
+        .map(|op| op.id)
+        .collect();
+    for id in ids {
+        let Some(op) = ops().remove(id) else {
+            continue;
+        };
+        op.waiter.cancel();
+        op.forget();
+        let mut promise = op.promise;
+        let _ = promise.reject(global, Ok(cancelled_error(global)));
+    }
 }
 
 pub(super) fn closed_error(global: &JSGlobalObject) -> JSValue {
@@ -1005,6 +1041,7 @@ pub(super) fn wait_for(
             .collect(),
         mutex: mutex.map(|mutex| (mutex, signal.clone())),
         top_level: module_call_site(global),
+        owner: Bun__Go__currentOwner(global),
     });
     let promise = op.promise.value();
     let op = ops().insert(id, op).as_ptr();
@@ -1088,7 +1125,11 @@ impl Options {
         Ok(parsed)
     }
 
+    /// Also if the goroutine that runs it was cancelled.
     pub(super) fn rejected_if_aborted(&self, global: &JSGlobalObject) -> Option<JSValue> {
+        if Bun__Go__isCancelled(global) {
+            return Some(JSPromise::rejected_promise(global, cancelled_error(global)).to_js());
+        }
         let signal = self.signal.as_ref()?;
         if !signal.aborted() {
             return None;

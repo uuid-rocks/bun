@@ -13,6 +13,10 @@ namespace Bun::Go {
 // had not settled are rejected, and the pool may grow again.
 void poolThreadWillExit(WebCore::ScriptExecutionContextIdentifier context);
 void poolThreadDidExit(WebCore::ScriptExecutionContextIdentifier context);
+// The thread of a Worker (not the pool's) is ending. The goroutines it started, and the ones they
+// started, are cancelled: those not started yet are dropped, and the channel, select and mutex
+// operations of those running reject, as does every one they start. Idempotent.
+void ownerWillExit(WebCore::ScriptExecutionContextIdentifier context);
 
 }
 
