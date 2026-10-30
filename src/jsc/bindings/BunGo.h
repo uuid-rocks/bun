@@ -9,8 +9,9 @@ class GlobalObject;
 
 namespace Bun::Go {
 
-// The pool thread of `context` has ended (main thread): its goroutines that had not settled are
-// rejected, and the pool may grow again.
+// Main thread: the pool thread of `context` was asked to stop, or has ended. Its goroutines that
+// had not settled are rejected, and the pool may grow again.
+void poolThreadWillExit(WebCore::ScriptExecutionContextIdentifier context);
 void poolThreadDidExit(WebCore::ScriptExecutionContextIdentifier context);
 
 }

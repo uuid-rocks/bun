@@ -189,6 +189,8 @@ void WorkerMessagingProxy::terminateWorkerGlobalScope()
     if (m_askedToTerminate)
         return;
     m_askedToTerminate = true;
+    if (m_options.kind == WorkerOptions::Kind::Goroutine)
+        Bun::Go::poolThreadWillExit(m_workerContextIdentifier);
     if (m_workerThread)
         WebWorker__requestTermination(m_workerThread);
 }

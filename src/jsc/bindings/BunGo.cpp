@@ -76,30 +76,33 @@ class Scheduler {
 public:
     // Spawner thread. Returns the goroutine's id.
     uint64_t spawn(Task&&, Spawner);
-    // Pool thread: the next goroutine for it, or none (it is idle until one is handed to it).
+    // Pool thread: the next goroutine for it, or none (it is idle until it is woken).
     std::optional<Task> take(ScriptExecutionContextIdentifier thread);
     // Pool thread: who is waiting for goroutine `id`, which is no longer running.
     std::optional<Spawner> finish(uint64_t id);
-    // Main thread.
-    void threadDidExit(ScriptExecutionContextIdentifier thread);
+    // Main thread: the thread is ending (asked to, or on its own). Idempotent. It may be called
+    // while the main thread's context stops its active objects, so it starts no thread.
+    void retire(ScriptExecutionContextIdentifier thread);
     void threadFailedToStart();
+    // Wake an idle thread for what is queued, or grow the pool. Called without the lock.
+    void dispatch();
 
 private:
-    struct Assignment {
-        ScriptExecutionContextIdentifier thread;
-        Task task;
-    };
-    void deliver(Assignment&&);
+    // Whether to start another thread (counted as starting) for what is queued.
+    bool shouldGrow() WTF_REQUIRES_LOCK(m_lock);
     void grow();
 
     Lock m_lock;
     Deque<std::pair<Task, Spawner>> m_queue WTF_GUARDED_BY_LOCK(m_lock);
-    // Pool threads waiting in take(), most recent last.
+    // Threads that found nothing to take, most recent last.
     Vector<ScriptExecutionContextIdentifier> m_idle WTF_GUARDED_BY_LOCK(m_lock);
-    // Pool threads whose runtime has called take() at least once.
+    // Threads that were woken and have not taken since.
+    HashSet<ScriptExecutionContextIdentifier> m_woken WTF_GUARDED_BY_LOCK(m_lock);
+    // Threads that have taken at least once and are not retired.
     HashSet<ScriptExecutionContextIdentifier> m_threads WTF_GUARDED_BY_LOCK(m_lock);
+    HashSet<ScriptExecutionContextIdentifier> m_retired WTF_GUARDED_BY_LOCK(m_lock);
     HashMap<uint64_t, Running> m_running WTF_GUARDED_BY_LOCK(m_lock);
-    // Threads created and not yet ended, and of those, the ones that have not taken yet.
+    // Threads not retired, and of those, the ones that have not taken yet.
     unsigned m_threadCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
     unsigned m_startingCount WTF_GUARDED_BY_LOCK(m_lock) { 0 };
     uint64_t m_nextId WTF_GUARDED_BY_LOCK(m_lock) { 1 };
@@ -149,46 +152,95 @@ void startPoolThread(ScriptExecutionContext& mainContext)
     poolWorkers().append(worker.releaseReturnValue());
 }
 
+JSObject* runtimeExports(Zig::GlobalObject* globalObject)
+{
+    JSValue exports = BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalGoRuntime, "Bun.go", "pull"_s);
+    return exports.getObject();
+}
+
+// Pool thread: it was idle, and something is queued.
+void wake(ScriptExecutionContext& context)
+{
+    auto* globalObject = defaultGlobalObject(context.jsGlobalObject());
+    auto& vm = globalObject->vm();
+    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
+    JSObject* exports = runtimeExports(globalObject);
+    JSValue pull;
+    if (!scope.exception())
+        pull = exports->get(globalObject, Identifier::fromString(vm, "pull"_s));
+    if (!scope.exception())
+        JSC::call(globalObject, pull, MarkedArgumentBuffer {}, "Bun.go"_s);
+    if (JSC::Exception* exception = scope.exception(); exception && !vm.isTerminationException(exception)) {
+        (void)scope.tryClearException();
+        Bun__reportUnhandledError(globalObject, JSValue::encode(exception->value()));
+    }
+}
+
+bool Scheduler::shouldGrow()
+{
+    // Starting and woken threads will take what is queued; grow while more is queued than that.
+    if (m_threadCount >= maxThreads() || m_queue.size() <= m_startingCount + m_woken.size())
+        return false;
+    m_threadCount++;
+    m_startingCount++;
+    return true;
+}
+
 uint64_t Scheduler::spawn(Task&& task, Spawner spawner)
 {
-    std::optional<Assignment> assignment;
-    bool shouldGrow = false;
     uint64_t id;
     {
         Locker locker { m_lock };
         id = m_nextId++;
         task.id = id;
-        if (!m_idle.isEmpty()) {
-            auto thread = m_idle.takeLast();
-            m_running.add(id, Running { thread, spawner });
-            assignment = Assignment { thread, WTF::move(task) };
-        } else {
-            m_queue.append({ WTF::move(task), spawner });
-            // Threads that are starting will take what is queued; grow while more is queued than that.
-            shouldGrow = m_threadCount < maxThreads() && m_queue.size() > m_startingCount;
-            if (shouldGrow) {
-                m_threadCount++;
-                m_startingCount++;
+        m_queue.append({ WTF::move(task), spawner });
+    }
+    dispatch();
+    return id;
+}
+
+void Scheduler::dispatch()
+{
+    for (;;) {
+        std::optional<ScriptExecutionContextIdentifier> thread;
+        bool grows = false;
+        {
+            Locker locker { m_lock };
+            if (m_queue.size() <= m_startingCount + m_woken.size())
+                return;
+            if (!m_idle.isEmpty()) {
+                thread = m_idle.takeLast();
+                m_woken.add(*thread);
+            } else {
+                grows = shouldGrow();
             }
         }
+        if (grows)
+            grow();
+        if (!thread)
+            return;
+        // What is queued stays queued until a thread takes it: a thread that is ending refuses the
+        // wake (or drops it unrun), and the goroutine goes to another.
+        if (ScriptExecutionContext::postTaskTo(*thread, BunLoopKind::Regular, wake))
+            return;
+        Locker locker { m_lock };
+        m_woken.remove(*thread);
     }
-    if (assignment)
-        deliver(WTF::move(*assignment));
-    if (shouldGrow)
-        grow();
-    return id;
 }
 
 std::optional<Task> Scheduler::take(ScriptExecutionContextIdentifier thread)
 {
     Locker locker { m_lock };
+    if (m_retired.contains(thread))
+        return std::nullopt;
     if (m_threads.add(thread).isNewEntry) {
         ASSERT(m_startingCount);
         m_startingCount--;
     }
+    m_woken.remove(thread);
     if (m_queue.isEmpty()) {
-        ASSERT(!m_idle.contains(thread));
-        m_idle.append(thread);
+        if (!m_idle.contains(thread))
+            m_idle.append(thread);
         return std::nullopt;
     }
     auto [task, spawner] = m_queue.takeFirst();
@@ -217,15 +269,17 @@ void Scheduler::threadFailedToStart()
 // A goroutine whose thread ended before it settled.
 void rejectAsThreadExited(uint64_t id, Spawner spawner);
 
-void Scheduler::threadDidExit(ScriptExecutionContextIdentifier thread)
+void Scheduler::retire(ScriptExecutionContextIdentifier thread)
 {
     Vector<std::pair<uint64_t, Spawner>> lost;
-    bool shouldGrow = false;
     {
         Locker locker { m_lock };
+        if (!m_retired.add(thread).isNewEntry)
+            return;
         m_threadCount--;
         if (!m_threads.remove(thread))
             m_startingCount--;
+        m_woken.remove(thread);
         m_idle.removeFirst(thread);
         m_running.removeIf([&](auto& entry) {
             if (entry.value.thread != thread)
@@ -233,32 +287,9 @@ void Scheduler::threadDidExit(ScriptExecutionContextIdentifier thread)
             lost.append({ entry.key, entry.value.spawner });
             return true;
         });
-        shouldGrow = m_threadCount < maxThreads() && m_queue.size() > m_startingCount;
-        if (shouldGrow) {
-            m_threadCount++;
-            m_startingCount++;
-        }
     }
     for (auto& [id, spawner] : lost)
         rejectAsThreadExited(id, spawner);
-    if (shouldGrow)
-        grow();
-}
-
-void runTask(ScriptExecutionContext&, Task&&);
-
-void Scheduler::deliver(Assignment&& assignment)
-{
-    auto id = assignment.task.id;
-    bool posted = ScriptExecutionContext::postTaskTo(assignment.thread, BunLoopKind::Regular, [task = WTF::move(assignment.task)](ScriptExecutionContext& context) mutable {
-        runTask(context, WTF::move(task));
-    });
-    // A pool thread only ends with the process, or when its heap is exhausted; a goroutine it
-    // refused, or dropped unrun in its teardown (see threadDidExit), fails.
-    if (posted)
-        return;
-    if (auto spawner = finish(id))
-        rejectAsThreadExited(id, *spawner);
 }
 
 void Scheduler::grow()
@@ -272,12 +303,6 @@ void Scheduler::grow()
     });
     if (!posted)
         threadFailedToStart();
-}
-
-JSObject* runtimeExports(Zig::GlobalObject* globalObject)
-{
-    JSValue exports = BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalGoRuntime, "Bun.go", "run"_s);
-    return exports.getObject();
 }
 
 JSObject* spawnExports(Zig::GlobalObject* globalObject)
@@ -299,49 +324,6 @@ JSArray* taskToJS(Zig::GlobalObject* globalObject, Task&& task)
     values.append(jsBoolean(task.fromCommonJSExports));
     values.append(args);
     RELEASE_AND_RETURN(scope, constructArray(globalObject, static_cast<ArrayAllocationProfile*>(nullptr), values));
-}
-
-// Pool thread: a goroutine handed to this idle thread.
-void runTask(ScriptExecutionContext& context, Task&& task)
-{
-    auto* globalObject = defaultGlobalObject(context.jsGlobalObject());
-    auto& vm = globalObject->vm();
-    auto scope = DECLARE_TOP_EXCEPTION_SCOPE(vm);
-    auto id = task.id;
-    JSArray* taskValue = taskToJS(globalObject, WTF::move(task));
-    JSValue run;
-    if (!scope.exception()) {
-        JSObject* exports = runtimeExports(globalObject);
-        if (!scope.exception())
-            run = exports->get(globalObject, Identifier::fromString(vm, "run"_s));
-    }
-    if (JSC::Exception* exception = scope.exception()) {
-        if (vm.isTerminationException(exception))
-            return;
-        // The arguments did not survive the trip: the goroutine fails with what went wrong.
-        (void)scope.tryClearException();
-        taskValue = nullptr;
-        MarkedArgumentBuffer failed;
-        failed.append(jsNumber(id));
-        failed.append(exception->value());
-        JSObject* exports = runtimeExports(globalObject);
-        RETURN_IF_EXCEPTION(scope, );
-        JSValue fail = exports->get(globalObject, Identifier::fromString(vm, "fail"_s));
-        RETURN_IF_EXCEPTION(scope, );
-        JSC::call(globalObject, fail, failed, "Bun.go"_s);
-        if (JSC::Exception* exception = scope.exception(); exception && !vm.isTerminationException(exception)) {
-            (void)scope.tryClearException();
-            Bun__reportUnhandledError(globalObject, JSValue::encode(exception->value()));
-        }
-        return;
-    }
-    MarkedArgumentBuffer args;
-    args.append(taskValue);
-    JSC::call(globalObject, run, args, "Bun.go"_s);
-    if (JSC::Exception* exception = scope.exception(); exception && !vm.isTerminationException(exception)) {
-        (void)scope.tryClearException();
-        Bun__reportUnhandledError(globalObject, JSValue::encode(exception->value()));
-    }
 }
 
 // Spawner thread: hand the outcome of goroutine `id` to internal/go/spawn.
@@ -402,12 +384,18 @@ ScriptExecutionContext& contextOf(JSGlobalObject* lexicalGlobalObject)
 
 } // namespace
 
+void poolThreadWillExit(ScriptExecutionContextIdentifier thread)
+{
+    scheduler().retire(thread);
+}
+
 void poolThreadDidExit(ScriptExecutionContextIdentifier thread)
 {
+    scheduler().retire(thread);
     poolWorkers().removeFirstMatching([&](auto& worker) {
         return worker->clientIdentifier() == thread;
     });
-    scheduler().threadDidExit(thread);
+    scheduler().dispatch();
 }
 
 // spawn(module, exportName, fromCommonJSExports, args): queue a goroutine; returns its id.
@@ -554,6 +542,13 @@ JSValue createGoRuntimeBinding(Zig::GlobalObject* globalObject)
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "take"_s), 0, Bun::Go::jsGoTake, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "settle"_s), 3, Bun::Go::jsGoSettle, ImplementationVisibility::Public, NoIntrinsic, 0);
     RELEASE_AND_RETURN(scope, binding);
+}
+
+extern "C" void Bun__Go__restartPool()
+{
+    auto workers = WTF::move(Bun::Go::poolWorkers());
+    for (auto& worker : workers)
+        worker->terminate();
 }
 
 // A pool thread's stand-in for an entry point. The thread's loop stays alive until it is asked to

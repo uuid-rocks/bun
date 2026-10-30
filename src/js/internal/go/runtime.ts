@@ -1,8 +1,7 @@
 // The loop of a Bun.go pool thread (BunGo.cpp): it stands in for the thread's entry point.
 //
 // One goroutine is taken per turn of the event loop. A goroutine runs until it first awaits; then
-// the thread takes the next. A thread that finds nothing to take is idle until BunGo.cpp hands it
-// a goroutine through `run`.
+// the thread takes the next. A thread that finds nothing to take is idle until BunGo.cpp wakes it.
 
 const { take, settle } = $cpp("BunGo.cpp", "createGoRuntimeBinding") as {
   take(): Task | Failed | undefined;
@@ -90,12 +89,11 @@ async function start(id: number, module: string, exportName: string, fromCommonJ
   }
 }
 
+// Also called by BunGo.cpp when this thread was idle and something is queued.
 function pull() {
   const task = take();
-  if (task !== undefined) run(task);
-}
-
-function run(task: Task | Failed) {
+  if (task === undefined) return;
+  // The next is taken on the next turn: the goroutines started meanwhile run until they await.
   setImmediate(pull);
   if (task.length === 2) {
     fail(task[0], task[1]);
@@ -107,6 +105,5 @@ function run(task: Task | Failed) {
 pull();
 
 export default {
-  run,
-  fail,
+  pull,
 };
