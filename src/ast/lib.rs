@@ -56,6 +56,9 @@ pub enum ImportKind {
     HtmlManifest = 10,
     #[strum(serialize = "internal")]
     Internal = 11,
+    /// The module of a function passed to `Bun.go()`: an entry point of its own
+    #[strum(serialize = "bun_go")]
+    BunGo = 12,
 }
 
 // E0015: EnumMap indexing isn't const; the lookup table is folded into match
@@ -96,6 +99,7 @@ impl ImportKind {
             ImportKind::Composes => b"composes",
             ImportKind::Internal => b"internal",
             ImportKind::HtmlManifest => b"html_manifest",
+            ImportKind::BunGo => b"bun-go",
         }
     }
 
@@ -114,6 +118,7 @@ impl ImportKind {
             ImportKind::Internal => b"<bun internal>",
             ImportKind::Composes => b"composes",
             ImportKind::HtmlManifest => b"HTML import",
+            ImportKind::BunGo => b"Bun.go()",
         }
     }
 

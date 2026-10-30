@@ -387,10 +387,18 @@ pub(crate) fn generate_chunks_in_parallel<'a, const IS_DEV_SERVER: bool>(
             // which would replace non-UTF-8 dir bytes with U+FFFD and corrupt
             // the output path.
             // Disk output sanitizes leading `..`; `--compile` keeps it so
-            // runtime bunfs references to out-of-root entrypoints resolve.
+            // runtime bunfs references to out-of-root entrypoints resolve. The
+            // `Bun.go()` entry points are named by a URL, which would drop the `..`.
+            let is_bun_go_entry_point = chunk.entry_point.is_entry_point()
+                && c.parse_graph()
+                    .bun_go_entry_points
+                    .contains(&chunk.entry_point.source_index());
             chunk
                 .template
-                .print(&mut rel_path, !c.options.compile_mode.is_executable())
+                .print(
+                    &mut rel_path,
+                    !c.options.compile_mode.is_executable() || is_bun_go_entry_point,
+                )
                 .expect("write to Vec<u8>");
             path::resolve_path::platform_to_posix_in_place::<u8>(&mut rel_path);
 

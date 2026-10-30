@@ -725,9 +725,10 @@ JSC_DEFINE_HOST_FUNCTION(jsGoKeepAlive, (JSGlobalObject * lexicalGlobalObject, C
     return JSValue::encode(jsUndefined());
 }
 
-// moduleOf(fn): [sourceURL, namespace | undefined] of the module whose source defines `fn`, or
-// undefined for a function with no source of its own (native, bound). The namespace is there for
+// moduleOf(fn): [sourceURL, namespace | undefined, bundled] of the module whose source defines `fn`,
+// or undefined for a function with no source of its own (native, bound). The namespace is there for
 // an ES module that has started evaluating; a CommonJS module is found in the require map.
+// `bundled`: the source is `bun build` output (it starts with the `// @bun` pragma).
 JSC_DEFINE_HOST_FUNCTION(jsGoModuleOf, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
     auto& vm = lexicalGlobalObject->vm();
@@ -747,9 +748,13 @@ JSC_DEFINE_HOST_FUNCTION(jsGoModuleOf, (JSGlobalObject * lexicalGlobalObject, Ca
             }
         }
     }
+    bool bundled = false;
+    if (auto* provider = function->jsExecutable()->source().provider())
+        bundled = provider->source().startsWith("// @bun"_s);
     MarkedArgumentBuffer values;
     values.append(jsString(vm, url));
     values.append(ns);
+    values.append(jsBoolean(bundled));
     RELEASE_AND_RETURN(scope, JSValue::encode(constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), values)));
 }
 

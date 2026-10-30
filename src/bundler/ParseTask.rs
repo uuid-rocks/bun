@@ -2640,6 +2640,10 @@ pub mod parse_worker {
         }
         opts.module_type = task.module_type;
         opts.is_entry_point = task.is_entry_point;
+        opts.bun_go_tasks = target.is_bun()
+            && output_format != options::Format::InternalBakeDev
+            && topts.framework.is_none()
+            && !task.source_index.is_runtime();
 
         task.jsx.parse = loader.is_jsx();
 

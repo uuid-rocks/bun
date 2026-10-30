@@ -154,8 +154,11 @@ declare module "bun" {
   /**
    * Runs the default export of a module on another thread, like {@link go} with a function. `module` is resolved
    * the way `new Worker(module)` resolves its entry point: a relative path against the current directory, so prefer
-   * `new URL("./task.ts", import.meta.url)`. In an executable built with `bun build --compile`, list the module as
-   * an entry point of the build.
+   * `new URL("./task.ts", import.meta.url)`. The fragment of a URL names another export:
+   * `new URL("./task.ts#countPrimes", import.meta.url)`.
+   *
+   * `bun build` finds `Bun.go(new URL("./task.ts", import.meta.url))` with a literal path, and `Bun.go(fn)` with an
+   * imported `fn`, and makes each module an entry point of the build. List any other module as an entry point.
    *
    * @category Concurrency
    */

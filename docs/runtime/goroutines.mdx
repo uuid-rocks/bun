@@ -108,6 +108,12 @@ const result = await Bun.go(new URL("./task.ts", import.meta.url), 1, 2);
 
 Bun resolves a module URL the way `new Worker()` resolves its entry point. It resolves a relative path against the current directory, so prefer `new URL("./task.ts", import.meta.url)`.
 
+The URL's fragment names another export. Then the calling thread doesn't import the module at all:
+
+```ts
+const count = await Bun.go(new URL("./primes.ts#countPrimes", import.meta.url), 0, 1e6);
+```
+
 ### Module state
 
 A module that a goroutine imports runs once on each pool thread. Its top-level variables belong to that thread, like thread-local storage. In a pool thread, `Bun.isMainThread` and `import.meta.main` are `false`.
@@ -245,8 +251,27 @@ A signal sent over a [channel](/runtime/channels) works the same way. A signal t
 
 - `bun test --isolate` gives each test file a new pool, so each file imports its goroutines' modules anew.
 - With `--hot`, a reload ends the pool's threads. Goroutines started after the reload import the modules as they are now. Goroutines that were still running reject with `ERR_GOROUTINE_THREAD_EXITED`.
-- In an executable built with `bun build --compile`, pass the module's URL to `Bun.go()` and list the module as an entry point of the build, as for a [Worker](/runtime/workers):
+- Bundles and executables built with `bun build` work as below.
+
+## Bundles and executables
+
+`bun build --target=bun` and `bun build --compile` find the modules that `Bun.go()` runs, and make each one an entry point of the build. The build finds:
+
+- an imported function: `Bun.go(countPrimes)`, a default import, or `Bun.go(primes.countPrimes)` after `import * as primes`
+- a URL with a literal path: `Bun.go(new URL("./task.ts", import.meta.url))`, with or without a fragment
+
+It writes the call with the URL of that entry point's output, and the export as the fragment:
+
+```js main.js
+Bun.go(new URL("./primes.js#countPrimes", import.meta.url), 0, 5e5);
+```
+
+So you can move the output and delete the sources. Each task module's output keeps its exports under their own names, with `--minify` too. An executable holds the task modules, so it runs from any directory.
+
+The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment. For a module named by a computed path, list the module as an entry point of the build, as for a [Worker](/runtime/workers):
 
 ```sh terminal icon="terminal"
-bun build --compile ./main.ts ./task.ts --outfile app
+bun build --compile ./main.ts ./tasks/*.ts --outfile app
 ```
+
+A function from a package that the build leaves external is passed as it is. The package's module is imported from `node_modules` at run time.

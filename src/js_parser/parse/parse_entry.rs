@@ -237,6 +237,10 @@ pub struct Options<'a> {
     /// A bundle entry point: its own output is needed, so a `module.exports = require(...)`-only file stays a real
     /// module rather than becoming a redirect to what it re-exports.
     pub is_entry_point: bool,
+
+    /// The bundle runs in Bun: each module that `Bun.go()` is given a function of, or the URL of,
+    /// becomes an entry point, and the call names that entry point's output.
+    pub bun_go_tasks: bool,
 }
 
 impl<'a> Default for Options<'a> {
@@ -272,6 +276,7 @@ impl<'a> Default for Options<'a> {
             repl_mode: false,
             lower_toml_datetimes: false,
             is_entry_point: false,
+            bun_go_tasks: false,
         }
     }
 }
@@ -362,6 +367,7 @@ impl<'a> Options<'a> {
             repl_mode: self.repl_mode,
             lower_toml_datetimes: self.lower_toml_datetimes,
             is_entry_point: self.is_entry_point,
+            bun_go_tasks: self.bun_go_tasks,
         }
     }
 
@@ -436,6 +442,7 @@ impl<'a> Options<'a> {
             repl_mode: false,
             lower_toml_datetimes: loader == options::Loader::Toml,
             is_entry_point: false,
+            bun_go_tasks: false,
         };
         opts.jsx.parse = loader.is_jsx();
         opts

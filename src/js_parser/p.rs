@@ -216,6 +216,106 @@ pub struct ReactRefreshImportClause<'a> {
     pub(crate) r#ref: Ref,
 }
 
+/// What `Bun.go(x, ...)` names when `x` is an imported binding or
+/// `new URL("./literal", import.meta.url)`. `cjs_source_path`: a CommonJS bundle inlines
+/// `import.meta.url` as this file's URL.
+fn bun_go_task<'a>(
+    call: bun_ast::StoreRef<E::Call>,
+    symbols: &[js_ast::Symbol],
+    cjs_source_path: Option<&[u8]>,
+    arena: &'a Bump,
+) -> Option<BunGoTask<'a>> {
+    let is_unbound_global = |target: &Expr, name: &[u8]| {
+        let Some(id) = target.data.e_identifier() else {
+            return false;
+        };
+        let symbol = &symbols[id.ref_.inner_index() as usize];
+        symbol.kind == js_ast::symbol::Kind::Unbound && symbol.original_name.slice() == name
+    };
+    let dot = call.target.data.e_dot()?;
+    if dot.name.slice() != b"go"
+        || dot.optional_chain.is_some()
+        || !is_unbound_global(&dot.target, b"Bun")
+    {
+        return None;
+    }
+    let first = call.args.slice().first().copied()?;
+    let task = match first.data {
+        js_ast::ExprData::EImportIdentifier(id) => BunGoTask::Import(id.ref_),
+        js_ast::ExprData::ENew(new) => {
+            let [href, base] = new.args.slice() else {
+                return None;
+            };
+            if !is_unbound_global(&new.target, b"URL") {
+                return None;
+            }
+            let base_is_import_meta_url = match base.data {
+                js_ast::ExprData::EDot(dot) => {
+                    dot.name.slice() == b"url"
+                        && matches!(dot.target.data, js_ast::ExprData::EImportMeta(_))
+                }
+                // A CommonJS bundle inlines `import.meta.url`.
+                js_ast::ExprData::EString(base) if base.is_utf8() => {
+                    cjs_source_path.is_some_and(|path| {
+                        let path = bun_core::StringView::from_bytes(path);
+                        base.slice8()
+                            == format!("{}", bun_url::file_url_from_string(&path)).as_bytes()
+                    })
+                }
+                _ => false,
+            };
+            let href_string = href.data.e_string()?;
+            if !base_is_import_meta_url || !href_string.is_utf8() {
+                return None;
+            }
+            let href_bytes = href_string.slice8();
+            let (path, fragment) = match strings::index_of_char_usize(href_bytes, b'#') {
+                Some(i) => (&href_bytes[..i], &href_bytes[i..]),
+                None => (href_bytes, &b""[..]),
+            };
+            // A path as the resolver reads it, relative to this file: no query, percent-escape or scheme.
+            if path.is_empty() || strings::index_of_any(path, b"%?:\\").is_some() {
+                return None;
+            }
+            let specifier: &'a [u8] =
+                if path.starts_with(b"./") || path.starts_with(b"../") || path.starts_with(b"/") {
+                    arena.alloc_slice_copy(path)
+                } else {
+                    let mut joined = bun_alloc::ArenaVec::with_capacity_in(path.len() + 2, arena);
+                    joined.extend_from_slice(b"./");
+                    joined.extend_from_slice(path);
+                    joined.into_bump_slice()
+                };
+            BunGoTask::Url {
+                specifier,
+                fragment: arena.alloc_slice_copy(fragment),
+                loc: href.loc,
+            }
+        }
+        _ => return None,
+    };
+    Some(task)
+}
+
+/// A `Bun.go()` call whose first argument names a module the bundle can make an entry point of.
+#[derive(Clone, Copy)]
+pub(crate) struct BunGoCall<'a> {
+    pub(crate) call: bun_ast::StoreRef<E::Call>,
+    pub(crate) task: BunGoTask<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BunGoTask<'a> {
+    /// An imported binding: the module and export come from its `named_imports` entry.
+    Import(Ref),
+    /// `new URL("<specifier><fragment>", import.meta.url)`
+    Url {
+        specifier: &'a [u8],
+        fragment: &'a [u8],
+        loc: bun_ast::Loc,
+    },
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ReactRefreshExportKind {
     Named,
@@ -311,6 +411,9 @@ pub struct P<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> {
     pub(crate) imports_to_convert_from_require: List<'a, DeferredImportNamespace>,
     pub(crate) imports_to_convert_from_dynamic_import: List<'a, DeferredImportNamespace>,
     pub(crate) dynamic_import_aliases: bun_ast::ast_result::DynamicImportAliases,
+    /// `Bun.go(fn)` / `Bun.go(new URL("./x", import.meta.url))` calls, made to name the entry
+    /// point of fn's module once `named_imports` is complete (`register_bun_go_tasks`).
+    pub(crate) bun_go_calls: Vec<BunGoCall<'a>>,
     /// User-declared locals holding an `import()` / `require()` namespace
     /// (`const ns = await import(...)`, `.then(ns => ...)`, `{...rest}`):
     /// `ns.foo` records the alias and the access is left as written.
@@ -1097,6 +1200,90 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     /// (`LinkerContext::match_imports_with_exports_for_file`). An exported local
     /// stays a local, or an importer of this file would bind through it and
     /// load the module eagerly. Runs after `ImportScanner` records exports.
+    /// Remembers `Bun.go(x, ...)` when `x` is an imported binding or
+    /// `new URL("./literal", import.meta.url)`. Called on the visited call.
+    pub(crate) fn note_bun_go_call(&mut self, call: bun_ast::StoreRef<E::Call>) {
+        let cjs_source_path = (self.options.output_format == crate::options::Format::Cjs)
+            .then_some(self.source.path.text);
+        if let Some(task) = bun_go_task(call, &self.symbols, cjs_source_path, self.arena) {
+            self.bun_go_calls.push(BunGoCall { call, task });
+        }
+    }
+
+    /// Points each call `note_bun_go_call` kept at its module's entry point: an
+    /// `ImportKind::BunGo` record that the bundler makes an entry point of, and a
+    /// `E::Special::BunGoTask` call in place of the first argument that the printer
+    /// prints as that entry point's URL.
+    fn register_bun_go_tasks(&mut self) {
+        for i in 0..self.bun_go_calls.len() {
+            let BunGoCall { mut call, task } = self.bun_go_calls[i];
+            let (specifier, fragment, range): (&'a [u8], &'a [u8], bun_ast::Range) = match task {
+                BunGoTask::Import(ref_) => {
+                    let Some(import) = self.named_imports.get(&ref_) else {
+                        continue;
+                    };
+                    if import.alias_is_star {
+                        continue;
+                    }
+                    let Some(alias) = import.alias else {
+                        continue;
+                    };
+                    let alias = alias.slice();
+                    let record = &self.import_records.items()[import.import_record_index as usize];
+                    if record.path.text.is_empty() {
+                        continue;
+                    }
+                    let fragment: &'a [u8] = if alias == b"default" {
+                        b""
+                    } else {
+                        let mut out =
+                            bun_alloc::ArenaVec::with_capacity_in(alias.len() + 1, self.arena);
+                        out.push(b'#');
+                        for &byte in alias {
+                            if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+                                out.push(byte);
+                            } else {
+                                out.extend_from_slice(&[
+                                    b'%',
+                                    b"0123456789ABCDEF"[(byte >> 4) as usize],
+                                    b"0123456789ABCDEF"[(byte & 15) as usize],
+                                ]);
+                            }
+                        }
+                        out.into_bump_slice()
+                    };
+                    let loc = call.args.slice()[0].loc;
+                    (record.path.text, fragment, bun_ast::Range { loc, len: 0 })
+                }
+                BunGoTask::Url {
+                    specifier,
+                    fragment,
+                    loc,
+                } => (specifier, fragment, self.source.range_of_string(loc)),
+            };
+            let import_record_index =
+                self.add_import_record_by_range(ImportKind::BunGo, range, specifier);
+            let original = call.args.slice()[0];
+            let fragment_expr = self.new_expr(E::String::init(fragment), original.loc);
+            let args = ExprNodeList::from_arena_slice(
+                self.arena.alloc_slice_copy(&[original, fragment_expr]),
+            );
+            call.args.slice_mut()[0] = self.new_expr(
+                E::Call {
+                    target: Expr {
+                        loc: original.loc,
+                        data: js_ast::ExprData::ESpecial(E::Special::BunGoTask(
+                            import_record_index,
+                        )),
+                    },
+                    args,
+                    ..Default::default()
+                },
+                original.loc,
+            );
+        }
+    }
+
     fn register_dynamic_import_items(&mut self) {
         if self.dynamic_import_aliases.count() == 0 {
             return;
@@ -9026,6 +9213,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         }
 
         self.register_dynamic_import_items();
+        self.register_bun_go_tasks();
 
         // A direct eval at module scope can assign every top-level variable and
         // reach every top-level name. Nested scopes are pinned in `pop_scope`;
@@ -9731,6 +9919,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             imports_to_convert_from_require: BumpVec::new_in(arena),
             imports_to_convert_from_dynamic_import: BumpVec::new_in(arena),
             dynamic_import_aliases: Default::default(),
+            bun_go_calls: Vec::new(),
             dynamic_import_namespace_locals: Default::default(),
             dynamic_import_escaped_records: Default::default(),
             dynamic_import_needs_object: Default::default(),
