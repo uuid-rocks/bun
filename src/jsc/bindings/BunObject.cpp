@@ -424,6 +424,16 @@ static JSValue constructBunShell(VM& vm, JSObject* bunObject) { return checkedBu
 static JSValue defaultBunSQLObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunSql); }
 static JSValue constructBunSQLObject(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunSQLConstructor); }
 
+static JSValue createBunGo(VM& vm, Zig::GlobalObject* globalObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue exports = BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalGoSpawn, "Bun.go", "go"_s);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, exports.getObject()->get(globalObject, Identifier::fromString(vm, "go"_s)));
+}
+
+static JSValue constructBunGo(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunGo); }
+
 static JSValue constructDNSObject(VM& vm, JSObject* bunObject)
 {
     JSGlobalObject* globalObject = bunObject->globalObject();
@@ -1040,6 +1050,7 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     fileURLToPath                                  functionFileURLToPath                                               DontDelete|Function 1
     gc                                             Bun::Bindgen::Generated::BunObject::jsGc                            DontDelete|Function 1
     generateHeapSnapshot                           functionGenerateHeapSnapshot                                        DontDelete|Function 2
+    go                                             constructBunGo                                                      DontDelete|PropertyCallback
     gunzipSync                                     Bun::Bindgen::Generated::BunObject::jsGunzipSync                    DontDelete|Function 1
     gzipSync                                       Bun::Bindgen::Generated::BunObject::jsGzipSync                      DontDelete|Function 1
     hash                                           Bun::Bindgen::Generated::HashObject::createHash                     DontDelete|PropertyCallback

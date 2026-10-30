@@ -14,6 +14,8 @@ struct WorkerOptions {
         Web,
         // Created by the `require("node:worker_threads").Worker` constructor
         Node,
+        // A thread of the Bun.go pool (BunGo.cpp): runs internal/go/runtime instead of an entry point
+        Goroutine,
     };
 
     String name;
