@@ -138,7 +138,9 @@ impl MutexCore {
             return None;
         }
         let waiter = waiter();
-        state.waiters.push_back((Arc::clone(&waiter), Instant::now()));
+        state
+            .waiters
+            .push_back((Arc::clone(&waiter), Instant::now()));
         Some(waiter)
     }
 

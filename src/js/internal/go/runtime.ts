@@ -191,21 +191,21 @@ async function start(task: Task) {
     fn,
     args,
     (ok, value) => {
-    if (!ok) {
-      fail(id, value, args);
-      return;
-    }
-    // Not awaited by an async function of this module: its frames stay out of the goroutine's.
-    Promise.$resolve(value).then(
-      value => {
-        try {
-          settle(id, 0, value);
-        } catch (error) {
-          fail(id, resultCloneError(error, value));
-        }
-      },
-      error => fail(id, error, args),
-    );
+      if (!ok) {
+        fail(id, value, args);
+        return;
+      }
+      // Not awaited by an async function of this module: its frames stay out of the goroutine's.
+      Promise.$resolve(value).then(
+        value => {
+          try {
+            settle(id, 0, value);
+          } catch (error) {
+            fail(id, resultCloneError(error, value));
+          }
+        },
+        error => fail(id, error, args),
+      );
     },
     id,
   );

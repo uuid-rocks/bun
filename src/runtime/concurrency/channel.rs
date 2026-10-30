@@ -26,9 +26,9 @@
 //! Values that share channels make a graph of channels; [`graph`](super::graph) reclaims the
 //! channels that only the queues of unreachable channels hold.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::mem::ManuallyDrop;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -161,7 +161,9 @@ impl State {
     }
 
     /// Empties a channel that is unreachable. Its values and entries, to drop once it is unlocked.
-    pub(super) fn take_all(&mut self) -> (VecDeque<ChannelMessage>, VecDeque<(Queued, ChannelMessage)>) {
+    pub(super) fn take_all(
+        &mut self,
+    ) -> (VecDeque<ChannelMessage>, VecDeque<(Queued, ChannelMessage)>) {
         self.edges = 0;
         self.receivers.clear();
         (
@@ -587,7 +589,9 @@ impl ChannelOp {
             (OpKind::Send | OpKind::Receive, WakeResult::Closed) => {
                 return promise.reject(global, Ok(closed_error(global)));
             }
-            (OpKind::Receive, WakeResult::Received(delivery)) => delivery.take().deserialize(global),
+            (OpKind::Receive, WakeResult::Received(delivery)) => {
+                delivery.take().deserialize(global)
+            }
             (OpKind::Next, WakeResult::Received(delivery)) => delivery
                 .take()
                 .deserialize(global)
@@ -797,7 +801,11 @@ impl ChannelCore {
             }
             state.closed = true;
             let senders = core::mem::take(&mut state.senders);
-            state.edges = state.buffer.iter().map(|m| u32::from(m.carries_channels())).sum();
+            state.edges = state
+                .buffer
+                .iter()
+                .map(|m| u32::from(m.carries_channels()))
+                .sum();
             (core::mem::take(&mut state.receivers), senders)
         };
         let mut waiting: Vec<Queued> = receivers

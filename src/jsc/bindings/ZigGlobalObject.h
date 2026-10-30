@@ -441,7 +441,7 @@ public:
     /* process.stdin/stdout/stderr are built over these lazily (BunProcess.cpp constructStd*). */            \
     V(private, WriteBarrier<JSObject>, m_nodeWorkerStdioPorts)                                               \
     V(private, LazyPropertyOfGlobalObject<Structure>, m_moduleGraphFrameStructure)                           \
-    /* A Bun.go pool thread's: the storage of the frame each goroutine runs in (BunGo.cpp). */             \
+    /* A Bun.go pool thread's: the storage of the frame each goroutine runs in (BunGo.cpp). */               \
     V(public, WriteBarrier<JSObject>, m_goroutineFrameStorage)                                               \
                                                                                                              \
     /* The original, unmodified Error.prepareStackTrace. */                                                  \

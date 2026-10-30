@@ -125,12 +125,17 @@ pub(super) fn collect() -> usize {
     let _one = COLLECTING.lock();
     let mut channels: Vec<Arc<ChannelCore>> = {
         let mut registry = REGISTRY.lock();
-        registry.channels.retain(|channel| channel.strong_count() > 0);
+        registry
+            .channels
+            .retain(|channel| channel.strong_count() > 0);
         registry.channels.iter().filter_map(Weak::upgrade).collect()
     };
     channels.sort_unstable_by_key(|channel| Arc::as_ptr(channel) as usize);
     channels.dedup_by(|a, b| Arc::ptr_eq(a, b));
-    let mut states: Vec<_> = channels.iter().map(|channel| channel.state.lock()).collect();
+    let mut states: Vec<_> = channels
+        .iter()
+        .map(|channel| channel.state.lock())
+        .collect();
     // Each count is read after every lock is held. A reference that is not an edge can only be
     // taken from another that is not, so once a count reads as all edges it stays that way.
     fence(Ordering::SeqCst);
