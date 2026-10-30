@@ -105,13 +105,27 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
-  test("a goroutine keeps its spawner alive until it settles, unless unref()'d", async () => {
+  test("a goroutine keeps its spawner alive until it settles", async () => {
     const { stdout, exitCode } = await run({
       "task.ts": `
         export async function slow() {
           await Bun.sleep(20);
           return "settled";
         }
+      `,
+      "main.ts": `
+        import { slow } from "./task.ts";
+        Bun.go(slow).then(console.log);
+        process.on("exit", code => console.log("exit", code));
+      `,
+    });
+    expect(stdout).toBe("settled\nexit 0");
+    expect(exitCode).toBe(0);
+  });
+
+  test("an unref()'d goroutine does not keep the process alive, even one that blocks its thread", async () => {
+    const { stdout, exitCode } = await run({
+      "task.ts": `
         export function block(sab: SharedArrayBuffer) {
           Atomics.wait(new Int32Array(sab), 0, 0);
         }
@@ -120,15 +134,13 @@ describe.concurrent("Bun.go", () => {
         }
       `,
       "main.ts": `
-        import { slow, block, park } from "./task.ts";
-        Bun.go(slow).then(console.log);
-        // Never settle: neither keeps the process alive.
+        import { block, park } from "./task.ts";
         Bun.go(block, new SharedArrayBuffer(4)).unref();
         Bun.go(park, new Bun.Channel()).unref().ref().unref();
         process.on("exit", code => console.log("exit", code));
       `,
     });
-    expect(stdout).toBe("settled\nexit 0");
+    expect(stdout).toBe("exit 0");
     expect(exitCode).toBe(0);
   });
 

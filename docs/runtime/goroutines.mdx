@@ -42,7 +42,7 @@ The four calls run at the same time on four threads.
 
 Goroutines run on a pool of threads that Bun starts as goroutines wait for one. The pool grows to as many threads as the machine has CPU cores, and at least 2. Set the `GOMAXPROCS` environment variable to choose another number (`UV_THREADPOOL_SIZE`, which also sizes Bun's other thread pools, takes precedence). The main thread is not part of the pool.
 
-A goroutine runs on one thread until it settles. When it awaits, its thread runs other goroutines, so thousands of goroutines can wait on I/O or on a [channel](/runtime/channels) at once. A goroutine that computes without awaiting keeps its thread busy, and goroutines started on that thread wait for it.
+A goroutine runs on one thread until it settles. When it awaits, its thread runs other goroutines, so thousands of goroutines can wait on I/O or on a [channel](/runtime/channels) at once. A goroutine that computes without awaiting, or blocks in `Atomics.wait()`, keeps its thread busy. The other goroutines on that thread wait until it returns or awaits.
 
 The pool never keeps the process alive. A goroutine keeps alive the thread that started it until it settles, unless you call `unref()` on it.
 
