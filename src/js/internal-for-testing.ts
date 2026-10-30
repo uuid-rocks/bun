@@ -96,6 +96,11 @@ export const channelQueueLengths = $bindgen("channel_testing.bind.ts", "queueLen
   channel: import("bun").Channel<any>,
 ) => { receivers: number; senders: number };
 
+/** How many values in channels' queues share a `Bun.Channel`. */
+export const channelIncoming = $bindgen("channel_testing.bind.ts", "incomingForTesting") as (
+  channel: import("bun").Channel<any>,
+) => number;
+
 /** How many `Bun.Channel`s exist, on every thread. */
 export const channelLiveCount = $bindgen("channel_testing.bind.ts", "liveCountForTesting") as () => number;
 

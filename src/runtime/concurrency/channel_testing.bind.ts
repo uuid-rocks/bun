@@ -21,3 +21,11 @@ export const sharingCountForTesting = b.fn({ returns: b.f64 });
 
 /** `bun:internal-for-testing`: how many channels one collection locks at most. */
 export const setCollectReachForTesting = b.fn({ args: { reach: b.f64 }, returns: b.undefined });
+
+/** `bun:internal-for-testing`: how many values in channels' queues share the channel. */
+export const incomingForTesting = b.fn({
+  args: { channel: b.any },
+  returns: b.f64,
+  capability: "js",
+  throws: true,
+});

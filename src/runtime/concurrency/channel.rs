@@ -83,6 +83,8 @@ impl ChannelCore {
 impl Drop for ChannelCore {
     fn drop(&mut self) {
         LIVE.fetch_sub(1, Ordering::Relaxed);
+        // Its values leave the queues before they drop with it.
+        self.state.get_mut().take_all();
     }
 }
 
@@ -1336,6 +1338,19 @@ pub(crate) extern "C" fn Channel__releaseStructuredClone(id: u64) {
     if let Some(core) = core {
         graph::release(core);
     }
+}
+
+/// `bun:internal-for-testing`: how many values in channels' queues share the channel.
+pub(crate) fn incoming_for_testing(cx: &mut JsScope<'_>, channel: JsLocal<'_>) -> JsResult<f64> {
+    let Some(channel) = channel.to_js().as_class_ref::<Channel>() else {
+        return Err(validators::throw_err_invalid_arg_type(
+            cx.global(),
+            "channel",
+            "Bun.Channel",
+            channel.to_js(),
+        ));
+    };
+    Ok(f64::from(channel.core.incoming.load(Ordering::Acquire)))
 }
 
 pub(crate) fn live_count_for_testing() -> f64 {

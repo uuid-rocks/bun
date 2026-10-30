@@ -843,6 +843,26 @@ describe.concurrent("Bun.Channel process", () => {
     expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   }, 60_000);
 
+  test("a channel freed with values still queued stops counting as holding the channels they share", async () => {
+    const result = await runReclaiming(`
+      const { channelIncoming } = await import("bun:internal-for-testing");
+      const shared = new Bun.Channel(1);
+      async function hold() {
+        const holder = new Bun.Channel(2);
+        await holder.send({ shared });
+        await holder.send({ again: shared });
+      }
+      await hold();
+      const held = channelIncoming(shared);
+      for (let i = 0; i < 100 && channelIncoming(shared) > 0; i++) {
+        Bun.gc(true);
+        await Bun.sleep(1);
+      }
+      console.log(held, channelIncoming(shared));
+    `);
+    expect(result).toEqual({ stdout: "2 0\n", stderr: "", exitCode: 0 });
+  });
+
   test("a large cycle that is still in use does not keep a later large cycle from being freed", async () => {
     const result = await runReclaiming(`
       setChannelCollectReach(256);
