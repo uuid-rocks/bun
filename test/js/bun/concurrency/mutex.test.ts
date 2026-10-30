@@ -226,6 +226,26 @@ describe("Bun.Mutex", () => {
     expect(await Bun.go((mu: Bun.Mutex) => mu.tryLock() === undefined, mu)).toBe(true);
   });
 
+  test("a lock() whose signal aborts while the lock is handed to it rejects, and the lock goes on", async () => {
+    const mu = new Bun.Mutex();
+    const controller = new AbortController();
+    const first = mu.tryLock()!;
+    const waiting = mu.lock({ signal: controller.signal });
+    // It waits long enough to be handed the lock once it loses to a lock() that barged in.
+    await Bun.sleep(5);
+    first.unlock();
+    const barged = mu.tryLock()!;
+    expect(barged).toBeDefined();
+    await Bun.sleep(5);
+    // Hands the lock to the waiter, then its signal aborts before the handoff arrives.
+    barged.unlock();
+    controller.abort(new Error("gave up"));
+    expect(await waiting.then(() => "locked", error => (error as Error).message)).toBe("gave up");
+    expect(mutexWaiters(mu)).toBe(0);
+    using free = mu.tryLock();
+    expect(free).toBeDefined();
+  });
+
   test("Bun.inspect() shows whether it is locked and how many wait, not its methods", async () => {
     const mutex = new Bun.Mutex();
     expect(Bun.inspect(mutex)).toBe("Mutex { locked: false, waiters: 0 }");

@@ -618,6 +618,17 @@ impl ChannelOp {
                 Ok(iterator_result(global, JSValue::UNDEFINED, true))
             }
             (OpKind::Lock, WakeResult::Acquired(handoff)) => {
+                // Its signal aborted while the lock was on its way, which it could not cancel.
+                let aborted = self
+                    .mutex
+                    .as_ref()
+                    .and_then(|(_, signal)| signal.as_ref())
+                    .filter(|signal| signal.aborted());
+                if let Some(signal) = aborted {
+                    // The lock goes on to the next waiter.
+                    drop(handoff);
+                    return promise.reject(global, Ok(signal.js_reason(global)));
+                }
                 handoff.keep();
                 Ok(JSValue::UNDEFINED)
             }
