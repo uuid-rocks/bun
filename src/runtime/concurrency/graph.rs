@@ -262,7 +262,7 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen) -> usize {
         }
     }
     let mut i = 0;
-    while i < reached.len() && reached.len() < REACH {
+    while i < reached.len() {
         let Some(channel) = reached[i].upgrade() else {
             i += 1;
             continue;
@@ -273,7 +273,9 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen) -> usize {
                 for &target in message.targets() {
                     // SAFETY: the message holds the core, and the lock holds the message.
                     let core = unsafe { &*target };
-                    if core.holds_channels.load(Ordering::Relaxed)
+                    // Past the limit, left for another batch to reach.
+                    if reached.len() < REACH
+                        && core.holds_channels.load(Ordering::Relaxed)
                         && seen.insert(target as usize, ()).is_none()
                     {
                         // SAFETY: as above: a live core of an `Arc`, which this does not drop.

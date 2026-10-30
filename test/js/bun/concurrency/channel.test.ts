@@ -671,7 +671,7 @@ describe.concurrent("Bun.Channel process", () => {
     // From a file: the goroutines of a \`bun -e\` script keep what they made until a full collection.
     using dir = tempDir("channel-reclaiming", {
       "main.js": `
-        import { channelLiveCount, collectChannels } from "bun:internal-for-testing";
+        import { channelLiveCount, channelValuesSharingChannels, collectChannels } from "bun:internal-for-testing";
         const base = channelLiveCount();
         // \`threads\`: the size of the goroutine pool (GOMAXPROCS), whose threads collect too.
         async function reclaimed(threads = 0) {
@@ -781,6 +781,19 @@ describe.concurrent("Bun.Channel process", () => {
     `,
       { GOMAXPROCS: "2", UV_THREADPOOL_SIZE: undefined },
     );
+    expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
+  });
+
+  test("values that share channels are freed once received", async () => {
+    const result = await runReclaiming(`
+      const before = channelValuesSharingChannels();
+      const ch = new Bun.Channel(1);
+      for (let i = 0; i < 100; i++) {
+        await ch.send({ inner: new Bun.Channel() });
+        await ch.receive();
+      }
+      console.log(channelValuesSharingChannels() - before);
+    `);
     expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   });
 

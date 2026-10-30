@@ -1282,6 +1282,10 @@ pub(crate) fn live_count_for_testing() -> f64 {
     f64::from(LIVE.load(Ordering::Relaxed))
 }
 
+pub(crate) fn sharing_count_for_testing() -> f64 {
+    message::sharing_count_for_testing()
+}
+
 pub(crate) fn collect_for_testing() -> f64 {
     graph::collect_all() as f64
 }

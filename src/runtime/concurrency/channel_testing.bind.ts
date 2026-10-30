@@ -15,3 +15,6 @@ export const liveCountForTesting = b.fn({ returns: b.f64 });
 
 /** `bun:internal-for-testing`: reclaims the channels that only unreachable channels hold, now, on this thread; how many. */
 export const collectForTesting = b.fn({ returns: b.f64 });
+
+/** `bun:internal-for-testing`: how many channel values that share a channel exist, on every thread. */
+export const sharingCountForTesting = b.fn({ returns: b.f64 });

@@ -1,6 +1,8 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use bun_collections::smallvec::SmallVec;
 
 use super::channel::ChannelCore;
@@ -70,7 +72,34 @@ pub(crate) struct ChannelMessage {
     message: NonNull<c_void>,
     /// The cores of the `Bun.Channel`s it shares, which its clone holds while it exists. In a
     /// channel's queue, its edges in the channel graph ([`graph`](super::graph)).
-    targets: Box<[*const ChannelCore]>,
+    targets: Targets,
+}
+
+/// How many messages that share channels exist, for `bun:internal-for-testing`.
+static SHARING: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct Targets(Box<[*const ChannelCore]>);
+
+impl Targets {
+    fn new(targets: Box<[*const ChannelCore]>) -> Self {
+        if !targets.is_empty() {
+            SHARING.fetch_add(1, Ordering::Relaxed);
+        }
+        Self(targets)
+    }
+}
+
+impl Drop for Targets {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            SHARING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn sharing_count_for_testing() -> f64 {
+    SHARING.load(Ordering::Relaxed) as f64
 }
 
 // SAFETY: the message holds no VM or JS state. Its bytes are its own; the buffers it moved or
@@ -98,25 +127,26 @@ impl ChannelMessage {
         })?;
         let message = NonNull::new(message).expect("a message, or an exception");
         let ids = channel_ids(message);
-        let targets = if ids.is_empty() {
+        let targets = Targets::new(if ids.is_empty() {
             Box::default()
         } else {
             super::channel::cores_of(&ids)
-        };
+        });
         Ok(Self { message, targets })
     }
 
     pub(super) fn carries_channels(&self) -> bool {
-        !self.targets.is_empty()
+        !self.targets.0.is_empty()
     }
 
     /// The cores of the channels it shares, alive while it is.
     pub(super) fn targets(&self) -> &[*const ChannelCore] {
-        &self.targets
+        &self.targets.0
     }
 
     /// The value, in `global`'s realm. Throws if the value cannot be made there.
-    pub(crate) fn deserialize(self, global: &JSGlobalObject) -> JsResult<JSValue> {
+    pub(crate) fn deserialize(mut self, global: &JSGlobalObject) -> JsResult<JSValue> {
+        drop(core::mem::take(&mut self.targets));
         let message = core::mem::ManuallyDrop::new(self).message;
         // SAFETY: `message` is ours; `deserialize` consumes it.
         bun_jsc::host_fn::from_js_host_call(global, || unsafe {
