@@ -6232,9 +6232,14 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     pub(crate) fn value_for_import_meta_main(&mut self, inverted: bool, loc: bun_ast::Loc) -> Expr {
         // A `Bun.go` pool thread imports an entry point that exports a goroutine's function, and
         // `import.meta.main` is `false` there.
-        let pool_may_import =
-            self.options.bun_go_tasks && self.options.is_entry_point && self.esm_export_keyword.len > 0;
-        if let Some(known) = self.options.import_meta_main_value.filter(|_| !pool_may_import) {
+        let pool_may_import = self.options.bun_go_tasks
+            && self.options.is_entry_point
+            && self.esm_export_keyword.len > 0;
+        if let Some(known) = self
+            .options
+            .import_meta_main_value
+            .filter(|_| !pool_may_import)
+        {
             return Expr {
                 loc,
                 data: js_ast::ExprData::EBoolean(E::Boolean {
