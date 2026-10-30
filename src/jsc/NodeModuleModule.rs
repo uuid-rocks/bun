@@ -197,6 +197,14 @@ fn on_require_extension_modify_non_function(
     Ok(())
 }
 
+/// `Module._extensions` is an object of one global object, and the table is what the loader reads of it.
+/// `bun test --isolate` calls this when that global object is retired, so the next one starts with none registered.
+pub(crate) fn reset_require_extensions(vm: &mut VirtualMachine) {
+    vm.commonjs_custom_extensions.clear_and_free();
+    vm.has_mutated_built_in_extensions = 0;
+    vm.transpiler.resolver.opts.extra_cjs_extensions = Box::default();
+}
+
 pub fn find_longest_registered_extension<'a>(
     vm: &'a VirtualMachine,
     filename: &[u8],
@@ -214,6 +222,31 @@ pub fn find_longest_registered_extension<'a>(
         }
     }
     None
+}
+
+/// Whether `Bun__transpileFile` can answer `require(specifier)` from the table, so that nothing else may answer it
+/// first. `true` can be for an entry that `Bun__transpileFile` does not pick; `false` never is.
+#[unsafe(no_mangle)]
+extern "C" fn NodeModuleModule__requireExtensionsSelect(
+    vm: &VirtualMachine,
+    specifier: &BunString,
+) -> bool {
+    !vm.commonjs_custom_extensions.is_empty() && registered_extension_matches(vm, specifier)
+}
+
+/// `Bun__transpileFile` matches the specifier as given when a built-in extension is registered, and the path
+/// without its `?query` otherwise. Either match counts.
+#[cold]
+fn registered_extension_matches(vm: &VirtualMachine, specifier: &BunString) -> bool {
+    let specifier = specifier.to_utf8();
+    let specifier = specifier.slice();
+    if find_longest_registered_extension(vm, specifier).is_some() {
+        return true;
+    }
+    match strings::index_of_char_usize(specifier, b'?') {
+        Some(query) => find_longest_registered_extension(vm, &specifier[..query]).is_some(),
+        None => false,
+    }
 }
 
 #[unsafe(no_mangle)]
