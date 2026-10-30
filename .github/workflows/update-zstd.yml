@@ -11,7 +11,7 @@ on:
 jobs:
   check-update:
     if: github.repository == 'oven-sh/bun'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     permissions:
       contents: write
       pull-requests: write

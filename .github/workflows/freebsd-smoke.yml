@@ -19,7 +19,7 @@ on:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     name: FreeBSD ${{ matrix.version }} smoke
     strategy:
       fail-fast: false

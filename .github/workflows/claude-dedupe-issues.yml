@@ -14,7 +14,8 @@ on:
 
 jobs:
   claude-dedupe-issues:
-    runs-on: ubuntu-latest
+    if: github.repository == 'oven-sh/bun'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     concurrency:
       group: claude-dedupe-issues-${{ github.event.issue.number || inputs.issue_number }}

@@ -53,7 +53,7 @@ jobs:
     if: >
       github.repository == 'oven-sh/bun' &&
       (github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true)
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
       issues: write

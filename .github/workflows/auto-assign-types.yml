@@ -9,8 +9,8 @@ on:
 
 jobs:
   auto-assign:
-    runs-on: ubuntu-latest
-    if: github.event.label.name == 'types'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    if: github.repository == 'oven-sh/bun' && github.event.label.name == 'types'
     permissions:
       issues: write
     steps:

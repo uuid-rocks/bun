@@ -16,8 +16,8 @@ permissions: {}
 
 jobs:
   cancel:
-    if: github.event.pull_request.merged == false
-    runs-on: ubuntu-latest
+    if: github.repository == 'oven-sh/bun' && github.event.pull_request.merged == false
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Cancel running/scheduled BuildKite builds for this branch
         env:
