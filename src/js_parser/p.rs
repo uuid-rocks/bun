@@ -308,6 +308,21 @@ fn bun_go_task<'a>(
     Some((callee, task))
 }
 
+/// `Some(None)` for `new Bun.WaitGroup()`, `Some(Some(X))` for `new X()` of an imported `X`.
+fn wait_group_constructor(symbols: &[js_ast::Symbol], value: Expr) -> Option<Option<Ref>> {
+    let new = value.data.e_new()?;
+    match new.target.data {
+        js_ast::ExprData::EDot(dot) if dot.name.slice() == b"WaitGroup" => {
+            let id = dot.target.data.e_identifier()?;
+            let symbol = &symbols[id.ref_.inner_index() as usize];
+            (symbol.kind == js_ast::symbol::Kind::Unbound && symbol.original_name.slice() == b"Bun")
+                .then_some(None)
+        }
+        js_ast::ExprData::EImportIdentifier(id) => Some(Some(id.ref_)),
+        _ => None,
+    }
+}
+
 /// A `.go()` call whose first argument names a module the bundle can make an entry point of.
 #[derive(Clone, Copy)]
 pub(crate) struct BunGoCall<'a> {
@@ -1282,7 +1297,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
         let state = match self.bun_go_bindings.get(&binding) {
             // Initialized again (`var`)
             Some(_) => BunGoBinding::Other,
-            None => match Self::wait_group_constructor(&self.symbols, value) {
+            None => match wait_group_constructor(&self.symbols, value) {
                 Some(constructor) => BunGoBinding::WaitGroup(constructor),
                 None => BunGoBinding::Other,
             },
@@ -1294,22 +1309,6 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     pub(crate) fn note_bun_go_assigned(&mut self, binding: Ref) {
         let binding = js_ast::symbol::follow_symbols(&self.symbols, binding);
         self.bun_go_bindings.insert(binding, BunGoBinding::Other);
-    }
-
-    /// `Some(None)` for `new Bun.WaitGroup()`, `Some(Some(X))` for `new X()` of an imported `X`.
-    fn wait_group_constructor(symbols: &[js_ast::Symbol], value: Expr) -> Option<Option<Ref>> {
-        let new = value.data.e_new()?;
-        match new.target.data {
-            js_ast::ExprData::EDot(dot) if dot.name.slice() == b"WaitGroup" => {
-                let id = dot.target.data.e_identifier()?;
-                let symbol = &symbols[id.ref_.inner_index() as usize];
-                (symbol.kind == js_ast::symbol::Kind::Unbound
-                    && symbol.original_name.slice() == b"Bun")
-                    .then_some(None)
-            }
-            js_ast::ExprData::EImportIdentifier(id) => Some(Some(id.ref_)),
-            _ => None,
-        }
     }
 
     /// Points each call `note_bun_go_call` kept at its module's entry point: an
