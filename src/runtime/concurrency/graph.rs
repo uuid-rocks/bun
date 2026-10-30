@@ -296,7 +296,7 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen) -> usize {
 /// Reclaims the channels of `channels` that no root reaches. Returns how many. No channel locked.
 fn collect(mut channels: Vec<Arc<ChannelCore>>) -> usize {
     channels.sort_unstable_by_key(|channel| Arc::as_ptr(channel) as usize);
-    let mut states: Vec<_> = channels
+    let states: Vec<_> = channels
         .iter()
         .map(|channel| channel.state.lock())
         .collect();
@@ -342,8 +342,9 @@ fn collect(mut channels: Vec<Arc<ChannelCore>>) -> usize {
         }
     }
 
+    // Each channel is unlocked once it is done with: what to reclaim is decided.
     let mut unreachable = Vec::new();
-    for (i, state) in states.iter_mut().enumerate() {
+    for (i, mut state) in states.into_iter().enumerate() {
         if !reachable[i] {
             unreachable.push(state.take_all());
         }
@@ -352,7 +353,6 @@ fn collect(mut channels: Vec<Arc<ChannelCore>>) -> usize {
         }
     }
     let reclaimed = unreachable.len();
-    drop(states);
     // The values, which drop the channels they share, outside the locks.
     dropping(move || {
         drop(unreachable);
