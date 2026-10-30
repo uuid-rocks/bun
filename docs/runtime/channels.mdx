@@ -1,6 +1,6 @@
 ---
 title: Channels
-description: Send values between threads with Bun.Channel
+description: Send values between threads with Bun.Channel and Bun.select
 ---
 
 `Bun.Channel` passes values between threads, in the order they were sent, the way Go's channels do. One thread sends, another receives, and either one waits until the other is ready.
@@ -137,6 +137,85 @@ A value that a receiver took before the signal aborted stays sent and is receive
 
 ---
 
+## Waiting on several channels with `select`
+
+`Bun.select()` waits until one of several channel operations can happen, then does exactly that one, the way Go's `select` does. Each case is a channel to receive from, or `[channel, value]` to send `value` on it.
+
+```ts
+const jobs = new Bun.Channel<string>();
+const quit = new Bun.Channel<void>();
+
+while (true) {
+  const result = await Bun.select([jobs, quit]);
+  if (result.index === 1) break;
+  console.log("job:", result.value);
+}
+```
+
+The result says which case happened, by its index in the list:
+
+| Case               | Result                                                                                              |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| receive            | `{ index, value, closed: false }`                                                                   |
+| receive, closed    | `{ index, value: undefined, closed: true }`, once the channel is closed and every value is received |
+| send               | `{ index, value: undefined, closed: false }`                                                        |
+| send, closed       | rejects with `ERR_CHANNEL_CLOSED`                                                                   |
+| nothing, `default` | `{ index: -1, value: undefined, closed: false }`                                                    |
+
+Only the case that happens takes a value or sends one. The others do nothing. When several cases are ready, `select()` picks one at random, so a busy channel does not starve the others.
+
+```ts
+const results = new Bun.Channel<number>(16);
+const errors = new Bun.Channel<Error>(16);
+
+// Send to whichever channel has room first.
+await Bun.select([
+  [results, 42],
+  [errors, new Error("no room")],
+]);
+```
+
+In TypeScript the result is typed by the index of its case, so checking `index` narrows `value`:
+
+```ts
+const numbers = new Bun.Channel<number>();
+const strings = new Bun.Channel<string>();
+
+const result = await Bun.select([numbers, strings]);
+if (result.index === 0 && !result.closed) {
+  result.value; // number
+}
+```
+
+### Not waiting
+
+With `default: true`, `select()` resolves at once with `index: -1` if no case is ready.
+
+```ts
+const result = await Bun.select([jobs], { default: true });
+if (result.index === -1) console.log("no job yet");
+```
+
+### Timeouts and cancelling
+
+Pass a `signal` to stop waiting. The promise rejects with the signal's reason, and no case happens. `AbortSignal.timeout()` is a timeout:
+
+```ts
+try {
+  await Bun.select([jobs, quit], { signal: AbortSignal.timeout(1000) });
+} catch (error) {
+  console.log(error.name); // => "TimeoutError"
+}
+```
+
+A case that happened before the signal aborted stays done.
+
+### Send values
+
+Every send value is cloned when `select()` is called, also for the cases that lose. A getter on the value runs, and a value that cannot be cloned rejects with a `DataCloneError` even if its case would not have been picked. Send cases take no `transfer` list, so a losing case never detaches an `ArrayBuffer`.
+
+---
+
 ## What a channel sends
 
 Every value is a [structured clone](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm), made the way `postMessage()` makes one. This is true on one thread too, so a receiver never shares an object with its sender.
@@ -161,4 +240,4 @@ A channel that holds a value containing a handle to itself is freed only once th
 
 ## The event loop
 
-A waiting `send()` or `receive()` does not keep the process alive. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel.
+A waiting `send()`, `receive()` or `select()` does not keep the process alive. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel.

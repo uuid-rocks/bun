@@ -381,6 +381,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "bun_string_jsc.bind.ts": null,
   "cares_jsc.bind.ts": null,
   "channel.bind.ts": "typeof Bun",
+  "channel_testing.bind.ts": null,
   "checker_queries_testing.bind.ts": null,
   "code_resolver_testing.bind.ts": null,
   "color_js.bind.ts": "typeof Bun",
@@ -447,6 +448,7 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "resolver_jsc.bind.ts": null,
   "response.bind.ts":
     '{ Request: Class<Omit<Request, "keepalive" | "duplex">>; Response: typeof Response & { prototype: Response } }',
+  "select.bind.ts": "typeof Bun",
   "server.bind.ts": "{ ServerWebSocket: Class<Required<Bun.ServerWebSocket>> }",
   "server_body.bind.ts": null,
   "shell_body.bind.ts": null,

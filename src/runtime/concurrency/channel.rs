@@ -13,11 +13,17 @@
 //! a value or closing the channel ([`Waiter::fire`]), or its own VM giving up on it — its signal
 //! aborted, its context stopped ([`Waiter::cancel`]). The winner on another thread posts the
 //! outcome to the waiter's VM ([`ChannelWake`]). A waiting operation does not keep its VM alive.
+//!
+//! A [`select`](super::select) queues one waiter in the channels of all its cases, each entry
+//! ([`Queued`]) with the index of its case. The entries of a waiter that fired or was cancelled
+//! stay queued until its VM takes them out ([`ChannelCore::forget`]); until then whoever reaches
+//! one fails to fire it and drops it.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
+use bun_collections::smallvec::SmallVec;
 use bun_event_loop::{
     ConcurrentTask::ConcurrentTask, ContextId, Task, TaskTag, Taskable, task_tag,
 };
@@ -34,19 +40,105 @@ use super::ops::OpTable;
 use crate::node::util::validators;
 
 pub(crate) struct ChannelCore {
-    capacity: u32,
-    state: Guarded<State>,
+    pub(super) capacity: u32,
+    pub(super) state: Guarded<State>,
 }
 
+/// Of the entries whose waiter can still fire, and but for a select that waits both to send and
+/// to receive on one unbuffered channel: no receiver waits while anything is buffered or a sender
+/// waits.
 #[derive(Default)]
-struct State {
-    /// At most `capacity` values. Empty while a receiver waits.
+pub(super) struct State {
+    /// At most `capacity` values.
     buffer: VecDeque<ChannelMessage>,
-    /// Waiting receivers, oldest first. Empty while anything is buffered or a sender waits.
-    receivers: VecDeque<Arc<Waiter>>,
-    /// Waiting senders and their values, oldest first. Empty while a receiver waits.
-    senders: VecDeque<(Arc<Waiter>, ChannelMessage)>,
+    /// Waiting receivers, oldest first.
+    pub(super) receivers: VecDeque<Queued>,
+    /// Waiting senders and their values, oldest first.
+    pub(super) senders: VecDeque<(Queued, ChannelMessage)>,
     closed: bool,
+}
+
+/// A waiter in a channel's queue, for one case of its operation: `0` but in a select.
+pub(super) struct Queued {
+    pub(super) waiter: Arc<Waiter>,
+    pub(super) case: u32,
+}
+
+impl Queued {
+    fn fire(&self) -> bool {
+        self.waiter.fire()
+    }
+
+    /// Posts the result of a waiter this thread fired to its VM. Nothing locked.
+    pub(super) fn wake(self, result: WakeResult) {
+        self.waiter.wake(self.case, result);
+    }
+}
+
+/// A send that happened at once.
+pub(super) enum SendNow {
+    /// Nothing was sent: drop the value once the channel is unlocked.
+    Closed(ChannelMessage),
+    /// To this receiver, which fired: wake it with the value once the channel is unlocked.
+    Handed(Queued, ChannelMessage),
+    Buffered,
+}
+
+/// A receive that happened at once.
+pub(super) enum ReceiveNow {
+    /// And the sender, fired, that it came from or that refilled the buffer: wake it once the
+    /// channel is unlocked.
+    Value(ChannelMessage, Option<Queued>),
+    /// Closed and drained.
+    Closed,
+}
+
+impl State {
+    /// `Err`: the send would wait. The value back.
+    pub(super) fn try_send(
+        &mut self,
+        capacity: u32,
+        message: ChannelMessage,
+    ) -> Result<SendNow, ChannelMessage> {
+        if self.closed {
+            return Ok(SendNow::Closed(message));
+        }
+        while let Some(receiver) = self.receivers.pop_front() {
+            if receiver.fire() {
+                return Ok(SendNow::Handed(receiver, message));
+            }
+        }
+        if self.buffer.len() < capacity as usize {
+            self.buffer.push_back(message);
+            return Ok(SendNow::Buffered);
+        }
+        Err(message)
+    }
+
+    /// `None`: the receive would wait.
+    pub(super) fn try_receive(&mut self) -> Option<ReceiveNow> {
+        if let Some(message) = self.buffer.pop_front() {
+            let sender = self.pop_sender().map(|(sender, refill)| {
+                self.buffer.push_back(refill);
+                sender
+            });
+            return Some(ReceiveNow::Value(message, sender));
+        }
+        if let Some((sender, message)) = self.pop_sender() {
+            return Some(ReceiveNow::Value(message, Some(sender)));
+        }
+        self.closed.then_some(ReceiveNow::Closed)
+    }
+
+    /// The oldest sender still waiting, fired.
+    fn pop_sender(&mut self) -> Option<(Queued, ChannelMessage)> {
+        while let Some((sender, message)) = self.senders.pop_front() {
+            if sender.fire() {
+                return Some((sender, message));
+            }
+        }
+        None
+    }
 }
 
 /// One waiting operation, as the channel's queue holds it.
@@ -77,9 +169,10 @@ impl Waiter {
     }
 
     /// Posts the result of a waiter this thread [fired](Self::fire) to its VM. Nothing locked.
-    fn wake(&self, result: WakeResult) {
+    fn wake(&self, case: u32, result: WakeResult) {
         let wake = bun_core::heap::into_raw(Box::new(ChannelWake {
             op_id: self.op_id,
+            case,
             result,
         }));
         let task = ConcurrentTask::create(Task::init(wake));
@@ -94,7 +187,7 @@ impl Waiter {
     }
 }
 
-enum WakeResult {
+pub(super) enum WakeResult {
     Received(ChannelMessage),
     Sent,
     Closed,
@@ -103,6 +196,7 @@ enum WakeResult {
 /// The outcome of a waiting operation, on its way to the operation's VM.
 pub(crate) struct ChannelWake {
     op_id: u64,
+    case: u32,
     result: WakeResult,
 }
 
@@ -123,19 +217,23 @@ impl ChannelWake {
         // SAFETY: the dispatch hands over the boxed wake.
         let wake = unsafe { bun_core::heap::take(this) };
         match ops().remove(wake.op_id) {
-            Some(mut op) => op.settle(global, wake.result),
+            Some(mut op) => op.settle(global, wake.case, wake.result),
             None => Ok(()),
         }
     }
 }
 
-#[derive(Clone, Copy)]
-enum OpKind {
+pub(super) enum OpKind {
     Send,
     Receive,
     /// A receive for an async iterator: `{ value, done }`, and the end is `done: true`.
     Next,
+    /// `Bun.select`: `{ index, value, closed }`. Which cases send.
+    Select(Box<[bool]>),
 }
+
+/// The channels a waiter is queued in, each once.
+pub(super) type Channels = SmallVec<[Arc<ChannelCore>; 2]>;
 
 /// A waiting operation, as its VM holds it: in [`ops`] by its waiter's `op_id`.
 pub(crate) struct ChannelOp {
@@ -144,23 +242,21 @@ pub(crate) struct ChannelOp {
     kind: OpKind,
     promise: JSPromiseStrong,
     waiter: Arc<Waiter>,
-    channel: Arc<ChannelCore>,
+    channels: Channels,
 }
 
 bun_jsc::impl_abort_handle_owner!(ChannelOp, abort_handle, |this, cause| {
     // SAFETY: trait contract — `this` is live, in the table.
-    let (id, waiter) = unsafe { ((*this).id, &(*this).waiter) };
-    let won = waiter.cancel();
-    if won {
-        // SAFETY: as above.
-        unsafe { (*this).channel.forget(waiter) };
-    } else if matches!(cause, AbortCause::Signal(_)) {
+    let id = unsafe { (*this).id };
+    // SAFETY: as above.
+    if !unsafe { (*this).waiter.cancel() } && matches!(cause, AbortCause::Signal(_)) {
         // The outcome is on its way and settles it.
         return;
     }
     let op = ops()
         .remove(id)
         .expect("an operation is in the table until it settles");
+    op.forget();
     if let AbortCause::Signal(reason) = cause {
         let global = VirtualMachine::get().global();
         let mut promise = op.promise;
@@ -169,11 +265,44 @@ bun_jsc::impl_abort_handle_owner!(ChannelOp, abort_handle, |this, cause| {
 });
 
 impl ChannelOp {
-    fn settle(&mut self, global: &JSGlobalObject, result: WakeResult) -> JsResult<()> {
+    /// Takes the waiter out of the channels that still queue it.
+    fn forget(&self) {
+        for channel in &self.channels {
+            channel.forget(&self.waiter);
+        }
+    }
+
+    fn settle(&mut self, global: &JSGlobalObject, case: u32, result: WakeResult) -> JsResult<()> {
         // Out of the table, so out of reach of a context stop that settling runs (a `then` getter).
         self.abort_handle.disarm();
+        if let OpKind::Select(sends) = &self.kind {
+            // The cases that lost.
+            self.forget();
+            let promise = &mut self.promise;
+            let value = match result {
+                WakeResult::Received(message) => message
+                    .deserialize(global)
+                    .map(|value| select_result(global, i64::from(case), value, false)),
+                WakeResult::Sent => Ok(select_result(
+                    global,
+                    i64::from(case),
+                    JSValue::UNDEFINED,
+                    false,
+                )),
+                WakeResult::Closed if sends[case as usize] => {
+                    return promise.reject(global, Ok(closed_error(global)));
+                }
+                WakeResult::Closed => Ok(select_result(
+                    global,
+                    i64::from(case),
+                    JSValue::UNDEFINED,
+                    true,
+                )),
+            };
+            return promise.settle(global, value);
+        }
         let promise = &mut self.promise;
-        let value = match (self.kind, result) {
+        let value = match (&self.kind, result) {
             (OpKind::Send, WakeResult::Sent) => Ok(JSValue::UNDEFINED),
             (OpKind::Send | OpKind::Receive, WakeResult::Closed) => {
                 return promise.reject(global, Ok(closed_error(global)));
@@ -189,13 +318,14 @@ impl ChannelOp {
             | (OpKind::Receive | OpKind::Next, WakeResult::Sent) => {
                 unreachable!("a sender is only sent to, a receiver only received from")
             }
+            (OpKind::Select(_), _) => unreachable!("settled above"),
         };
         promise.settle(global, value)
     }
 }
 
 /// This VM's waiting channel operations.
-fn ops() -> &'static mut OpTable<ChannelOp> {
+pub(super) fn ops() -> &'static mut OpTable<ChannelOp> {
     let state = crate::jsc_hooks::runtime_state();
     debug_assert!(!state.is_null());
     // SAFETY: the live per-thread `RuntimeState`; JS thread. Every use is one statement, and
@@ -203,7 +333,7 @@ fn ops() -> &'static mut OpTable<ChannelOp> {
     unsafe { &mut (*state).channel_ops }
 }
 
-fn closed_error(global: &JSGlobalObject) -> JSValue {
+pub(super) fn closed_error(global: &JSGlobalObject) -> JSValue {
     global
         .err(ErrorCode::CHANNEL_CLOSED, format_args!("Channel is closed"))
         .to_js()
@@ -216,6 +346,20 @@ fn iterator_result(global: &JSGlobalObject, value: JSValue, done: bool) -> JSVal
     result
 }
 
+/// What `Bun.select` resolves to. `index` is `-1` for `default`.
+pub(super) fn select_result(
+    global: &JSGlobalObject,
+    index: i64,
+    value: JSValue,
+    closed: bool,
+) -> JSValue {
+    let result = JSValue::create_empty_object(global, 3);
+    result.put(global, "index", JSValue::js_number(index as f64));
+    result.put(global, "value", value);
+    result.put(global, "closed", JSValue::js_boolean(closed));
+    result
+}
+
 enum SendStep {
     Done,
     Closed,
@@ -225,23 +369,28 @@ enum SendStep {
 impl ChannelCore {
     fn send(&self, waiter: impl FnOnce() -> Arc<Waiter>, message: ChannelMessage) -> SendStep {
         let mut state = self.state.lock();
-        if state.closed {
-            drop(state);
-            return SendStep::Closed;
-        }
-        while let Some(receiver) = state.receivers.pop_front() {
-            if receiver.fire() {
+        let message = match state.try_send(self.capacity, message) {
+            Ok(sent) => {
                 drop(state);
-                receiver.wake(WakeResult::Received(message));
-                return SendStep::Done;
+                return match sent {
+                    SendNow::Closed(_) => SendStep::Closed,
+                    SendNow::Handed(receiver, message) => {
+                        receiver.wake(WakeResult::Received(message));
+                        SendStep::Done
+                    }
+                    SendNow::Buffered => SendStep::Done,
+                };
             }
-        }
-        if state.buffer.len() < self.capacity as usize {
-            state.buffer.push_back(message);
-            return SendStep::Done;
-        }
+            Err(message) => message,
+        };
         let waiter = waiter();
-        state.senders.push_back((Arc::clone(&waiter), message));
+        state.senders.push_back((
+            Queued {
+                waiter: Arc::clone(&waiter),
+                case: 0,
+            },
+            message,
+        ));
         SendStep::Wait(waiter)
     }
 
@@ -251,38 +400,24 @@ impl ChannelCore {
         waiter: impl FnOnce() -> Arc<Waiter>,
     ) -> Result<Option<ChannelMessage>, Arc<Waiter>> {
         let mut state = self.state.lock();
-        let mut sender = None;
-        let message = if let Some(message) = state.buffer.pop_front() {
-            if let Some((waiter, refill)) = Self::pop_sender(&mut state) {
-                state.buffer.push_back(refill);
-                sender = Some(waiter);
-            }
-            message
-        } else if let Some((waiter, message)) = Self::pop_sender(&mut state) {
-            sender = Some(waiter);
-            message
-        } else if state.closed {
-            return Ok(None);
-        } else {
+        let Some(received) = state.try_receive() else {
             let waiter = waiter();
-            state.receivers.push_back(Arc::clone(&waiter));
+            state.receivers.push_back(Queued {
+                waiter: Arc::clone(&waiter),
+                case: 0,
+            });
             return Err(waiter);
         };
         drop(state);
-        if let Some(sender) = sender {
-            sender.wake(WakeResult::Sent);
-        }
-        Ok(Some(message))
-    }
-
-    /// The oldest sender still waiting, fired.
-    fn pop_sender(state: &mut State) -> Option<(Arc<Waiter>, ChannelMessage)> {
-        while let Some((sender, message)) = state.senders.pop_front() {
-            if sender.fire() {
-                return Some((sender, message));
+        Ok(match received {
+            ReceiveNow::Value(message, sender) => {
+                if let Some(sender) = sender {
+                    sender.wake(WakeResult::Sent);
+                }
+                Some(message)
             }
-        }
-        None
+            ReceiveNow::Closed => None,
+        })
     }
 
     fn close(&self) {
@@ -297,33 +432,44 @@ impl ChannelCore {
                 core::mem::take(&mut state.senders),
             )
         };
-        for waiter in receivers
-            .iter()
-            .chain(senders.iter().map(|(waiter, _)| waiter))
-        {
-            if waiter.fire() {
-                waiter.wake(WakeResult::Closed);
+        let mut waiting: Vec<Queued> = receivers
+            .into_iter()
+            .chain(senders.into_iter().map(|(queued, _)| queued))
+            .collect();
+        // A select that waits both to receive and to send here has both cases ready now.
+        shuffle(&mut waiting);
+        for queued in waiting {
+            if queued.fire() {
+                queued.wake(WakeResult::Closed);
             }
         }
     }
 
-    /// Takes a [cancelled](Waiter::cancel) waiter out of its queue.
+    /// Takes the entries of a waiter that fired or was [cancelled](Waiter::cancel) out of the
+    /// queues.
     fn forget(&self, waiter: &Arc<Waiter>) {
-        let dropped = {
+        let mut dropped = SmallVec::<[ChannelMessage; 1]>::new();
+        {
             let mut state = self.state.lock();
-            if let Some(i) = state.receivers.iter().position(|w| Arc::ptr_eq(w, waiter)) {
-                state.receivers.remove(i);
-                None
-            } else {
-                let i = state
-                    .senders
-                    .iter()
-                    .position(|(w, _)| Arc::ptr_eq(w, waiter));
-                i.and_then(|i| state.senders.remove(i))
+            state
+                .receivers
+                .retain(|queued| !Arc::ptr_eq(&queued.waiter, waiter));
+            while let Some(i) = state
+                .senders
+                .iter()
+                .position(|(queued, _)| Arc::ptr_eq(&queued.waiter, waiter))
+            {
+                dropped.extend(state.senders.remove(i).map(|(_, message)| message));
             }
-        };
-        // Its value, outside the lock: it can hold the last handle of another channel.
+        }
+        // Its values, outside the lock: one can hold the last handle of another channel.
         drop(dropped);
+    }
+
+    /// How many entries the queues hold, live or not.
+    fn queue_lengths(&self) -> (usize, usize) {
+        let state = self.state.lock();
+        (state.receivers.len(), state.senders.len())
     }
 }
 
@@ -352,6 +498,14 @@ impl Channel {
                 state: Guarded::new(State::default()),
             }),
         })
+    }
+
+    pub(super) fn core(&self) -> &Arc<ChannelCore> {
+        &self.core
+    }
+
+    fn channels(&self) -> Channels {
+        SmallVec::from_elem(Arc::clone(&self.core), 1)
     }
 
     pub(crate) fn get_capacity(&self) -> u32 {
@@ -390,10 +544,16 @@ impl Channel {
             return Ok(rejected);
         }
         let id = ops().next_id();
-        Ok(match self.core.send(|| self.waiter(global, id), message) {
+        Ok(match self.core.send(|| new_waiter(global, id), message) {
             SendStep::Done => JSPromise::resolved_promise_value(global, JSValue::UNDEFINED),
             SendStep::Closed => JSPromise::rejected_promise(global, closed_error(global)).to_js(),
-            SendStep::Wait(waiter) => self.wait(global, OpKind::Send, waiter, options.signal),
+            SendStep::Wait(waiter) => wait(
+                global,
+                OpKind::Send,
+                waiter,
+                self.channels(),
+                options.signal,
+            ),
         })
     }
 
@@ -418,7 +578,7 @@ impl Channel {
             return Ok(rejected);
         }
         let id = ops().next_id();
-        match self.core.receive(|| self.waiter(global, id)) {
+        match self.core.receive(|| new_waiter(global, id)) {
             Ok(Some(message)) => {
                 let value = message.deserialize(global)?;
                 let value = match kind {
@@ -434,55 +594,83 @@ impl Channel {
                 ),
                 _ => JSPromise::rejected_promise(global, closed_error(global)).to_js(),
             }),
-            Err(waiter) => Ok(self.wait(global, kind, waiter, options.signal)),
+            Err(waiter) => Ok(wait(global, kind, waiter, self.channels(), options.signal)),
         }
-    }
-
-    fn waiter(&self, global: &JSGlobalObject, op_id: u64) -> Arc<Waiter> {
-        let vm = global.bun_vm();
-        Arc::new(Waiter {
-            vm: vm.handle(),
-            loop_kind: vm.current_loop_kind(),
-            op_id,
-            state: AtomicU32::new(WAITING),
-        })
-    }
-
-    /// The promise of an operation whose waiter is queued. Nothing can settle it before this
-    /// returns: its wake runs on this thread, and so does its signal.
-    fn wait(
-        &self,
-        global: &JSGlobalObject,
-        kind: OpKind,
-        waiter: Arc<Waiter>,
-        signal: Option<AbortSignalRef>,
-    ) -> JSValue {
-        let id = waiter.op_id;
-        let op = Box::new(ChannelOp {
-            abort_handle: AbortHandle::for_owner::<ChannelOp>(),
-            id,
-            kind,
-            promise: JSPromiseStrong::init(global),
-            waiter,
-            channel: Arc::clone(&self.core),
-        });
-        let promise = op.promise.value();
-        let op = ops().insert(id, op).as_ptr();
-        let vm = global.bun_vm();
-        // SAFETY: `op` is in the table, which frees it only through `remove`; the handle is
-        // disarmed when it drops.
-        unsafe {
-            AbortHandle::arm_owner(op, vm.context_of_caller());
-            if let Some(signal) = signal {
-                AbortHandle::follow_owner(op, signal);
-            }
-        }
-        promise
     }
 }
 
-struct Options {
+/// Uniformly at random.
+pub(super) fn shuffle<T>(items: &mut [T]) {
+    for i in (1..items.len()).rev() {
+        items.swap(i, (bun_core::fast_random() % (i as u64 + 1)) as usize);
+    }
+}
+
+pub(super) fn new_waiter(global: &JSGlobalObject, op_id: u64) -> Arc<Waiter> {
+    let vm = global.bun_vm();
+    Arc::new(Waiter {
+        vm: vm.handle(),
+        loop_kind: vm.current_loop_kind(),
+        op_id,
+        state: AtomicU32::new(WAITING),
+    })
+}
+
+/// The promise of an operation whose waiter is queued in `channels`. Nothing can settle it before
+/// this returns: its wake runs on this thread, and so does its signal.
+pub(super) fn wait(
+    global: &JSGlobalObject,
+    kind: OpKind,
+    waiter: Arc<Waiter>,
+    channels: Channels,
     signal: Option<AbortSignalRef>,
+) -> JSValue {
+    let id = waiter.op_id;
+    let op = Box::new(ChannelOp {
+        abort_handle: AbortHandle::for_owner::<ChannelOp>(),
+        id,
+        kind,
+        promise: JSPromiseStrong::init(global),
+        waiter,
+        channels,
+    });
+    let promise = op.promise.value();
+    let op = ops().insert(id, op).as_ptr();
+    let vm = global.bun_vm();
+    // SAFETY: `op` is in the table, which frees it only through `remove`; the handle is
+    // disarmed when it drops.
+    unsafe {
+        AbortHandle::arm_owner(op, vm.context_of_caller());
+        if let Some(signal) = signal {
+            AbortHandle::follow_owner(op, signal);
+        }
+    }
+    promise
+}
+
+/// `bun:internal-for-testing`: how many entries the channel's queues hold, live or not.
+pub(crate) fn queue_lengths_for_testing(
+    cx: &mut JsScope<'_>,
+    channel: JsLocal<'_>,
+) -> JsResult<JSValue> {
+    let global = cx.global();
+    let Some(channel) = channel.to_js().as_class_ref::<Channel>() else {
+        return Err(validators::throw_err_invalid_arg_type(
+            global,
+            "channel",
+            "Bun.Channel",
+            channel.to_js(),
+        ));
+    };
+    let (receivers, senders) = channel.core.queue_lengths();
+    let result = JSValue::create_empty_object(global, 2);
+    result.put(global, "receivers", JSValue::js_number(receivers as f64));
+    result.put(global, "senders", JSValue::js_number(senders as f64));
+    Ok(result)
+}
+
+pub(super) struct Options {
+    pub(super) signal: Option<AbortSignalRef>,
     transfer: JSValue,
 }
 
@@ -492,7 +680,7 @@ impl Options {
         transfer: JSValue::UNDEFINED,
     };
 
-    fn parse(global: &JSGlobalObject, options: JSValue, send: bool) -> JsResult<Self> {
+    pub(super) fn parse(global: &JSGlobalObject, options: JSValue, send: bool) -> JsResult<Self> {
         let mut parsed = Options::NONE;
         if options.is_undefined() {
             return Ok(parsed);
@@ -519,7 +707,7 @@ impl Options {
         Ok(parsed)
     }
 
-    fn rejected_if_aborted(&self, global: &JSGlobalObject) -> Option<JSValue> {
+    pub(super) fn rejected_if_aborted(&self, global: &JSGlobalObject) -> Option<JSValue> {
         let signal = self.signal.as_ref()?;
         if !signal.aborted() {
             return None;
