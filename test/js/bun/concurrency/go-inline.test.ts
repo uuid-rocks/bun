@@ -6,7 +6,8 @@ async function run(files: Record<string, string>, { threads = 4, main = "main.ts
   using dir = tempDir("bun-go-inline", files);
   await using proc = Bun.spawn({
     cmd: [bunExe(), ...args, main],
-    env: { ...bunEnv, GOMAXPROCS: String(threads) },
+    // UV_THREADPOOL_SIZE sizes the pool ahead of GOMAXPROCS.
+    env: { ...bunEnv, GOMAXPROCS: String(threads), UV_THREADPOOL_SIZE: undefined },
     cwd: String(dir),
     stdout: "pipe",
     stderr: "pipe",
