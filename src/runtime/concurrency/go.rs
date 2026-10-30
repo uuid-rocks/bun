@@ -4,7 +4,7 @@
 use core::ffi::c_void;
 
 use bun_core::strings;
-use bun_js_parser::parse::parse_entry::function_free_names;
+use bun_js_parser::parse::parse_entry::{function_free_names, reads_whether_main};
 
 /// Zero-based, in bytes of the text; the line is -1 for none.
 #[repr(C)]
@@ -64,4 +64,16 @@ pub(crate) unsafe extern "C" fn Bun__Go__functionNames(
         unsafe { on_name(ctx, name.as_ptr(), name.len(), position_of(*at)) };
     }
     true
+}
+
+/// Whether module `text` reads whether it runs as the entry point or on the main thread
+/// (`reads_whether_main`). True if it can't be scanned: no reason to refuse it then.
+///
+/// # Safety
+/// `text` points to `len` bytes of UTF-8.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn Bun__Go__readsWhetherMain(text: *const u8, len: usize) -> bool {
+    // SAFETY: the caller's contract.
+    let text = unsafe { core::slice::from_raw_parts(text, len) };
+    reads_whether_main(text).unwrap_or(true)
 }

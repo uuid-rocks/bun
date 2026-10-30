@@ -12,6 +12,8 @@ const {
   evaluating,
   describe,
   hasModuleRequire,
+  readsMain,
+  ownedByThisThread,
 } = $cpp("BunGo.cpp", "createGoSpawnBinding") as {
   spawn(module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]): number;
   spawnInline(source: string, module: string, line: number, column: number, strict: boolean, args: unknown[]): number;
@@ -22,21 +24,25 @@ const {
   check(fn: Function, source: string, module: string, line: number, column: number): Problem[] | undefined;
   codeGenerationAllowed(): boolean;
   evaluating(module: string): boolean;
-  describe(value: unknown): [path: string, what: string] | undefined;
+  describe(value: unknown): [path: string, what: string, hint: string | undefined] | undefined;
   hasModuleRequire(fn: Function, module: string): boolean;
+  readsMain(fn: Function): boolean;
+  // A structured clone of `object` throws a DataCloneError that says `hint`.
+  ownedByThisThread(object: object, hint: string): void;
 };
 
 // A function's text, and where it starts in its module (zero-based).
 type Source = [source: string, module: string, line: number, column: number, strict: boolean];
 type ProblemKind =
   "unparsable" | "class" | "this" | "arguments" | "import.meta" | "eval" | "captured" | "imported" | "undeclared";
-// The line is one-based, in the module's own text. What a captured or imported binding holds, and
-// where an import comes from (its specifier, and its name there; none for a namespace).
+// Where: the file and one-based line in the module's source, which a source map gives for a bundle.
+// What a captured or imported binding holds, and where an import comes from (its specifier, and its
+// name there; none for a namespace).
 type Problem = [
   kind: ProblemKind,
   name: string,
-  line: number,
-  valueKind: "function" | "class" | "namespace" | "data" | "bun" | "",
+  at: string,
+  valueKind: "function" | "native" | "class" | "namespace" | "data" | "bun" | "",
   from: string | undefined,
   importName: string | undefined,
 ];
@@ -56,37 +62,65 @@ type Pending = {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   keepsAlive: boolean;
+  // The AbortSignals among the arguments, by index: a goroutine that throws its copy of one's reason rejects
+  // with the reason itself.
+  signals: AbortSignal[] | undefined;
 };
 
 const pending = new Map<number, Pending>();
 // internal/go/runtime runs here: modules are imported here to run goroutines.
 let onPoolThread = false;
 const targets = new WeakMap<Function, Target>();
+// What `bun build` found a function passed to a `.go()` call to be: its module's entry chunk, by URL.
+const bundledTasks = new WeakMap<Function, URL>();
 // What `check` found for the code of a function no module exports, by its source: an inline
 // function is a new object each time the code around it runs.
 type Verdict = { module: string; line: number; column: number; target: Target | undefined; problems?: Problem[] };
 const verdicts = new Map<string, Verdict>();
 const kMaxVerdicts = 1024;
 
+const kGoroutineHint = "a goroutine belongs to the thread that started it: await it, and send its result";
+
 class Goroutine<T> extends Promise<T> {
   #id = 0;
+  // Until it starts (a WaitGroup's limit can hold it back)
+  #keepsAlive = true;
+  #resolve!: Pending["resolve"];
+  #reject!: Pending["reject"];
 
   static get [Symbol.species]() {
     return Promise;
   }
 
-  static start<T>(id: number): Goroutine<T> {
-    let entry!: Pending;
-    const goroutine = new Goroutine<T>((resolve, reject) => {
-      entry = { resolve: resolve as Pending["resolve"], reject, keepsAlive: true };
+  static create<T>(): Goroutine<T> {
+    let resolve!: Pending["resolve"], reject!: Pending["reject"];
+    const goroutine = new Goroutine<T>((res, rej) => {
+      resolve = res as Pending["resolve"];
+      reject = rej;
     });
-    goroutine.#id = id;
-    pending.$set(id, entry);
-    keepAlive(1);
+    goroutine.#resolve = resolve;
+    goroutine.#reject = reject;
+    ownedByThisThread(goroutine, kGoroutineHint);
     return goroutine;
   }
 
+  static start(goroutine: Goroutine<unknown>, id: number, signals: AbortSignal[] | undefined) {
+    goroutine.#id = id;
+    const keepsAlive = goroutine.#keepsAlive;
+    pending.$set(id, { resolve: goroutine.#resolve, reject: goroutine.#reject, keepsAlive, signals });
+    if (keepsAlive) keepAlive(1);
+  }
+
+  // It never started.
+  static fail(goroutine: Goroutine<unknown>, error: unknown) {
+    goroutine.#reject(error);
+  }
+
   ref(): this {
+    if (this.#id === 0) {
+      this.#keepsAlive = true;
+      return this;
+    }
     const entry = pending.$get(this.#id);
     if (entry !== undefined && !entry.keepsAlive) {
       entry.keepsAlive = true;
@@ -96,6 +130,10 @@ class Goroutine<T> extends Promise<T> {
   }
 
   unref(): this {
+    if (this.#id === 0) {
+      this.#keepsAlive = false;
+      return this;
+    }
     const entry = pending.$get(this.#id);
     if (entry !== undefined && entry.keepsAlive) {
       entry.keepsAlive = false;
@@ -119,98 +157,168 @@ function keyOf(object: object, fn: Function): string | undefined {
   }
 }
 
-// bun build finds the module of a function only from the call itself.
-const inBundle =
-  ' In a bundle, pass Bun.go() the imported binding itself, as in Bun.go(task) or Bun.go(tasks.task), or the module\'s URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)): bun build makes that module an entry point. List a module named any other way as an entry point of the build.';
+// How a call to `api` is written in an example.
+function callOf(api: string) {
+  return api === "WaitGroup.go" ? "group.go" : api;
+}
 
-function notSendable(fn: Function, url: string | undefined, problems?: Problem[], bundled = false) {
-  const error = notSendableIn(fn, url, problems);
-  if (bundled) error.message += inBundle;
+// bun build finds the module of a function only from the call itself, and a bundle has no module to
+// import() inside the function. A WaitGroup's go() is Bun's only if the module declares the group.
+function inBundle(api: string) {
+  return api === "WaitGroup.go"
+    ? " In a bundle, bun build makes the module of an imported function an entry point when the function is passed as it is, as in group.go(task), to a group this module declares with `new Bun.WaitGroup()`. Otherwise list the task's module as an entry point and build with --splitting."
+    : ` In a bundle, pass ${api}() the function as an import, as in ${api}(task): bun build makes its module an entry point.`;
+}
+
+function notSendable(api: string, fn: Function, url: string | undefined, problems?: Problem[], bundled = false) {
+  const error = notSendableIn(api, fn, url, problems, bundled);
+  if (bundled) error.message += inBundle(api);
   return error;
 }
 
-function notSendableIn(fn: Function, url: string | undefined, problems?: Problem[]) {
-  const label = fn.name ? `"${fn.name}"` : "this function";
+function notSendableIn(
+  api: string,
+  fn: Function,
+  url: string | undefined,
+  problems: Problem[] | undefined,
+  bundled: boolean,
+) {
+  const name = fn.name;
   if (url === undefined) {
+    // What Function.prototype.bind() makes is named "bound " and the name of what it binds.
+    if (typeof name === "string" && name.startsWith("bound ")) {
+      return $ERR_GOROUTINE_NOT_SENDABLE(
+        `${api}() can't run a bound function on another thread: it has no source of its own. Pass the function itself, and what it was bound to as arguments.`,
+      );
+    }
     return $ERR_GOROUTINE_NOT_SENDABLE(
-      `Bun.go() can't run ${label} on another thread: it has no source of its own (it is native or bound). Pass a function written in your code.`,
+      `${api}() can't run ${name ? `"${name}"` : "this function"} on another thread: it has no source of its own (it is native). Pass a function written in your code.`,
     );
   }
+  const label = name ? `"${name}"` : "this function";
   if (problems === undefined) {
     return $ERR_GOROUTINE_NOT_SENDABLE(
-      `Bun.go() can't run ${label} on another thread: no module exports it, and its source can't be compiled again there while code generation from strings is disallowed. Export it from its module.`,
+      `${api}() can't run ${label} on another thread: no module exports it, and its source can't be compiled again there while code generation from strings is disallowed. Export it from its module.`,
     );
   }
   const [kind] = problems[0];
   if (kind === "unparsable" || kind === "class") {
     return $ERR_GOROUTINE_NOT_SENDABLE(
-      `Bun.go() can't run ${label} on another thread: it is ${kind === "class" ? "a class" : "a method"}. Pass a function or an arrow function.`,
+      `${api}() can't run ${label} on another thread: it is ${kind === "class" ? "a class" : "a method"}. Pass a function or an arrow function.`,
     );
   }
-  const at = (line: number) => `${url}:${line}`;
-  const reasons: string[] = [];
-  for (const [kind, name, line, valueKind, from, importName] of problems) {
-    const uses = `it uses "${name}" (${at(line)})`;
+  // Bindings that take the same advice are named together, in the order they come.
+  const groups = new Map<string, [what: (one: boolean) => string, uses: [name: string, at: string][]]>();
+  const add = (key: string, name: string, at: string, what: (one: boolean) => string) => {
+    const group = groups.get(key);
+    if (group === undefined) groups.set(key, [what, [[name, at]]]);
+    else group[1].push([name, at]);
+  };
+  const say = (key: string, text: string) => groups.set(`${groups.size} ${key}`, [() => text, []]);
+  const them = (one: boolean) => (one ? "it" : "them");
+  const fromAround = (one: boolean, a: string, many: string) =>
+    `${one ? a : many} of the code around it: define ${them(one)} inside this function${bundled ? "" : `, or export ${them(one)} from another module and \`await import()\` ${them(one)} there`}`;
+  for (const [kind, name, at, valueKind, from, importName] of problems) {
     switch (kind) {
       case "captured":
         if (valueKind === "bun") {
-          reasons.push(`${uses}, which is Bun.${name}: use Bun.${name} instead`);
-        } else if (valueKind === "function" || valueKind === "class") {
-          reasons.push(
-            `${uses}, a ${valueKind} of the code around it: define it inside this function, or export it from a module other than the entry point and import it inside this function with \`await import()\``,
-          );
+          say(kind, `it uses "${name}" (${at}), which is Bun.${name}: use Bun.${name} instead`);
+        } else if (valueKind === "function" || valueKind === "native") {
+          add("function", name, at, one => fromAround(one, "a function", "functions"));
+        } else if (valueKind === "class") {
+          add("class", name, at, one => fromAround(one, "a class", "classes"));
         } else if (valueKind === "namespace") {
-          reasons.push(`${uses}, a module's namespace: import the module inside this function with \`await import()\``);
+          add("namespace", name, at, one =>
+            bundled
+              ? `${one ? "a module's namespace" : "modules' namespaces"}`
+              : `${one ? "a module's namespace" : "modules' namespaces"}: \`await import()\` ${one ? "the module" : "them"} inside this function`,
+          );
         } else if (valueKind === "data") {
-          reasons.push(`${uses}, a variable of the code around it: pass it as an argument`);
+          add(
+            "data",
+            name,
+            at,
+            one =>
+              `${one ? "a variable" : "variables"} of the code around it: pass ${them(one)} as ${one ? "an argument" : "arguments"}`,
+          );
         } else {
           // Not readable yet, as a function declaration may not be.
-          reasons.push(
-            `${uses}, which belongs to the code around it: pass it as an argument, or, for a function, define it inside this function or export it from a module other than the entry point and import it inside this function with \`await import()\``,
+          add(
+            "around",
+            name,
+            at,
+            one =>
+              `which ${one ? "belongs" : "belong"} to the code around it: pass ${them(one)} as ${one ? "an argument" : "arguments"}, or define ${them(one)} inside this function`,
           );
         }
         break;
       case "imported": {
-        const imports = `${uses}, which its module imports from "${from}"`;
+        const imports = `it uses "${name}" (${at}), which its module imports from "${from}"`;
+        const importInside =
+          importName === undefined
+            ? `\`const ${name} = await import(${JSON.stringify(from)})\``
+            : `\`const { ${importName === name ? name : `${importName}: ${name}`} } = await import(${JSON.stringify(from)})\``;
         if (from === "bun" || valueKind === "bun") {
-          reasons.push(
+          say(
+            kind,
             `${imports}: use ${importName === undefined || importName === "default" ? "the global Bun" : `Bun.${importName}`} instead`,
           );
         } else if (valueKind === "function") {
-          reasons.push(
-            `${imports}: pass it to Bun.go() itself, as in Bun.go(${name}, ...args), or import it inside this function with \`await import(${JSON.stringify(from)})\``,
+          say(
+            kind,
+            `${imports}: pass it to ${api}() itself, as in ${callOf(api)}(${name}, ...args)${bundled ? "" : `, or import it inside this function with ${importInside}`}`,
           );
+        } else if (valueKind === "class" || valueKind === "native") {
+          // Neither has a source of its own to send, nor can it be an argument.
+          const own = `export a function that uses it from a module of your own and pass that function to ${api}()`;
+          say(kind, `${imports}: ${bundled ? own : `import it inside this function with ${importInside}, or ${own}`}`);
+        } else if (bundled) {
+          say(kind, `${imports}: pass it as an argument`);
         } else {
-          reasons.push(
-            `${imports}: import it inside this function with \`await import(${JSON.stringify(from)})\`, or pass it as an argument`,
-          );
+          say(kind, `${imports}: import it inside this function with ${importInside}, or pass it as an argument`);
         }
         break;
       }
       case "undeclared":
-        reasons.push(`${uses}, which is neither its own nor a global: define it inside this function`);
-        break;
-      case "this":
-        reasons.push(
-          `the arrow function uses the \`this\` of the code around it (${at(line)}): pass it as an argument`,
+        add(
+          kind,
+          name,
+          at,
+          one => `which ${one ? "is" : "are"} neither its own nor a global: define ${them(one)} inside this function`,
         );
         break;
+      case "this":
+        say(kind, `the arrow function uses the \`this\` of the code around it (${at}): pass it as an argument`);
+        break;
       case "arguments":
-        reasons.push(
-          `the arrow function uses the \`arguments\` of the function around it (${at(line)}): pass them as arguments`,
+        say(
+          kind,
+          `the arrow function uses the \`arguments\` of the function around it (${at}): pass them as arguments`,
         );
         break;
       case "import.meta":
-        reasons.push(`it uses \`import.meta\` (${at(line)}): pass what it needs from it as an argument`);
+        say(kind, `it uses \`import.meta\` (${at}): pass what it needs from it as an argument`);
         break;
       case "eval":
-        reasons.push(
-          `it calls \`eval()\` directly (${at(line)}), which can read the variables around it: call \`(0, eval)()\` instead`,
+        say(
+          kind,
+          `it calls \`eval()\` directly (${at}), which can read the variables around it: call \`(0, eval)()\` instead`,
         );
         break;
     }
   }
-  return $ERR_GOROUTINE_NOT_SENDABLE(`Bun.go() can't run ${label} on another thread: ${reasons.join("; ")}.`);
+  const reasons: string[] = [];
+  for (const [what, uses] of groups.values()) {
+    if (uses.length === 0) {
+      reasons.push(what(true));
+      continue;
+    }
+    const sameAt = uses.every(([, at]) => at === uses[0][1]);
+    const names = uses.map(([name, at]) => (sameAt ? `"${name}"` : `"${name}" (${at})`));
+    const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+    reasons.push(`it uses ${list}${sameAt ? ` (${uses[0][1]})` : ""}, ${what(uses.length === 1)}`);
+  }
+  return $ERR_GOROUTINE_NOT_SENDABLE(`${api}() can't run ${label} on another thread: ${reasons.join("; ")}.`);
 }
 
 // The function a module exports: its module's key and the name it is exported under.
@@ -232,8 +340,8 @@ function exportOf(fn: Function, source: ReturnType<typeof moduleOf>): Target | u
 }
 
 // A function that uses nothing but its parameters, what it declares, and globals: its source.
-function inlineOf(fn: Function, source: Source | undefined, bundled: boolean): Target {
-  if (source === undefined) throw notSendable(fn, undefined);
+function inlineOf(api: string, fn: Function, source: Source | undefined, bundled: boolean): Target {
+  if (source === undefined) throw notSendable(api, fn, undefined);
   const [text, module, line, column, strict] = source;
   let verdict = verdicts.$get(text);
   if (verdict === undefined || verdict.module !== module || verdict.line !== line || verdict.column !== column) {
@@ -253,25 +361,31 @@ function inlineOf(fn: Function, source: Source | undefined, bundled: boolean): T
     if (problems === undefined || !problems.some(problem => problem[1] === "require")) verdicts.$set(text, verdict);
   }
   const { problems } = verdict;
-  if (problems !== undefined) throw notSendable(fn, module, problems, bundled);
-  if (!codeGenerationAllowed()) throw notSendable(fn, module, undefined, bundled);
+  if (problems !== undefined) throw notSendable(api, fn, module, problems, bundled);
+  if (!codeGenerationAllowed()) throw notSendable(api, fn, module, undefined, bundled);
   return verdict.target!;
 }
 
-function targetOf(fn: Function): Target {
-  const target = cachedTargetOf(fn);
+function targetOf(api: string, fn: Function): Target {
+  const target = cachedTargetOf(api, fn);
   // What `require` is depends on the closure, and a variable can be assigned another: the verdict
   // of the first function made by this code says nothing about it.
   if (target[0] === TargetKind.Inline && target[6] && !hasModuleRequire(fn, target[2])) {
     const problems = check(fn, target[1], target[2], target[3], target[4]);
-    if (problems !== undefined) throw notSendable(fn, target[2], problems);
+    if (problems !== undefined) throw notSendable(api, fn, target[2], problems);
   }
   return target;
 }
 
-function cachedTargetOf(fn: Function): Target {
+function cachedTargetOf(api: string, fn: Function): Target {
   let target = targets.get(fn);
   if (target !== undefined) return target;
+  const bundled = bundledTasks.get(fn);
+  if (bundled !== undefined) {
+    target = urlTarget(bundled);
+    targets.set(fn, target);
+    return target;
+  }
   const source = sourceOf(fn);
   if (source !== undefined) {
     // Code that made a function no module exports makes another: no need to look for it in the
@@ -287,9 +401,27 @@ function cachedTargetOf(fn: Function): Target {
     }
   }
   const module = moduleOf(fn);
-  target = exportOf(fn, module) ?? inlineOf(fn, source, module?.[2] ?? false);
+  target = exportOf(fn, module);
+  if (target !== undefined) {
+    if (!onPoolThread && target[1] === Bun.main && !readsMain(fn)) throw unguardedMain(api, fn, target[1]);
+  } else {
+    target = inlineOf(api, fn, source, module?.[2] ?? false);
+  }
   targets.set(fn, target);
   return target;
+}
+
+// A pool thread imports the module of each export it runs. All of the entry point's top-level code would run
+// there again, and its own call to go() would wait for itself.
+function unguardedMain(api: string, fn: Function, module: string) {
+  const label = fn.name ? `"${fn.name}"` : "this function";
+  const guard = "put that code inside if (import.meta.main) { ... }, which is false on a pool thread";
+  const move = `move ${label} to a module of its own`;
+  // A Worker's script is its own entry point, whose top-level code is the Worker's work.
+  const advice = Bun.isMainThread ? `${guard}, or ${move}` : `${move}, or ${guard}`;
+  return $ERR_GOROUTINE_NOT_SENDABLE(
+    `${api}() can't run ${label} on another thread: it is exported by the entry point, ${module}, which each pool thread would import to run it, and the entry point's top-level code would run there again. ${advice[0].toUpperCase()}${advice.slice(1)}.`,
+  );
 }
 
 // A URL's fragment names the export to run; `bun build` writes `Bun.go(fn)` as one.
@@ -308,62 +440,108 @@ function urlTarget(url: URL): Target {
   ];
 }
 
-function go(task: unknown, ...args: unknown[]) {
-  let target: Target;
-  if ($isCallable(task)) {
-    target = targetOf(task as Function);
-  } else if (typeof task === "string") {
-    target = task.startsWith("file:")
+function targetFor(api: string, task: unknown): Target {
+  if ($isCallable(task)) return targetOf(api, task as Function);
+  if (typeof task === "string") {
+    return task.startsWith("file:")
       ? urlTarget(new URL(task))
       : [TargetKind.Export, resolveModule(task), "default", false];
-  } else if (task instanceof URL) {
-    target = urlTarget(task);
-  } else {
-    throw $ERR_INVALID_ARG_TYPE("fn", ["function", "string", "URL"], task);
   }
+  if (task instanceof URL) return urlTarget(task);
+  throw $ERR_INVALID_ARG_TYPE("fn", ["function", "string", "URL"], task);
+}
+
+// The AbortSignals among the arguments, by index.
+function signalsOf(args: unknown[]) {
+  let signals: AbortSignal[] | undefined;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] instanceof AbortSignal) (signals ??= [])[i] = args[i] as AbortSignal;
+  }
+  return signals;
+}
+
+// Queues the goroutine on the pool.
+function start(api: string, goroutine: Goroutine<unknown>, task: unknown, target: Target, args: unknown[]) {
   let id: number;
   if (target[0] === TargetKind.Export) {
-    if (onPoolThread && evaluating(target[1])) throw evaluatingHere(task, target[1], target[2]);
+    if (onPoolThread && evaluating(target[1])) throw evaluatingHere(api, task, target[1], target[2]);
     try {
       id = spawn(target[1], target[2], target[3], args);
     } catch (error) {
-      throw argumentCloneError(error, args);
+      throw argumentCloneError(api, error, args);
     }
   } else {
     try {
       id = spawnInline(target[1], target[2], target[3], target[4], target[5], args);
     } catch (error) {
-      throw argumentCloneError(error, args);
+      throw argumentCloneError(api, error, args);
     }
   }
-  return Goroutine.start(id);
+  Goroutine.start(goroutine, id, signalsOf(args));
 }
+
+// What go() throws itself points at its caller, not at this module.
+function thrownBy(error: unknown, caller: Function) {
+  if (!(error instanceof Error)) return error;
+  const { name } = error;
+  if ((error as { code?: unknown }).code === undefined && name !== "DataCloneError") return error;
+  Error.captureStackTrace(error, caller);
+  // A DOMException is not an ErrorInstance: the header of what captureStackTrace writes is "Error".
+  const { message, stack } = error;
+  if (error instanceof DOMException && typeof stack === "string") {
+    const end = stack.indexOf("\n");
+    error.stack = `${name}: ${message}${end === -1 ? "" : stack.slice(end)}`;
+  }
+  return error;
+}
+
+function go(task: unknown, ...args: unknown[]) {
+  const goroutine = Goroutine.create();
+  try {
+    start("Bun.go", goroutine, task, targetFor("Bun.go", task), args);
+  } catch (error) {
+    throw thrownBy(error, go);
+  }
+  return goroutine;
+}
+
+// `bun build`: `fn` is the export the URL names. A call to any `.go()` method passes it through this, so a call
+// that is not to Bun.go() still gets `fn` itself.
+function bundledTask(fn: unknown, url: unknown) {
+  if ($isCallable(fn) && url instanceof URL) bundledTasks.set(fn as Function, url);
+  return fn;
+}
+Object.defineProperty(go, Symbol.for("Bun.go.task"), { value: bundledTask });
 
 // A pool thread imports the module of each export it runs. A module this thread is still evaluating
 // (the entry point's top level, say, waiting on its own goroutines) would wait for the goroutine,
 // which would wait for the module.
-function evaluatingHere(task: unknown, module: string, exportName: string) {
+function evaluatingHere(api: string, task: unknown, module: string, exportName: string) {
   const label = $isCallable(task) && (task as Function).name ? `"${(task as Function).name}"` : `"${exportName}"`;
   return $ERR_GOROUTINE_NOT_SENDABLE(
-    `Bun.go() can't run ${label} here: it is exported by ${module}, which this pool thread is still evaluating (a pool thread evaluates the module of each export it runs). The goroutine would wait for the module, and the module for the goroutine. Run that module's top-level code only on the main thread, inside if (import.meta.main) { ... }, or move ${label} to a module of its own.`,
+    `${api}() can't run ${label} here: it is exported by ${module}, which this pool thread is still evaluating (a pool thread evaluates the module of each export it runs). The goroutine would wait for the module, and the module for the goroutine. Run that module's top-level code only on the main thread, inside if (import.meta.main) { ... }, or move ${label} to a module of its own.`,
   );
 }
 
 // What in the arguments can't be cloned, and which argument holds it.
-function argumentCloneError(error: unknown, args: unknown[]) {
-  if ((error as Error)?.name !== "DataCloneError") return error;
+function uncloneableArgument(api: string, args: unknown[]) {
   for (let i = 0; i < args.length; i++) {
     const found = describe(args[i]);
     if (found === undefined) continue;
-    const [path, what] = found;
+    const [path, what, hint] = found;
     return new DOMException(
-      path === ""
-        ? `Bun.go() argument ${i + 1} is ${what}, which can't be sent to another thread.`
-        : `Bun.go() argument ${i + 1} has ${what} at ${path}, which can't be sent to another thread.`,
+      (path === ""
+        ? `${api}() argument ${i + 1} is ${what}, which can't be sent to another thread.`
+        : `${api}() argument ${i + 1} has ${what} at ${path}, which can't be sent to another thread.`) +
+        (hint === undefined ? "" : ` ${hint[0].toUpperCase()}${hint.slice(1)}.`),
       "DataCloneError",
     );
   }
-  return error;
+}
+
+function argumentCloneError(api: string, error: unknown, args: unknown[]) {
+  if ((error as Error)?.name !== "DataCloneError") return error;
+  return uncloneableArgument(api, args) ?? error;
 }
 
 const errorConstructors = {
@@ -389,14 +567,18 @@ type ErrorRecord = {
   props: object | undefined;
 };
 // What a goroutine threw (internal/go/runtime): an Error as its parts, which the structured clone
-// would not all keep, or another value as it was.
-type Thrown = ["error", ErrorRecord] | ["value", unknown];
+// would not all keep, the reason of the AbortSignal that was argument `index`, or another value as it was.
+type Thrown = ["error", ErrorRecord] | ["signal", index: number] | ["value", unknown];
 
-function fromThread(thrown: Thrown): unknown {
+function fromThread(thrown: Thrown, signals: AbortSignal[] | undefined): unknown {
+  if (thrown[0] === "signal") {
+    const signal = signals?.[thrown[1]];
+    return signal?.aborted ? signal.reason : new DOMException("This operation was aborted", "AbortError");
+  }
   if (thrown[0] !== "error") return thrown[1];
   const record = thrown[1];
   const { name, message, stack, props, errors } = record;
-  const options = "cause" in record ? { cause: fromThread(record.cause!) } : undefined;
+  const options = "cause" in record ? { cause: fromThread(record.cause!, signals) } : undefined;
   let error;
   if (record.domException) {
     error = new DOMException(message, name);
@@ -409,7 +591,11 @@ function fromThread(thrown: Thrown): unknown {
       });
     }
   } else if (errors !== undefined) {
-    error = new AggregateError(errors.map(fromThread), message, options);
+    error = new AggregateError(
+      errors.map(inner => fromThread(inner, signals)),
+      message,
+      options,
+    );
   } else {
     const Constructor = errorConstructors[name] ?? Error;
     error = new Constructor(message, options);
@@ -439,28 +625,43 @@ function settle(id: number, outcome: Outcome, value: unknown) {
   pending.$delete(id);
   if (entry.keepsAlive) keepAlive(-1);
   if (outcome === Outcome.Fulfilled) entry.resolve(value);
-  else entry.reject(outcome === Outcome.Rejected ? fromThread(value as Thrown) : value);
+  else entry.reject(outcome === Outcome.Rejected ? fromThread(value as Thrown, entry.signals) : value);
 }
 
-// What disposal aborts a WaitGroup's goroutines with. A goroutine's signal is a clone of the group's, so what it
-// rejects with because of the abort is a clone of this: the same name and message.
-const kDisposed = "The WaitGroup was disposed";
+const kWaitGroupHint = "a WaitGroup belongs to the thread that created it: send results on a channel instead";
 
-function isDisposal(error: unknown) {
-  return error instanceof Error && error.name === "AbortError" && error.message === kDisposed;
-}
+// A goroutine that waits for a free slot of a WaitGroup with a limit.
+type Queued = { goroutine: Goroutine<unknown>; task: unknown; target: Target; args: unknown[] };
 
-// Go's sync.WaitGroup with its Go method (Go 1.25), and errgroup's first-error cancellation.
+// Go's sync.WaitGroup with its Go method (Go 1.25), and errgroup's first-error cancellation and SetLimit.
 class WaitGroup {
   #controller = new AbortController();
   #signal: AbortSignal;
   #running = new Set<Promise<unknown>>();
   // The first goroutine that failed, and whether wait() has thrown it.
   #failure: { error: unknown; thrown: boolean } | undefined;
-  // Disposal aborted the goroutines: the reason they throw from then on is what it asked for.
-  #disposed = false;
+  // What disposal aborted the group with. A goroutine that rejects with it (the reason of its copy of the
+  // group's signal comes back as the original) did not fail.
+  #disposal: DOMException | undefined;
+  #limit = Infinity;
+  // Goroutines started and not settled.
+  #active = new Set<Promise<unknown>>();
+  #queue: Queued[] = [];
+  #queueHead = 0;
+  // What waits for a slot rejects once the signal aborts, not once a slot frees. Listens only while something
+  // waits: a listener on a signal of AbortSignal.any() keeps the group alive as long as the parent signal.
+  #onAbort = () => this.#next();
 
-  constructor(options?: { signal?: AbortSignal }) {
+  constructor(options?: { signal?: AbortSignal; limit?: number }) {
+    try {
+      this.#signal = this.#init(options);
+    } catch (error) {
+      throw thrownBy(error, WaitGroup);
+    }
+    ownedByThisThread(this, kWaitGroupHint);
+  }
+
+  #init(options: { signal?: AbortSignal; limit?: number } | undefined) {
     let parent: AbortSignal | undefined;
     if (options !== undefined) {
       if (!$isObject(options)) throw $ERR_INVALID_ARG_TYPE("options", "object", options);
@@ -468,29 +669,118 @@ class WaitGroup {
       if (parent !== undefined && !(parent instanceof AbortSignal)) {
         throw $ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", parent);
       }
+      const limit = options.limit;
+      if (limit !== undefined) {
+        if (typeof limit !== "number") throw $ERR_INVALID_ARG_TYPE("options.limit", "number", limit);
+        if (!(limit >= 1) || (limit !== Infinity && !Number.isInteger(limit))) {
+          throw $ERR_OUT_OF_RANGE("options.limit", "an integer >= 1, or Infinity", limit);
+        }
+        this.#limit = limit;
+      }
     }
     // AbortSignal.any() holds what it makes weakly: a long-lived parent does not keep this alive.
-    this.#signal = parent === undefined ? this.#controller.signal : AbortSignal.any([parent, this.#controller.signal]);
+    return parent === undefined ? this.#controller.signal : AbortSignal.any([parent, this.#controller.signal]);
   }
 
   get signal() {
     return this.#signal;
   }
 
+  get [Symbol.toStringTag]() {
+    return "WaitGroup";
+  }
+
+  // `console.log(group)` shows its state, as for a channel.
+  [Symbol.for("nodejs.util.inspect.custom")](
+    depth: number,
+    options: { stylize(text: string, style: string): string; depth?: number | null },
+  ) {
+    if (depth < 0) return options.stylize("[WaitGroup]", "special");
+    const { inspect } = require("node:util");
+    const fields = {
+      running: this.#running.size - (this.#queue.length - this.#queueHead),
+      queued: this.#queue.length - this.#queueHead,
+      aborted: this.#signal.aborted,
+    };
+    return `WaitGroup ${inspect(fields, { ...options, depth: options.depth == null ? null : options.depth - 1 })}`;
+  }
+
   go(fn: unknown, ...args: unknown[]) {
-    const goroutine = go(fn, ...args);
-    const running = this.#running;
-    running.add(goroutine);
+    const goroutine = Goroutine.create();
+    try {
+      const target = targetFor("WaitGroup.go", fn);
+      if (this.#active.size < this.#limit) {
+        this.#start(goroutine, fn, target, args);
+      } else {
+        // As go() would throw now, not once it starts.
+        if (target[0] === TargetKind.Export && onPoolThread && evaluating(target[1])) {
+          throw evaluatingHere("WaitGroup.go", fn, target[1], target[2]);
+        }
+        const uncloneable = uncloneableArgument("WaitGroup.go", args);
+        if (uncloneable !== undefined) throw uncloneable;
+        if (this.#queueHead === this.#queue.length) this.#signal.addEventListener("abort", this.#onAbort);
+        this.#queue.push({ goroutine, task: fn, target, args });
+        if (this.#signal.aborted) this.#next();
+      }
+    } catch (error) {
+      throw thrownBy(error, WaitGroup.prototype.go);
+    }
+    this.#running.add(goroutine);
     goroutine.then(
-      () => running.delete(goroutine),
+      () => this.#settled(goroutine),
       error => {
-        running.delete(goroutine);
-        if (this.#failure !== undefined || (this.#disposed && isDisposal(error))) return;
-        this.#failure = { error, thrown: false };
-        this.#controller.abort(error);
+        if (this.#failure === undefined && (this.#disposal === undefined || error !== this.#disposal)) {
+          this.#failure = { error, thrown: false };
+          this.#controller.abort(error);
+        }
+        this.#settled(goroutine);
       },
     );
     return goroutine;
+  }
+
+  #start(goroutine: Goroutine<unknown>, task: unknown, target: Target, args: unknown[]) {
+    start("WaitGroup.go", goroutine, task, target, args);
+    this.#active.add(goroutine);
+  }
+
+  // Runs after a failure aborted the signal, so that what waits for the slot sees it.
+  #settled(goroutine: Promise<unknown>) {
+    this.#running.delete(goroutine);
+    if (this.#active.delete(goroutine)) this.#next();
+  }
+
+  // Starts what waits for a slot. Once a failure or the caller has aborted the group's signal, what waits rejects
+  // with its reason instead of starting. Disposal drops nothing: what waits starts as slots free, and sees the
+  // aborted signal, as it would have without a limit.
+  #next() {
+    const queue = this.#queue;
+    // A failure after disposal leaves the signal's reason as disposal's.
+    const signal = this.#signal;
+    const cancelled =
+      this.#failure !== undefined
+        ? { reason: this.#failure.error }
+        : signal.aborted && (this.#disposal === undefined || signal.reason !== this.#disposal)
+          ? { reason: signal.reason }
+          : undefined;
+    while (this.#queueHead < queue.length && (this.#active.size < this.#limit || cancelled !== undefined)) {
+      const { goroutine, task, target, args } = queue[this.#queueHead];
+      queue[this.#queueHead++] = undefined!;
+      if (cancelled !== undefined) {
+        Goroutine.fail(goroutine, cancelled.reason);
+        continue;
+      }
+      try {
+        this.#start(goroutine, task, target, args);
+      } catch (error) {
+        Goroutine.fail(goroutine, error);
+      }
+    }
+    if (this.#queueHead === queue.length && queue.length > 0) {
+      queue.length = 0;
+      this.#queueHead = 0;
+      this.#signal.removeEventListener("abort", this.#onAbort);
+    }
   }
 
   async wait() {
@@ -505,9 +795,8 @@ class WaitGroup {
   }
 
   async [Symbol.asyncDispose]() {
-    this.#disposed = true;
-    // A DOMException keeps its name through the clone; an Error's custom name does not.
-    this.#controller.abort(new DOMException(kDisposed, "AbortError"));
+    this.#disposal ??= new DOMException("The WaitGroup was disposed", "AbortError");
+    this.#controller.abort(this.#disposal);
     const running = this.#running;
     while (running.size > 0) await Promise.allSettled(running);
     const failure = this.#failure;

@@ -60,7 +60,8 @@ async function run(workers: number, limit: number, size: number, signal: AbortSi
   using ranges = new Bun.Channel<Range>(Math.max(workers, 1) * 2);
   using counts = new Bun.Channel<number>(Math.max(workers, 1) * 2);
   using quit = new Bun.Channel<never>();
-  signal.addEventListener("abort", () => quit.close(), { once: true });
+  if (signal.aborted) quit.close();
+  else signal.addEventListener("abort", () => quit.close(), { once: true });
 
   const start = performance.now();
   const produced = produce(ranges, quit, limit, size);

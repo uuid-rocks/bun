@@ -17,5 +17,6 @@ export const Mutex = b.class({
     },
     __tryLock: { returns: b.bool, privateSymbol: "mutexTryLock" },
     __unlock: { privateSymbol: "mutexUnlock" },
+    "@@inspectCustom": { returns: b.string.utf8, rustName: "inspect", length: 2 },
   },
 });

@@ -42,7 +42,8 @@ struct Entry {
 struct Report {
     /// VMs that have not described their operations yet.
     pending: usize,
-    sections: Vec<(ThreadKind, String)>,
+    /// What each VM described: one entry per waiting operation.
+    sections: Vec<(ThreadKind, Vec<String>)>,
 }
 
 struct Registry {
@@ -190,16 +191,14 @@ fn is_deadlocked(registry: &Registry) -> bool {
 /// BunGo.cpp, on each VM with operations that wait, once a deadlock is found.
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn Bun__Deadlock__describe(global: &JSGlobalObject) {
-    let mut ops: Vec<String> = super::channel::ops()
+    let ops: Vec<String> = super::channel::ops()
         .iter()
         .map(|op| op.describe(global))
         .collect();
-    ops.sort();
-    let section = ops.join("\n  ");
-    described(Some((global.bun_vm().thread_kind(), section)));
+    described(Some((global.bun_vm().thread_kind(), ops)));
 }
 
-fn described(section: Option<(ThreadKind, String)>) {
+fn described(section: Option<(ThreadKind, Vec<String>)>) {
     let mut registry = REGISTRY.lock();
     let Some(report) = &mut registry.report else {
         return;
@@ -218,24 +217,27 @@ pub(crate) extern "C" fn Bun__Deadlock__exit(global: &JSGlobalObject) {
     let Some(mut report) = REGISTRY.lock().report.take() else {
         return;
     };
-    report
-        .sections
-        .sort_by_key(|(kind, _)| *kind != ThreadKind::Main);
+    // Goroutines run on whichever pool thread is free: theirs are one section.
+    let mut main = Vec::new();
+    let mut goroutines = Vec::new();
+    let mut workers = Vec::new();
+    for (kind, ops) in report.sections.drain(..) {
+        match kind {
+            ThreadKind::Main => main.extend(ops),
+            ThreadKind::Goroutine => goroutines.extend(ops),
+            ThreadKind::Worker => workers.push(ops),
+        }
+    }
     let mut text = String::new();
-    let (mut goroutine_threads, mut workers) = (0, 0);
-    for (kind, section) in &report.sections {
-        let label = match kind {
-            ThreadKind::Main => String::from("main thread"),
-            ThreadKind::Goroutine => {
-                goroutine_threads += 1;
-                format!("Bun.go thread {goroutine_threads}")
-            }
-            ThreadKind::Worker => {
-                workers += 1;
-                format!("Worker {workers}")
-            }
-        };
-        text.push_str(&format!("\n{label}:\n  {section}\n"));
+    let mut section = |label: &str, ops: Vec<String>| {
+        if !ops.is_empty() {
+            text.push_str(&format!("\n{label}:\n  {}\n", grouped(ops).join("\n  ")));
+        }
+    };
+    section("main thread", main);
+    section("goroutines", goroutines);
+    for (i, ops) in workers.into_iter().enumerate() {
+        section(&format!("Worker {}", i + 1), ops);
     }
     bun_core::pretty_errorln!(
         "<r><red>error<r><d>:<r> <b>all goroutines are asleep - deadlock!<r>\n{}\nNo thread is left that can send, receive, close or unlock for these. Set BUN_GO_DEADLOCK=0 to wait anyway.",
@@ -246,4 +248,24 @@ pub(crate) extern "C" fn Bun__Deadlock__exit(global: &JSGlobalObject) {
     vm.exit_handler.requested = true;
     vm.on_exit();
     vm.global_exit();
+}
+
+/// Sorted, with identical waits (the same operation at the same stack) once, and how many there are.
+fn grouped(mut ops: Vec<String>) -> Vec<String> {
+    ops.sort();
+    let mut out: Vec<String> = Vec::with_capacity(ops.len());
+    let mut i = 0;
+    while i < ops.len() {
+        let count = ops[i..].iter().take_while(|op| **op == ops[i]).count();
+        let op = &ops[i];
+        out.push(if count == 1 {
+            op.clone()
+        } else {
+            let first_line =
+                bun_core::strings::index_of_char_usize(op.as_bytes(), b'\n').unwrap_or(op.len());
+            format!("{} \u{d7} {count}{}", &op[..first_line], &op[first_line..])
+        });
+        i += count;
+    }
+    out
 }

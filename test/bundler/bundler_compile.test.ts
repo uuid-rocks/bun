@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, renameSync, rmSync } from "fs";
-import { bunEnv, bunExe, isWindows, tempDir } from "harness";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "fs";
+import { bunEnv, bunExe, isWindows, normalizeBunSnapshot, tempDir } from "harness";
 import { join } from "path";
 import { BundlerTestInput, itBundled as itBundledBase } from "./expectBundled";
 
@@ -1569,7 +1569,7 @@ const server = serve({
 describe("Bun.go", () => {
   const goFiles = {
     "src/main.ts": `
-      import { add, label } from "./tasks/math.ts";
+      import { add, label, mul } from "./tasks/math.ts";
       import { add as plus } from "./tasks/math.ts";
       import * as text from "./tasks/text.ts";
       import twice from "./tasks/twice.ts";
@@ -1577,7 +1577,31 @@ describe("Bun.go", () => {
       import { which as packageWhich } from "dualpkg/dual";
       import { work } from "./tasks/cjs.cjs";
       import { urlLabel } from "./label.ts";
+      import { go, go as spawn, WaitGroup } from "bun";
+      // A WaitGroup the build can't see is a method of any name: it keeps the function, and tells Bun.go its URL.
+      async function inGroup(group: Bun.WaitGroup) {
+        return [await group.go(mul, 2, 5)];
+      }
+      async function grouped() {
+        await using group = new Bun.WaitGroup({ limit: 1 });
+        const results = [
+          await group.go(add, 1, 2),
+          await group.go(text.shout, "wg"),
+          ...(await inGroup(group)),
+          await group.go(new URL("./tasks/url-task.ts", import.meta.url), 9),
+        ];
+        let named = new WaitGroup();
+        results.push(await named.go(twice, 4), await named.go(new URL("tasks/math.ts#mul", import.meta.url), 3, 3));
+        await named.wait();
+        return results;
+      }
+      // A go() method that is not Bun's gets the function itself.
+      const router = { go: (fn: Function) => fn === text.shout };
       Promise.all([
+        go(add, 1, 0),
+        spawn(text.shout, "go"),
+        grouped(),
+        router.go(text.shout),
         Bun.go(add, 2, 3),
         Bun.go(plus, 1, 1),
         Bun.go(text.shout, "hi"),
@@ -1614,7 +1638,7 @@ describe("Bun.go", () => {
     // Shares the bundle's top-level scope with the calls the build writes.
     "src/label.ts": `const URL = "shadowed"; export const urlLabel = URL;`,
   };
-  const goStdout = `[{"sum":5,"isMainThread":false},{"sum":2,"isMainThread":false},"HI!",-5,42,5,42,"mjs","package mjs",77,{"inline":15}] math shadowed\n`;
+  const goStdout = `[{"sum":1,"isMainThread":false},"GO!",[{"sum":3,"isMainThread":false},"WG!",10,10,8,9],true,{"sum":5,"isMainThread":false},{"sum":2,"isMainThread":false},"HI!",-5,42,5,42,"mjs","package mjs",77,{"inline":15}] math shadowed\n`;
 
   async function run(cmd: string[], cwd: string) {
     await using proc = Bun.spawn({ cmd, env: bunEnv, cwd, stdout: "pipe", stderr: "pipe" });
@@ -1639,9 +1663,16 @@ describe("Bun.go", () => {
       expect(build.exitCode).toBe(0);
       if (flags.length === 0) {
         const main = readFileSync(join(root, "out", "main.js"), "utf8");
-        expect(main).toContain(`Bun.go(new globalThis.URL("./tasks/math.js#add", import.meta.url), 2, 3)`);
-        expect(main).toContain(`Bun.go(new globalThis.URL("./tasks/text.js#odd%20name", import.meta.url), 5)`);
-        expect(main).toContain(`Bun.go(new globalThis.URL("./tasks/twice.js", import.meta.url), 21)`);
+        // An imported binding keeps its value: Bun.go learns the URL of a function on the way.
+        const task = (value: string, url: string) =>
+          `globalThis.Bun.go[globalThis.Symbol.for("Bun.go.task")](${value}, new globalThis.URL("${url}", import.meta.url))`;
+        expect(main).toContain(`Bun.go(${task("add", "./tasks/math.js#add")}, 2, 3)`);
+        expect(main).toContain(`Bun.go(${task("negate", "./tasks/text.js#odd%20name")}, 5)`);
+        expect(main).toContain(`Bun.go(${task("twice_default", "./tasks/twice.js")}, 21)`);
+        expect(main).toContain(`Bun.go(new globalThis.URL("./tasks/math.js#mul", import.meta.url), 6, 7)`);
+        // Neither a go() method that is not Bun's, nor a WaitGroup the build can't see.
+        expect(main).toContain(`router.go(shout)`);
+        expect(main).toContain(`group.go(mul, 2, 5)`);
       }
       rmSync(join(root, "src"), { recursive: true });
       rmSync(join(root, "node_modules"), { recursive: true });
@@ -1674,6 +1705,266 @@ describe("Bun.go", () => {
     });
   }
 
+  test("a URL passed to a go() method that is not Bun's is left as written, whether or not it names a module", async () => {
+    using dir = tempDir("bun-go-other-method", {
+      "navigation.ts": `
+        const router = { go: (url: URL) => console.log(url.href.slice(url.href.lastIndexOf("/") + 1)) };
+        router.go(new URL("./settings", import.meta.url));
+        router.go(new URL("./tasks.ts#label", import.meta.url));
+        // Not a WaitGroup where it is used.
+        let group: any = new Bun.WaitGroup();
+        group = router;
+        group.go(new URL("./missing", import.meta.url));
+        // Initialized twice: not a WaitGroup either.
+        var twice: any = router;
+        twice.go(new URL("./twice", import.meta.url));
+        var twice: any = new Bun.WaitGroup();
+        // Initialized with undefined after a WaitGroup: not one either.
+        var maybe: any = new Bun.WaitGroup();
+        var maybe: any = undefined;
+        maybe?.go(new URL("./undefined", import.meta.url));
+      `,
+      "tasks.ts": `export const label = "tasks";`,
+    });
+    const root = String(dir);
+    const expected = "settings\ntasks.ts#label\nmissing\ntwice\n";
+    const bundle = await run([bunExe(), "build", "--target=bun", "navigation.ts", "--outdir", "out"], root);
+    expect(bundle.stderr).toBe("");
+    expect(bundle.exitCode).toBe(0);
+    expect(existsSync(join(root, "out", "tasks.js"))).toBe(false);
+    const bundled = await run([bunExe(), join(root, "out", "navigation.js")], root);
+    expect(bundled.stdout).toBe(expected);
+    expect(bundled.exitCode).toBe(0);
+    const compile = await run([bunExe(), "build", "--compile", "navigation.ts", "--outfile", join("bin", "app")], root);
+    expect(compile.stderr).toBe("");
+    expect(compile.exitCode).toBe(0);
+    const compiled = await run([join(root, "bin", "app")], root);
+    expect(compiled.stdout).toBe(expected);
+    expect(compiled.exitCode).toBe(0);
+  });
+
+  test("bun build --compile: a URL passed to a WaitGroup declared after the function that uses it", async () => {
+    using dir = tempDir("bun-go-compile-hoisted-group", {
+      "main.ts": `
+        import { WaitGroup } from "bun";
+        async function run() {
+          return [
+            await group.go(new URL("./task.ts#double", import.meta.url), 4),
+            await other.go(new URL("./task.ts#double", import.meta.url), 5),
+          ];
+        }
+        await using group = new Bun.WaitGroup();
+        const other = new WaitGroup();
+        // A declaration without a value keeps the value.
+        var again = new Bun.WaitGroup();
+        var again;
+        console.log(await run(), await again.go(new URL("./task.ts#double", import.meta.url), 6));
+      `,
+      "task.ts": `export const double = (n: number) => n * 2;`,
+    });
+    const root = String(dir);
+    const build = await run([bunExe(), "build", "--compile", "main.ts", "--outfile", join("out", "app")], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    rmSync(join(root, "main.ts"));
+    rmSync(join(root, "task.ts"));
+    const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
+    expect(stderr).toBe("");
+    expect(stdout).toBe("[ 8, 10 ] 12\n");
+    expect(exitCode).toBe(0);
+  });
+
+  test("bun build --compile: an entry point that exports its goroutine's function and guards its top-level code", async () => {
+    using dir = tempDir("bun-go-compile-single-file", {
+      "main.ts": `
+        import { helper } from "./helper.ts";
+        export function work(n: number) {
+          return helper(n);
+        }
+        if (import.meta.main) {
+          await using group = new Bun.WaitGroup();
+          console.log(await Promise.all([Bun.go(work, 1), group.go(work, 2)]));
+        }
+      `,
+      "helper.ts": `export const helper = (n: number) => n * 10;`,
+    });
+    const root = String(dir);
+    const build = await run([bunExe(), "build", "--compile", "main.ts", "--outfile", join("out", "app")], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    rmSync(join(root, "main.ts"));
+    rmSync(join(root, "helper.ts"));
+    const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
+    expect(stderr).toBe("");
+    expect(stdout).toBe("[ 10, 20 ]\n");
+    expect(exitCode).toBe(0);
+  });
+
+  test("bun build: a go() call whose receiver is not known to be Bun's builds as it would without goroutines", async () => {
+    using dir = tempDir("bun-go-unknown-receiver", {
+      "app.ts": `
+        import { HOME, handler } from "./routes.ts";
+        const router = { go: (to: unknown) => to };
+        // A WaitGroup the build can't see is one of these too.
+        function start(group: { go(fn: unknown): unknown }) {
+          return group.go(handler) === handler;
+        }
+        console.log(router.go(HOME), router.go(handler) === handler, start(router));
+      `,
+      "routes.ts": `
+        export const HOME = "/home";
+        export function handler() { return 1; }
+      `,
+    });
+    const root = String(dir);
+    const expected = "/home true true\n";
+    for (const output of [
+      ["--outfile", join("single", "app.js")],
+      ["--outdir", "out"],
+    ]) {
+      const build = await run([bunExe(), "build", "--target=bun", "app.ts", ...output], root);
+      expect(build.stderr).toBe("");
+      expect(build.exitCode).toBe(0);
+    }
+    // No entry point for routes.ts, and nothing that needs Bun.go.
+    expect(readdirSync(join(root, "out"))).toEqual(["app.js"]);
+    for (const file of [join("single", "app.js"), join("out", "app.js")]) {
+      const text = readFileSync(join(root, file), "utf8");
+      expect(text).not.toContain("Bun.go");
+      expect(text).toContain(`router.go(HOME), router.go(handler) === handler`);
+      const { stdout, exitCode } = await run([bunExe(), file], root);
+      expect(stdout).toBe(expected);
+      expect(exitCode).toBe(0);
+    }
+  });
+
+  test("bun build: an imported constant passed to Bun.go() reaches it as it is", async () => {
+    using dir = tempDir("bun-go-imported-constant", {
+      "app.ts": `
+        import { TASK } from "./constants.ts";
+        try {
+          Bun.go(TASK);
+        } catch (error) {
+          console.log(error.code);
+        }
+      `,
+      "constants.ts": `export const TASK = 42;`,
+    });
+    const root = String(dir);
+    const source = await run([bunExe(), "app.ts"], root);
+    expect(source.stdout).toBe("ERR_INVALID_ARG_TYPE\n");
+    const build = await run([bunExe(), "build", "--target=bun", "app.ts", "--outdir", "out"], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    const { stdout, exitCode } = await run([bunExe(), join("out", "app.js")], root);
+    expect(stdout).toBe(source.stdout);
+    expect(exitCode).toBe(0);
+  });
+
+  test("bun build --outfile: a module Bun.go() makes an entry point is an error that says to build with --outdir or --compile", async () => {
+    using dir = tempDir("bun-go-outfile", {
+      "app.ts": `
+        import { work } from "./work.ts";
+        console.log(await Bun.go(work, 21));
+      `,
+      "imported.ts": `
+        import { go } from "bun";
+        import { work } from "./work.ts";
+        console.log(await go(work, 21));
+      `,
+      "group.ts": `
+        import { work } from "./work.ts";
+        await using group = new Bun.WaitGroup();
+        console.log(await group.go(work, 21));
+      `,
+      "work.ts": `export function work(n: number) { return n * 2; }`,
+    });
+    // The error names the API the call is to.
+    for (const [file, api, line] of [
+      ["app.ts", "Bun.go()", 3],
+      ["imported.ts", "go()", 4],
+      ["group.ts", "A WaitGroup's .go()", 4],
+    ] as const) {
+      const { stderr, exitCode } = await run(
+        [bunExe(), "build", "--target=bun", file, "--outfile", "out.js"],
+        String(dir),
+      );
+      expect(stderr).toContain(
+        `error: ${api} makes "work.ts" an entry point of the build, which then writes more than one file: build with --outdir or --compile`,
+      );
+      expect(stderr).toContain(`${file}:${line}:`);
+      expect(stderr).not.toContain("[hash]");
+      expect(exitCode).toBe(1);
+    }
+  });
+
+  test("bun build: the error for a WaitGroup the build can't see, given an imported function, says how to make it one", async () => {
+    using dir = tempDir("bun-go-parameter-group", {
+      "app.ts": `
+        import { scale } from "./scale.ts";
+        async function runAll(group: Bun.WaitGroup, xs: number[]) {
+          return await Promise.all(xs.map(x => group.go(scale, x)));
+        }
+        await using group = new Bun.WaitGroup();
+        try {
+          console.log(await runAll(group, [1, 2]));
+        } catch (error) {
+          console.log(error.message);
+        }
+      `,
+      "scale.ts": `import { factor } from "./factor.ts"; export function scale(n: number) { return n * factor; }`,
+      "factor.ts": `export const factor = 10;`,
+    });
+    const root = String(dir);
+    const source = await run([bunExe(), "app.ts"], root);
+    expect(source.stdout).toBe("[ 10, 20 ]\n");
+    const build = await run([bunExe(), "build", "--target=bun", "app.ts", "--outdir", "out"], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    const { stdout, exitCode } = await run([bunExe(), join("out", "app.js")], root);
+    expect(stdout).toStartWith(`WaitGroup.go() can't run "scale" on another thread`);
+    expect(stdout).toEndWith(
+      "In a bundle, bun build makes the module of an imported function an entry point when the function is passed as it is, as in group.go(task), to a group this module declares with `new Bun.WaitGroup()`. Otherwise list the task's module as an entry point and build with --splitting.\n",
+    );
+    expect(exitCode).toBe(0);
+    // What the message says: the module as an entry point, with --splitting.
+    const listed = await run(
+      [bunExe(), "build", "--target=bun", "--splitting", "app.ts", "scale.ts", "--outdir", "listed"],
+      root,
+    );
+    expect(listed.stderr).toBe("");
+    expect(listed.exitCode).toBe(0);
+    const fixed = await run([bunExe(), join("listed", "app.js")], root);
+    expect(fixed.stdout).toBe(source.stdout);
+    expect(fixed.exitCode).toBe(0);
+  });
+
+  test("bun build --sourcemap: a function that is not sendable is named where its source is", async () => {
+    using dir = tempDir("bun-go-sourcemap", {
+      "app.ts": `
+        let factor = 3;
+        function helper(n: number) { return n * factor; }
+        try {
+          Bun.go((n: number) => helper(n), 1);
+        } catch (error) {
+          console.log(error.message);
+        }
+      `,
+    });
+    const root = String(dir);
+    const build = await run(
+      [bunExe(), "build", "--target=bun", "app.ts", "--outdir", "out", "--sourcemap=linked"],
+      root,
+    );
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    const { stdout, exitCode } = await run([bunExe(), join("out", "app.js")], root);
+    expect(normalizeBunSnapshot(stdout, dir)).toMatchInlineSnapshot(
+      `"Bun.go() can't run this function on another thread: it uses "helper" (<dir>/app.ts:5), which belongs to the code around it: pass it as an argument, or define it inside this function. In a bundle, pass Bun.go() the function as an import, as in Bun.go(task): bun build makes its module an entry point."`,
+    );
+    expect(exitCode).toBe(0);
+  });
+
   test("bun build --compile: a function the build can't trace to its module, and that is not self-contained, throws, naming the fix", async () => {
     using dir = tempDir("bun-go-compile-computed", {
       "main.ts": `
@@ -1685,24 +1976,51 @@ describe("Bun.go", () => {
           console.log(error.code);
           console.log(error.message);
         }
+        try {
+          await using group = new Bun.WaitGroup();
+          console.log(await group.go(tasks[name], 4));
+        } catch (error) {
+          console.log(error.code);
+          console.log(error.message);
+        }
       `,
       "tasks.ts": `import { factor } from "./factor.ts"; export function work(n: number) { return n * factor; }`,
       "factor.ts": `export const factor = 10;`,
     });
     const root = String(dir);
     const source = await run([bunExe(), "main.ts"], root);
-    expect(source.stdout).toBe("30\n");
+    expect(source.stdout).toBe("30\n40\n");
     const build = await run([bunExe(), "build", "--compile", "main.ts", "--outfile", join("out", "app")], root);
     expect(build.stderr).toBe("");
     expect(build.exitCode).toBe(0);
     const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
     expect(stderr).toBe("");
-    const [code, message] = stdout.split("\n");
+    const [code, message, groupCode, groupMessage] = stdout.split("\n");
     expect(code).toBe("ERR_GOROUTINE_NOT_SENDABLE");
-    expect(message).toContain(
-      `In a bundle, pass Bun.go() the imported binding itself, as in Bun.go(task) or Bun.go(tasks.task), or the module's URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)): bun build makes that module an entry point. List a module named any other way as an entry point of the build.`,
+    expect(message).toEndWith(
+      `In a bundle, pass Bun.go() the function as an import, as in Bun.go(task): bun build makes its module an entry point.`,
     );
+    // A bundle has no module to import() inside the function.
+    expect(message).not.toContain("import(");
+    expect(groupCode).toBe("ERR_GOROUTINE_NOT_SENDABLE");
+    expect(groupMessage).toStartWith(`WaitGroup.go() can't run "work" on another thread`);
+    expect(groupMessage).toEndWith(
+      "In a bundle, bun build makes the module of an imported function an entry point when the function is passed as it is, as in group.go(task), to a group this module declares with `new Bun.WaitGroup()`. Otherwise list the task's module as an entry point and build with --splitting.",
+    );
+    expect(groupMessage).not.toContain("Bun.go");
     expect(exitCode).toBe(0);
+
+    // What the message says: the module as an entry point, with --splitting.
+    const listed = await run(
+      [bunExe(), "build", "--compile", "--splitting", "main.ts", "tasks.ts", "--outfile", join("listed", "app")],
+      root,
+    );
+    expect(listed.stderr).toBe("");
+    expect(listed.exitCode).toBe(0);
+    const fixed = await run([join(root, "listed", "app")], join(root, "listed"));
+    expect(fixed.stderr).toBe("");
+    expect(fixed.stdout).toBe("30\n40\n");
+    expect(fixed.exitCode).toBe(0);
   });
 });
 

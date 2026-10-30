@@ -38,6 +38,8 @@ struct Case {
 enum Read {
     Channel(Case),
     Signal(AbortSignalRef),
+    /// `null` or `undefined`: never ready, like a nil channel in Go. It keeps its index.
+    Never,
 }
 
 /// What the case that won did, once the channels are unlocked.
@@ -82,18 +84,30 @@ pub(crate) fn select(
     // Not `len` at once: a sparse array's can be 2 ** 32 - 1, and its first hole throws.
     let mut read = Vec::new();
     for i in 0..len as u32 {
-        read.push(read_case(global, cases.get_index(global, i)?, i)?);
+        let case = cases.get_index(global, i)?;
+        // A hole is not an `undefined` case.
+        let hole = case.is_undefined()
+            && !cases.has_own_property_value(global, JSValue::js_number(f64::from(i)))?;
+        read.push(read_case(global, case, i, hole)?);
     }
     // A getter can have aborted it.
     if let Some(rejected) = parsed.rejected_if_aborted(global) {
         return Ok(rejected);
+    }
+    if !default && parsed.signal.is_none() && read.iter().all(|case| matches!(case, Read::Never)) {
+        return Err(validators::throw_err_invalid_arg_value(
+            global,
+            format_args!(
+                "Bun.select() whose cases are all null waits forever: pass options.signal or options.default"
+            ),
+        ));
     }
 
     let mut channels: Channels = read
         .iter()
         .filter_map(|case| match case {
             Read::Channel(case) => Some(Arc::clone(&case.channel)),
-            Read::Signal(_) => None,
+            Read::Signal(_) | Read::Never => None,
         })
         .collect();
     channels.sort_unstable_by_key(|channel| Arc::as_ptr(channel) as usize);
@@ -120,6 +134,7 @@ pub(crate) fn select(
     for &i in &order {
         let case = match &mut read[i as usize] {
             Read::Channel(case) => case,
+            Read::Never => continue,
             Read::Signal(signal) => {
                 if signal.aborted() {
                     won = Some((i, Won::Aborted));
@@ -181,7 +196,7 @@ pub(crate) fn select(
             .enumerate()
             .filter_map(|(i, case)| match case {
                 Read::Signal(signal) => Some((i as u32, signal)),
-                Read::Channel(_) => None,
+                Read::Channel(_) | Read::Never => None,
             })
             .collect();
         return Ok(wait(
@@ -225,8 +240,12 @@ pub(crate) fn select(
 }
 
 /// A receive is a channel; a send is `[channel, value]`, whose value this clones; an
-/// `AbortSignal` is ready once it aborts.
-fn read_case(global: &JSGlobalObject, case: JSValue, i: u32) -> JsResult<Read> {
+/// `AbortSignal` is ready once it aborts; `null` or `undefined` never is. `hole`: the case is a
+/// hole of a sparse array.
+fn read_case(global: &JSGlobalObject, case: JSValue, i: u32, hole: bool) -> JsResult<Read> {
+    if case.is_undefined_or_null() && !hole {
+        return Ok(Read::Never);
+    }
     if let Some(channel) = case.as_class_ref::<Channel>() {
         return Ok(Read::Channel(Case {
             channel: Arc::clone(channel.core()),
@@ -260,7 +279,7 @@ fn read_case(global: &JSGlobalObject, case: JSValue, i: u32) -> JsResult<Read> {
         .err(
             ErrorCode::INVALID_ARG_TYPE,
             format_args!(
-                "The \"cases[{i}]\" argument must be a Bun.Channel to receive from, a [Bun.Channel, value] array to send on, or an AbortSignal"
+                "The \"cases[{i}]\" argument must be a Bun.Channel to receive from, a [Bun.Channel, value] array to send on, an AbortSignal, or null"
             ),
         )
         .throw())

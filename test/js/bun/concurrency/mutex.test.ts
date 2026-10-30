@@ -182,4 +182,35 @@ describe("Bun.Mutex", () => {
     expect(mu.tryLock()).toBeUndefined();
     expect(await Bun.go((mu: Bun.Mutex) => mu.tryLock() === undefined, mu)).toBe(true);
   });
+
+  test("Bun.inspect() shows whether it is locked and how many wait, not its methods", async () => {
+    const mutex = new Bun.Mutex();
+    expect(Bun.inspect(mutex)).toBe("Mutex { locked: false, waiters: 0 }");
+    const held = mutex.tryLock()!;
+    const waiting = [mutex.lock(), mutex.lock()];
+    expect(Bun.inspect(mutex)).toBe("Mutex { locked: true, waiters: 2 }");
+    expect(Bun.inspect({ mutex })).toBe("{\n  mutex: Mutex { locked: true, waiters: 2 },\n}");
+    held.unlock();
+    (await waiting[0]).unlock();
+    (await waiting[1]).unlock();
+    expect(Bun.inspect(mutex)).toBe("Mutex { locked: false, waiters: 0 }");
+  });
+
+  test("a lock can't be sent to another thread, and the error says what to do", async () => {
+    const mutex = new Bun.Mutex();
+    using lock = mutex.tryLock()!;
+    expect(() => Bun.go((lock: unknown) => lock, lock)).toThrow(
+      "Bun.go() argument 1 is a MutexLock, which can't be sent to another thread. A lock belongs to the goroutine that took it: pass the Mutex and lock it there.",
+    );
+    const channel = new Bun.Channel(1);
+    expect(await channel.send({ lock: await Promise.resolve(lock) }).catch(e => e.message)).toBe(
+      "channel.send(): value.lock is a MutexLock, which can't be sent to another thread. A lock belongs to the goroutine that took it: pass the Mutex and lock it there.",
+    );
+    expect(() => structuredClone(lock)).toThrow(
+      "structuredClone(): value is a MutexLock, which can't be cloned. A lock belongs to the goroutine that took it: pass the Mutex and lock it there.",
+    );
+    expect(Object.prototype.toString.call(lock)).toBe("[object MutexLock]");
+    // What isn't Bun's own keeps the message of the standard.
+    expect(() => structuredClone({ fn() {} })).toThrow("The object can not be cloned.");
+  });
 });

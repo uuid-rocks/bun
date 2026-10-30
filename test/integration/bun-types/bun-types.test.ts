@@ -1118,6 +1118,39 @@ describe("@types/bun integration test", () => {
     });
   });
 
+  describe("concurrency", () => {
+    typeTest("a wrong call to Bun.go() or Bun.select() names the argument at fault", {
+      files: {
+        "go-errors.ts": [
+          `declare function stretch(text: string, rounds: number, signal: AbortSignal): Promise<string>;`,
+          `const signal = new AbortController().signal;`,
+          `Bun.go(stretch, "x", 10);`,
+          `Bun.go(stretch, "x", "10", signal);`,
+          `new Bun.WaitGroup().go(stretch, "x");`,
+          `const nums = new Bun.Channel<number>();`,
+          `Bun.select([[nums, "nope"]]);`,
+        ].join("\n"),
+      },
+      emptyInterfaces: expectedEmptyInterfacesWhenNoDOM,
+      diagnostics: diagnostics => {
+        expect(diagnostics.filter(d => d.line?.startsWith("go-errors.ts"))).toEqual([
+          { code: 2554, line: "go-errors.ts:3:5", message: "Expected 4 arguments, but got 3." },
+          {
+            code: 2345,
+            line: "go-errors.ts:4:22",
+            message: "Argument of type 'string' is not assignable to parameter of type 'number'.",
+          },
+          { code: 2554, line: "go-errors.ts:5:21", message: "Expected 4 arguments, but got 2." },
+          {
+            code: 2322,
+            line: "go-errors.ts:7:20",
+            message: "Type 'string' is not assignable to type 'number'.",
+          },
+        ]);
+      },
+    });
+  });
+
   describe("bun:bundle feature()", () => {
     typeTest("Registry augmentation restricts feature() to known flags", {
       files: {

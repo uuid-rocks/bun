@@ -216,15 +216,15 @@ pub struct ReactRefreshImportClause<'a> {
     pub(crate) r#ref: Ref,
 }
 
-/// What `Bun.go(x, ...)` names when `x` is an imported binding or
-/// `new URL("./literal", import.meta.url)`. `cjs_source_path`: a CommonJS bundle inlines
+/// What `Bun.go(x, ...)`, `go(x, ...)` or `<identifier>.go(x, ...)` names when `x` is an imported
+/// binding or `new URL("./literal", import.meta.url)`. `cjs_source_path`: a CommonJS bundle inlines
 /// `import.meta.url` as this file's URL.
 fn bun_go_task<'a>(
     call: bun_ast::StoreRef<E::Call>,
     symbols: &[js_ast::Symbol],
     cjs_source_path: Option<&[u8]>,
     arena: &'a Bump,
-) -> Option<BunGoTask<'a>> {
+) -> Option<(BunGoCallee, BunGoTask<'a>)> {
     let is_unbound_global = |target: &Expr, name: &[u8]| {
         let Some(id) = target.data.e_identifier() else {
             return false;
@@ -232,13 +232,18 @@ fn bun_go_task<'a>(
         let symbol = &symbols[id.ref_.inner_index() as usize];
         symbol.kind == js_ast::symbol::Kind::Unbound && symbol.original_name.slice() == name
     };
-    let dot = call.target.data.e_dot()?;
-    if dot.name.slice() != b"go"
-        || dot.optional_chain.is_some()
-        || !is_unbound_global(&dot.target, b"Bun")
-    {
-        return None;
-    }
+    let callee = match call.target.data {
+        js_ast::ExprData::EDot(dot) if dot.name.slice() == b"go" => {
+            if dot.optional_chain.is_none() && is_unbound_global(&dot.target, b"Bun") {
+                BunGoCallee::Bun
+            } else {
+                // Another receiver is not known to be a `Bun.WaitGroup`: its call builds as written.
+                BunGoCallee::Local(dot.target.data.e_identifier()?.ref_)
+            }
+        }
+        js_ast::ExprData::EImportIdentifier(id) => BunGoCallee::Import(id.ref_),
+        _ => return None,
+    };
     let first = call.args.slice().first().copied()?;
     let task = match first.data {
         js_ast::ExprData::EImportIdentifier(id) => BunGoTask::Import(id.ref_),
@@ -294,14 +299,51 @@ fn bun_go_task<'a>(
         }
         _ => return None,
     };
-    Some(task)
+    Some((callee, task))
 }
 
-/// A `Bun.go()` call whose first argument names a module the bundle can make an entry point of.
+/// `Some(None)` for `new Bun.WaitGroup()`, `Some(Some(X))` for `new X()` of an imported `X`.
+fn wait_group_constructor(symbols: &[js_ast::Symbol], value: Expr) -> Option<Option<Ref>> {
+    let new = value.data.e_new()?;
+    match new.target.data {
+        js_ast::ExprData::EDot(dot) if dot.name.slice() == b"WaitGroup" => {
+            let id = dot.target.data.e_identifier()?;
+            let symbol = &symbols[id.ref_.inner_index() as usize];
+            (symbol.kind == js_ast::symbol::Kind::Unbound && symbol.original_name.slice() == b"Bun")
+                .then_some(None)
+        }
+        js_ast::ExprData::EImportIdentifier(id) => Some(Some(id.ref_)),
+        _ => None,
+    }
+}
+
+/// A `.go()` call whose first argument names a module the bundle can make an entry point of.
 #[derive(Clone, Copy)]
 pub(crate) struct BunGoCall<'a> {
     pub(crate) call: bun_ast::StoreRef<E::Call>,
+    pub(crate) callee: BunGoCallee,
     pub(crate) task: BunGoTask<'a>,
+}
+
+/// What a local holds, for `P::is_wait_group`.
+#[derive(Clone, Copy)]
+pub(crate) enum BunGoBinding {
+    /// Its one initializer is `new Bun.WaitGroup()` (`None`) or `new X()` of an imported `X`.
+    WaitGroup(Option<Ref>),
+    /// Another initializer, more than one, or an assignment
+    Other,
+}
+
+/// What a `.go()` call calls.
+#[derive(Clone, Copy)]
+pub(crate) enum BunGoCallee {
+    /// `Bun.go`: the first argument is printed as its module's URL.
+    Bun,
+    /// An imported binding: `Bun.go` if it is `go` of "bun", which is known once the imports are.
+    Import(Ref),
+    /// The `go` method of a binding: a `Bun.WaitGroup`'s if `is_wait_group` says so once every
+    /// declaration and assignment has been visited. Another's call builds as written.
+    Local(Ref),
 }
 
 #[derive(Clone, Copy)]
@@ -414,6 +456,8 @@ pub struct P<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> {
     /// `Bun.go(fn)` / `Bun.go(new URL("./x", import.meta.url))` calls, made to name the entry
     /// point of fn's module once `named_imports` is complete (`register_bun_go_tasks`).
     pub(crate) bun_go_calls: Vec<BunGoCall<'a>>,
+    /// What initializes each local, and whether it is assigned (`is_wait_group`).
+    pub(crate) bun_go_bindings: bun_collections::HashMap<Ref, BunGoBinding>,
     /// User-declared locals holding an `import()` / `require()` namespace
     /// (`const ns = await import(...)`, `.then(ns => ...)`, `{...rest}`):
     /// `ns.foo` records the alias and the access is left as written.
@@ -1205,9 +1249,56 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     pub(crate) fn note_bun_go_call(&mut self, call: bun_ast::StoreRef<E::Call>) {
         let cjs_source_path = (self.options.output_format == crate::options::Format::Cjs)
             .then_some(self.source.path.text);
-        if let Some(task) = bun_go_task(call, &self.symbols, cjs_source_path, self.arena) {
-            self.bun_go_calls.push(BunGoCall { call, task });
+        if let Some((callee, task)) = bun_go_task(call, &self.symbols, cjs_source_path, self.arena)
+        {
+            self.bun_go_calls.push(BunGoCall { call, callee, task });
         }
+    }
+
+    /// Whether `ref_` is the import of `name` from "bun", under any local name.
+    fn is_import_of_bun(&self, ref_: Ref, name: &[u8]) -> bool {
+        let Some(import) = self.named_imports.get(&ref_) else {
+            return false;
+        };
+        let record = &self.import_records.items()[import.import_record_index as usize];
+        !import.alias_is_star
+            && import.alias.map(|alias| alias.slice()) == Some(name)
+            && record.path.text == b"bun"
+    }
+
+    /// Whether `binding` holds a `Bun.WaitGroup` wherever it is used: its only initializer is
+    /// `new Bun.WaitGroup()` or `new WaitGroup()` of "bun", and it is never assigned.
+    fn is_wait_group(&self, binding: Ref) -> bool {
+        // Each `var` declaration of a name is a symbol, linked to the one they share.
+        let binding = js_ast::symbol::follow_symbols(&self.symbols, binding);
+        match self.bun_go_bindings.get(&binding) {
+            Some(BunGoBinding::WaitGroup(Some(constructor))) => {
+                self.is_import_of_bun(*constructor, b"WaitGroup")
+            }
+            Some(BunGoBinding::WaitGroup(None)) => true,
+            Some(BunGoBinding::Other) | None => false,
+        }
+    }
+
+    /// Remembers what initializes a local, for `is_wait_group`. Called on each visited
+    /// declaration with a value; one without (`var group;`) keeps the value it has.
+    pub(crate) fn note_bun_go_initializer(&mut self, binding: Ref, value: Expr) {
+        let binding = js_ast::symbol::follow_symbols(&self.symbols, binding);
+        let state = match self.bun_go_bindings.get(&binding) {
+            // Initialized again (`var`)
+            Some(_) => BunGoBinding::Other,
+            None => match wait_group_constructor(&self.symbols, value) {
+                Some(constructor) => BunGoBinding::WaitGroup(constructor),
+                None => BunGoBinding::Other,
+            },
+        };
+        self.bun_go_bindings.insert(binding, state);
+    }
+
+    /// `binding` is assigned: whether it holds a `Bun.WaitGroup` depends on where it is used.
+    pub(crate) fn note_bun_go_assigned(&mut self, binding: Ref) {
+        let binding = js_ast::symbol::follow_symbols(&self.symbols, binding);
+        self.bun_go_bindings.insert(binding, BunGoBinding::Other);
     }
 
     /// Points each call `note_bun_go_call` kept at its module's entry point: an
@@ -1216,7 +1307,22 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     /// prints as that entry point's URL.
     fn register_bun_go_tasks(&mut self) {
         for i in 0..self.bun_go_calls.len() {
-            let BunGoCall { mut call, task } = self.bun_go_calls[i];
+            let BunGoCall {
+                mut call,
+                callee,
+                task,
+            } = self.bun_go_calls[i];
+            let is_bun_go = match callee {
+                BunGoCallee::Bun => true,
+                BunGoCallee::Import(ref_) => self.is_import_of_bun(ref_, b"go"),
+                BunGoCallee::Local(ref_) => self.is_wait_group(ref_),
+            };
+            if !is_bun_go {
+                continue;
+            }
+            // An imported binding may be a constant (a module's path, say), not a function: its value
+            // is what the call gets, and a function among them is registered with its URL on the way.
+            let keeps_value = matches!(task, BunGoTask::Import(_));
             let (specifier, fragment, range): (&'a [u8], &'a [u8], bun_ast::Range) = match task {
                 BunGoTask::Import(ref_) => {
                     let Some(import) = self.named_imports.get(&ref_) else {
@@ -1263,11 +1369,28 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             };
             let import_record_index =
                 self.add_import_record_by_range(ImportKind::BunGo, range, specifier);
+            self.import_records.items_mut()[import_record_index as usize]
+                .flags
+                .insert(match callee {
+                    BunGoCallee::Bun => bun_ast::ImportRecordFlags::empty(),
+                    BunGoCallee::Import(_) => bun_ast::ImportRecordFlags::BUN_GO_IMPORTED,
+                    BunGoCallee::Local(_) => bun_ast::ImportRecordFlags::BUN_GO_WAIT_GROUP,
+                });
             let original = call.args.slice()[0];
             let fragment_expr = self.new_expr(E::String::init(fragment), original.loc);
-            let args = ExprNodeList::from_arena_slice(
-                self.arena.alloc_slice_copy(&[original, fragment_expr]),
-            );
+            // A third argument: `print_bun_go_task` keeps the value.
+            let args = if keeps_value {
+                let keep = self.new_expr(E::Boolean { value: true }, original.loc);
+                ExprNodeList::from_arena_slice(self.arena.alloc_slice_copy(&[
+                    original,
+                    fragment_expr,
+                    keep,
+                ]))
+            } else {
+                ExprNodeList::from_arena_slice(
+                    self.arena.alloc_slice_copy(&[original, fragment_expr]),
+                )
+            };
             call.args.slice_mut()[0] = self.new_expr(
                 E::Call {
                     target: Expr {
@@ -6178,7 +6301,16 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
 
     #[inline]
     pub(crate) fn value_for_import_meta_main(&mut self, inverted: bool, loc: bun_ast::Loc) -> Expr {
-        if let Some(known) = self.options.import_meta_main_value {
+        // A `Bun.go` pool thread imports an entry point that exports a goroutine's function, and
+        // `import.meta.main` is `false` there.
+        let pool_may_import = self.options.bun_go_tasks
+            && self.options.is_entry_point
+            && self.esm_export_keyword.len > 0;
+        if let Some(known) = self
+            .options
+            .import_meta_main_value
+            .filter(|_| !pool_may_import)
+        {
             return Expr {
                 loc,
                 data: js_ast::ExprData::EBoolean(E::Boolean {
@@ -9920,6 +10052,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             imports_to_convert_from_dynamic_import: BumpVec::new_in(arena),
             dynamic_import_aliases: Default::default(),
             bun_go_calls: Vec::new(),
+            bun_go_bindings: Default::default(),
             dynamic_import_namespace_locals: Default::default(),
             dynamic_import_escaped_records: Default::default(),
             dynamic_import_needs_object: Default::default(),

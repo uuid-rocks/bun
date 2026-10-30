@@ -4393,7 +4393,7 @@ pub mod bv2_impl {
 
                 this.process_files_to_copy(&reachable_files)?;
 
-                this.add_bun_go_tasks_as_extra_entry_points(&reachable_files);
+                this.add_bun_go_tasks_as_extra_entry_points(&reachable_files)?;
                 this.add_server_component_boundaries_as_extra_entry_points()?;
 
                 this.clone_ast()?;
@@ -4558,7 +4558,7 @@ pub mod bv2_impl {
 
                 this.process_files_to_copy(&reachable_files)?;
 
-                this.add_bun_go_tasks_as_extra_entry_points(&reachable_files);
+                this.add_bun_go_tasks_as_extra_entry_points(&reachable_files)?;
                 this.add_server_component_boundaries_as_extra_entry_points()?;
 
                 this.clone_ast()?;
@@ -4596,11 +4596,15 @@ pub mod bv2_impl {
 
         /// Every module a reachable `Bun.go()` call names becomes an entry point, as if it were
         /// listed on the command line: its exports are kept, and the call names its output.
-        pub(crate) fn add_bun_go_tasks_as_extra_entry_points(&mut self, reachable_files: &[Index]) {
+        pub(crate) fn add_bun_go_tasks_as_extra_entry_points(
+            &mut self,
+            reachable_files: &[Index],
+        ) -> Result<(), Error> {
             let all_import_records = self.graph.ast.items_import_records();
             let loaders = self.graph.input_files.items_loader();
             let sources = self.graph.input_files.items_source();
-            let mut tasks: Vec<IndexInt> = Vec::new();
+            // The module, and the file and record of a call that names it
+            let mut tasks: Vec<(IndexInt, IndexInt, &ImportRecord)> = Vec::new();
             for source_index in reachable_files {
                 let Some(records) = all_import_records.get(source_index.get() as usize) else {
                     continue;
@@ -4610,32 +4614,65 @@ pub mod bv2_impl {
                         && record.source_index.is_valid()
                         && loaders[record.source_index.get() as usize].is_javascript_like()
                     {
-                        tasks.push(record.source_index.get());
+                        tasks.push((record.source_index.get(), source_index.get(), record));
                     }
                 }
             }
             if tasks.is_empty() {
-                return;
+                return Ok(());
             }
             // Parse order is not deterministic; output paths and chunk order must be.
-            tasks.sort_unstable_by(|a, b| {
-                sources[*a as usize]
-                    .path
-                    .text
-                    .cmp(sources[*b as usize].path.text)
+            tasks.sort_by(|a, b| {
+                (
+                    sources[a.0 as usize].path.text,
+                    sources[a.1 as usize].path.text,
+                )
+                    .cmp(&(
+                        sources[b.0 as usize].path.text,
+                        sources[b.1 as usize].path.text,
+                    ))
+                    .then(a.2.range.loc.start.cmp(&b.2.range.loc.start))
             });
-            tasks.dedup();
-            for task in tasks {
-                if !self
+            tasks.dedup_by_key(|task| task.0);
+            // `--outfile` names one file, and an entry point is another.
+            let one_output = !self.transpiler.options.supports_multiple_outputs
+                && !self.transpiler.options.compile_mode.is_executable();
+            let mut added = false;
+            for (task, importer, record) in tasks {
+                if self
                     .graph
                     .entry_points
                     .iter()
                     .any(|entry| entry.get() == task)
                 {
-                    self.graph.entry_points.push(Index::init(task));
-                    self.graph.bun_go_entry_points.push(task);
+                    continue;
                 }
+                if one_output {
+                    let _ = self.transpiler.log_mut().add_range_error_fmt(
+                        Some(&sources[importer as usize]),
+                        record.range,
+                        format_args!(
+                            "{} makes {} an entry point of the build, which then writes more than one file: build with --outdir or --compile",
+                            if record.flags.contains(bun_ast::ImportRecordFlags::BUN_GO_WAIT_GROUP) {
+                                "A WaitGroup's .go()"
+                            } else if record.flags.contains(bun_ast::ImportRecordFlags::BUN_GO_IMPORTED) {
+                                "go()"
+                            } else {
+                                "Bun.go()"
+                            },
+                            bun_core::fmt::quote(sources[task as usize].path.pretty),
+                        ),
+                    );
+                    added = true;
+                    continue;
+                }
+                self.graph.entry_points.push(Index::init(task));
+                self.graph.bun_go_entry_points.push(task);
             }
+            if added {
+                return Err(Error::BuildFailed);
+            }
+            Ok(())
         }
 
         pub(crate) fn add_server_component_boundaries_as_extra_entry_points(
@@ -5650,7 +5687,7 @@ pub mod bv2_impl {
 
             self.process_files_to_copy(&reachable_files)?;
 
-            self.add_bun_go_tasks_as_extra_entry_points(&reachable_files);
+            self.add_bun_go_tasks_as_extra_entry_points(&reachable_files)?;
             self.add_server_component_boundaries_as_extra_entry_points()?;
 
             // SAFETY: see `generate_from_cli` — repr(transparent) Index slice cast +

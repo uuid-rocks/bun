@@ -103,6 +103,11 @@ bitflags::bitflags! {
         /// `IS_UNUSED` for its own reasons (an unused TypeScript import, a macro
         /// import), and those records must never be resolved.
         const IS_BARREL_DEFERRED = 1 << 18;
+
+        /// A `BunGo` record of `go()` imported from "bun", or of a `Bun.WaitGroup`'s `go()`:
+        /// what an error about the call names. Neither is `Bun.go()`.
+        const BUN_GO_IMPORTED = 1 << 19;
+        const BUN_GO_WAIT_GROUP = 1 << 20;
     }
 }
 

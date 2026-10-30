@@ -202,6 +202,9 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
 
         // Handle assigning to a constant
         if in_.assign_target != js_ast::AssignTarget::None {
+            if p.options.bun_go_tasks {
+                p.note_bun_go_assigned(result.r#ref);
+            }
             // A write to the name of a class with lowered class decorators goes to
             // the class's own immutable binding, not to `inner_class_ref`.
             if let Some(&(inner_ref, name_ref)) = p

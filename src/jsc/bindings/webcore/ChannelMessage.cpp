@@ -16,6 +16,7 @@
 #include "ScriptExecutionContext.h"
 #include "SerializedScriptValue.h"
 #include "ZigGlobalObject.h"
+#include "BunClientData.h"
 #include <JavaScriptCore/ErrorInstance.h>
 #include <JavaScriptCore/IteratorOperations.h>
 #include <JavaScriptCore/JSMap.h>
@@ -104,6 +105,10 @@ std::optional<Bun::Uncloneable> find(JSGlobalObject* globalObject, JSValue value
         return Bun::Uncloneable { path, "a symbol"_s };
     if (!value.isObject())
         return std::nullopt;
+    if (auto marked = Bun::markedUncloneable(vm, value)) {
+        marked->path = path;
+        return marked;
+    }
     JSObject* object = asObject(value);
     if (object->isCallable()) {
         String name;
@@ -168,6 +173,30 @@ std::optional<Bun::Uncloneable> find(JSGlobalObject* globalObject, JSValue value
 
 }
 
+std::optional<Bun::Uncloneable> Bun::markedUncloneable(JSC::VM& vm, JSValue value)
+{
+    if (!value.isObject())
+        return std::nullopt;
+    JSObject* object = asObject(value);
+    JSValue hint = object->getDirect(vm, WebCore::builtinNames(vm).isUncloneablePrivateName());
+    if (!hint || !hint.isString())
+        return std::nullopt;
+    // A lock is an object literal: its own Symbol.toStringTag names it.
+    String className;
+    if (JSValue tag = object->getDirect(vm, vm.propertyNames->toStringTagSymbol); tag && tag.isString())
+        className = asString(tag)->tryGetValue();
+    if (className.isEmpty())
+        className = JSObject::calculatedClassName(object);
+    return Bun::Uncloneable { emptyString(), className.isEmpty() || className == "Object"_s ? "an object"_str : withArticle(className), asString(hint)->tryGetValue() };
+}
+
+String Bun::hintSentence(const String& hint)
+{
+    if (hint.isEmpty())
+        return emptyString();
+    return makeString(' ', toASCIIUpper(hint[0]), StringView(hint).substring(1), '.');
+}
+
 std::optional<Bun::Uncloneable> Bun::findUncloneable(JSGlobalObject* globalObject, JSValue value)
 {
     HashSet<JSObject*> seen;
@@ -197,7 +226,7 @@ extern "C" MessageWithMessagePorts* Bun__ChannelMessage__createFor(JSGlobalObjec
     String where = site ? "Bun.select()"_s : "channel.send()"_s;
     String root = site ? makeString("cases["_s, index, "][1]"_s) : "value"_str;
     String text = found
-        ? makeString(where, ": "_s, root, found->path, " is "_s, found->what, ", which can't be sent to another thread."_s)
+        ? makeString(where, ": "_s, root, found->path, " is "_s, found->what, ", which can't be sent to another thread."_s, Bun::hintSentence(found->hint))
         : makeString(where, ": "_s, root, " can't be sent to another thread: "_s, original);
     throwException(globalObject, scope, createDOMException(globalObject, ExceptionCode::DataCloneError, text));
     return nullptr;

@@ -56,8 +56,20 @@ type NumberReceived = { index: 0; value: number; closed: false } | { index: 0; v
   expectType(await Bun.select([ch], { default: maybe })).is<NumberReceived | Bun.SelectDefault>();
 }
 
+// null turns a case off: it is never the result.
+{
+  const off = await Bun.select([ch, null, strings]);
+  expectType(off.index).is<0 | 2>();
+  const maybe: Bun.Channel<number> | null = Math.random() > 0.5 ? ch : null;
+  expectType((await Bun.select([maybe, undefined])).index).is<0>();
+}
 // @ts-expect-error - the value must be a T of its channel
 Bun.select([[strings, 1]]);
+// A channel is invariant: a Channel<string> takes only strings, so it is not a Channel<unknown>.
+// @ts-expect-error - a Channel<string> is not a Channel<unknown>
+const anything: Bun.Channel<unknown> = strings;
+// @ts-expect-error - nor a Channel<"a">
+const narrow: Bun.Channel<"a"> = strings;
 // @ts-expect-error - a case is a channel or [channel, value]
 Bun.select([1]);
 // @ts-expect-error - send cases take no transfer list
@@ -92,7 +104,7 @@ Bun.select([[ch, 1, { transfer: [] }]]);
   expectType(group.signal).is<AbortSignal>();
   expectType(group.go((a: number, b: string) => a + b.length, 1, "x")).is<Bun.Goroutine<number>>();
   expectType(group.go(async (signal: AbortSignal) => signal.aborted, group.signal)).is<Bun.Goroutine<boolean>>();
-  expectType(group.go<string>("./task.ts", 1)).is<Bun.Goroutine<string>>();
+  expectType(group.go<(n: number) => string>("./task.ts", 1)).is<Bun.Goroutine<string>>();
   expectType(group.wait()).is<Promise<void>>();
   // @ts-expect-error - the arguments must fit the function
   group.go((a: number) => a, "not a number");

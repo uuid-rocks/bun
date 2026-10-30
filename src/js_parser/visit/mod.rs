@@ -733,6 +733,11 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                 } else {
                     self.vis_scope().is_after_const_local_prefix = true;
                 }
+                if self.options.bun_go_tasks
+                    && let Some(value) = decl.value
+                {
+                    self.note_bun_go_initializer(id_ref, value);
+                }
                 // SAFETY: original_name is arena-owned, valid for 'a.
                 let original_name: &'a [u8] = self.symbols[id_ref.inner_index() as usize]
                     .original_name

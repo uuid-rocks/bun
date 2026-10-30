@@ -2661,16 +2661,19 @@ pub(crate) mod __gated_printer {
         }
 
         #[inline]
-        /// The function given to `Bun.go()` (`E::Special::BunGoTask`): the URL of its module's
-        /// entry chunk with the export as the fragment, or the expression as written when the
-        /// module is not part of the bundle.
+        /// What names the function given to `Bun.go()` (`E::Special::BunGoTask`): the URL of its
+        /// module's entry chunk with the export as the fragment, or the expression as written when
+        /// the module is not part of the bundle. An imported binding (a third argument) keeps its
+        /// value, a function among them registered with that URL on the way.
         fn print_bun_go_task(&mut self, call: &E::Call, level: Level, flags: ExprFlagSet) {
             let ExprData::ESpecial(E::Special::BunGoTask(import_record_index)) = call.target.data
             else {
                 unreachable!()
             };
-            let [original, fragment] = call.args.slice() else {
-                unreachable!()
+            let (original, fragment, keeps_value) = match call.args.slice() {
+                [original, fragment] => (original, fragment, false),
+                [original, fragment, _] => (original, fragment, true),
+                _ => unreachable!(),
             };
             let record = self.import_record(import_record_index as usize);
             if !record
@@ -2687,6 +2690,13 @@ pub(crate) mod __gated_printer {
             href.extend_from_slice(fragment);
             self.print_space_before_identifier();
             self.add_source_mapping(original.loc);
+            if keeps_value {
+                // internal/go/spawn's `bundledTask`
+                self.print(b"globalThis.Bun.go[globalThis.Symbol.for(\"Bun.go.task\")](");
+                self.print_expr(*original, Level::Comma, ExprFlag::none());
+                self.print(b",");
+                self.print_space();
+            }
             // Another file's top-level `URL` can share the chunk's scope.
             self.print(b"new globalThis.URL(");
             self.print_string_literal_utf8(&href, true);
@@ -2698,6 +2708,9 @@ pub(crate) mod __gated_printer {
                 self.print(b"Bun.pathToFileURL(__filename)");
             }
             self.print(b")");
+            if keeps_value {
+                self.print(b")");
+            }
         }
 
         pub(crate) fn import_record(&self, import_record_index: usize) -> &'a ImportRecord<'a> {
