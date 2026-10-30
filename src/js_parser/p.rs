@@ -1204,7 +1204,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     /// `new URL("./literal", import.meta.url)`. Called on the visited call.
     pub(crate) fn note_bun_go_call(&mut self, call: bun_ast::StoreRef<E::Call>) {
         let cjs_source_path = (self.options.output_format == crate::options::Format::Cjs)
-            .then(|| self.source.path.text);
+            .then_some(self.source.path.text);
         if let Some(task) = bun_go_task(call, &self.symbols, cjs_source_path, self.arena) {
             self.bun_go_calls.push(BunGoCall { call, task });
         }
