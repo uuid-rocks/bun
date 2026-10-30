@@ -149,7 +149,7 @@ jobs:
         run: |
           mapfile -t filters < <(grep -Ev '^[[:space:]]*(#|$)' .github/ci-tests.txt)
           printf 'filter: %s\n' "${filters[@]}"
-          node scripts/runner.node.ts --exec-path="$PWD/build/debug/bun-debug" "${filters[@]}"
+          node scripts/runner.node.ts --vendor=false --exec-path="$PWD/build/debug/bun-debug" "${filters[@]}"
 
       - name: Disk usage
         if: always()
