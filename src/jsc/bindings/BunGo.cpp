@@ -80,6 +80,7 @@ enum class FunctionTextKind : uint8_t {
     Arrow = 2,
     Class = 3,
 };
+extern "C" bool Bun__Go__readsWhetherMain(const uint8_t* text, size_t length);
 extern "C" bool Bun__Go__functionNames(const char8_t* text, size_t length, void* context, void (*onName)(void*, const uint8_t* name, size_t length, NamePosition), FunctionNames* out);
 
 namespace Bun::Go {
@@ -894,20 +895,20 @@ JSC_DEFINE_HOST_FUNCTION(jsGoOwnedByThisThread, (JSGlobalObject * lexicalGlobalO
     return JSValue::encode(jsUndefined());
 }
 
-// readsMain(fn): whether the source of the module that defines `fn` reads whether it is the entry
-// point (`import.meta.main`, `require.main`, `Bun.main`), as the top-level code of an entry point
-// that exports a goroutine's function has to, to run only on the main thread.
+// readsMain(fn): whether the module that defines `fn` reads whether it is the entry point or runs
+// on the main thread (`import.meta.main`, `require.main`, `Bun.main`, `Bun.isMainThread`,
+// `isMainThread`), as the top-level code of an entry point that exports a goroutine's function has
+// to, to run only on the main thread.
 JSC_DEFINE_HOST_FUNCTION(jsGoReadsMain, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
     auto* function = dynamicDowncast<JSFunction>(callFrame->argument(0));
     if (!function || function->isHostOrBuiltinFunction())
-        return JSValue::encode(jsBoolean(false));
+        return JSValue::encode(jsBoolean(true));
     auto* provider = function->jsExecutable()->source().provider();
     if (!provider)
-        return JSValue::encode(jsBoolean(false));
-    StringView source = provider->source();
-    bool reads = source.contains("import.meta.main"_s) || source.contains("require.main"_s) || source.contains("Bun.main"_s);
-    return JSValue::encode(jsBoolean(reads));
+        return JSValue::encode(jsBoolean(true));
+    auto text = provider->source().utf8();
+    return JSValue::encode(jsBoolean(Bun__Go__readsWhetherMain(reinterpret_cast<const uint8_t*>(text.data()), text.length())));
 }
 
 // evaluating(module): whether this thread has started to evaluate the ES module `module` (a module

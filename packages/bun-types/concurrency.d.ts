@@ -130,7 +130,8 @@ declare module "bun" {
    * - a function that a module exports (ES module or CommonJS). Each pool thread imports that module once, and calls
    *   the export. Module state is per thread, and `import.meta.main` is `false` there. Bun prefers this when the
    *   function is exported, and it is the way for code that uses its module's imports. An entry point that exports
-   *   it must keep its top-level code inside `if (import.meta.main)`, or `go()` throws `ERR_GOROUTINE_NOT_SENDABLE`.
+   *   it must keep its top-level code inside `if (import.meta.main)` (or `if (Bun.isMainThread)`), or `go()` throws
+   *   `ERR_GOROUTINE_NOT_SENDABLE`.
    * - a module ({@link GoModule}), whose default export, or the export its URL's fragment names, runs.
    *
    * A bound or native function throws `ERR_GOROUTINE_NOT_SENDABLE`. So does a function no module exports while
@@ -327,7 +328,8 @@ declare module "bun" {
      * @param options.limit How many of its goroutines run at once, like errgroup's `SetLimit`: an integer from `1`,
      * or `Infinity` (the default). {@link go} still returns at once; a goroutine past the limit waits for one to
      * settle before it starts. Its arguments are cloned when it starts. Once {@link signal} has aborted, a goroutine
-     * that waits rejects with `signal.reason` and never starts.
+     * that waits rejects with `signal.reason` and never starts, unless disposal aborted it: disposal drops nothing,
+     * and what waits starts with the aborted signal.
      */
     constructor(options?: { signal?: AbortSignal; limit?: number });
 

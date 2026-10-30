@@ -313,6 +313,29 @@ describe("Bun.WaitGroup", () => {
       parent.abort();
     });
 
+    test("await using drops nothing: what waits for a slot starts, with the aborted signal", async () => {
+      const ran = new Int32Array(new SharedArrayBuffer(4 * 10));
+      const aborted = new Int32Array(new SharedArrayBuffer(4 * 10));
+      {
+        await using group = new Bun.WaitGroup({ limit: 3 });
+        for (let i = 0; i < 10; i++) {
+          group.go(
+            (ran: Int32Array, aborted: Int32Array, i: number, signal: AbortSignal) => {
+              Atomics.store(ran, i, 1);
+              Atomics.store(aborted, i, signal.aborted ? 1 : 0);
+            },
+            ran,
+            aborted,
+            i,
+            group.signal,
+          );
+        }
+      }
+      expect(Array.from(ran)).toEqual(Array(10).fill(1));
+      // The last ones started after disposal aborted the signal.
+      expect(aborted[9]).toBe(1);
+    });
+
     test("a goroutine that waits for a slot throws from go() at once if it can't start", () => {
       const group = new Bun.WaitGroup({ limit: 1 });
       const gate = new Bun.Channel<void>(1);

@@ -680,15 +680,18 @@ class WaitGroup {
     if (this.#active.delete(goroutine)) this.#next();
   }
 
-  // Starts what waits for a slot. Once the group's signal has aborted, what waits rejects with its reason
-  // instead of starting.
+  // Starts what waits for a slot. Once a failure or the caller has aborted the group's signal, what waits rejects
+  // with its reason instead of starting. Disposal drops nothing: what waits starts as slots free, and sees the
+  // aborted signal, as it would have without a limit.
   #next() {
     const queue = this.#queue;
-    while (this.#queueHead < queue.length && (this.#active.size < this.#limit || this.#signal.aborted)) {
+    const signal = this.#signal;
+    const cancelled = signal.aborted && (this.#disposal === undefined || signal.reason !== this.#disposal);
+    while (this.#queueHead < queue.length && (this.#active.size < this.#limit || cancelled)) {
       const { goroutine, task, target, args } = queue[this.#queueHead];
       queue[this.#queueHead++] = undefined!;
-      if (this.#signal.aborted) {
-        Goroutine.fail(goroutine, this.#signal.reason);
+      if (cancelled) {
+        Goroutine.fail(goroutine, signal.reason);
         continue;
       }
       try {

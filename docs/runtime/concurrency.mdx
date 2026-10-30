@@ -68,7 +68,7 @@ if (import.meta.main) {
 }
 ```
 
-Without the guard, each pool thread would run the program's top-level code again. `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` instead when the entry point exports the function and never reads `import.meta.main`.
+Without the guard, each pool thread would run the program's top-level code again. `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` instead when the entry point exports the function and never checks `import.meta.main`, `Bun.isMainThread` or `isMainThread` of `node:worker_threads`.
 
 A goroutine can start goroutines of its own function, too, when it can name it: an exported function, or a named function expression such as `Bun.go(async function fib(n) { ... Bun.go(fib, n - 1) ... }, 20)`. An arrow function stored in a `const`, or a function declared at the top of the entry point, is a variable of the code around it on the other thread: export it from a module instead.
 

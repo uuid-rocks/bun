@@ -417,6 +417,35 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
+  test("Bun.isMainThread guards an entry point too, and a string that names a guard is not one", async () => {
+    const guarded = await run({
+      "main.ts": `
+        export function work(x: number) {
+          return x * 2;
+        }
+        if (Bun.isMainThread) console.log(await Bun.go(work, 4));
+      `,
+    });
+    expect(guarded.stdout).toBe("8");
+    expect(guarded.exitCode).toBe(0);
+    const unguarded = await run({
+      "main.ts": `
+        // import.meta.main
+        const text = "Bun.main, require.main";
+        export function work(x: number) {
+          return x * 2;
+        }
+        try {
+          Bun.go(work, 4);
+        } catch (error) {
+          console.log(error.code);
+        }
+      `,
+    });
+    expect(unguarded.stdout).toBe("ERR_GOROUTINE_NOT_SENDABLE");
+    expect(unguarded.exitCode).toBe(0);
+  });
+
   test("process.exit() in a goroutine exits the process with its code", async () => {
     const { stdout, exitCode } = await run({
       "main.ts": `

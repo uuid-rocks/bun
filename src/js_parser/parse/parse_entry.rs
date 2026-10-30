@@ -170,6 +170,89 @@ pub fn function_free_names(text: &[u8]) -> Option<FunctionFreeNames> {
     parser.free_names_of_function().ok()
 }
 
+/// Whether module `text` reads whether it runs as the entry point, or on the main thread:
+/// `import.meta.main`, `require.main`, `Bun.main`, `Bun.isMainThread`, or `isMainThread` (of
+/// `node:worker_threads`). Strings, comments, templates and regular expressions don't count.
+/// Returns `None` if the text can't be scanned.
+pub fn reads_whether_main(text: &[u8]) -> Option<bool> {
+    use js_lexer::T;
+    let arena = bun_alloc::Arena::new();
+    let source = bun_ast::Source::init_path_string(&b"module.js"[..], text);
+    let mut log = bun_ast::Log::init();
+    let mut lexer = js_lexer::Lexer::init_without_reading(&mut log, &source, &arena);
+    lexer.step();
+    lexer.next().ok()?;
+    // The words of the tokens before this one, newest first: a name, "." or "".
+    let mut before: [&[u8]; 4] = [b""; 4];
+    let mut previous = T::TEndOfFile;
+    // The brace depth at each `${` of the templates the scan is inside.
+    let mut templates: Vec<u32> = Vec::new();
+    let mut braces: u32 = 0;
+    loop {
+        let token = lexer.token;
+        let word: &[u8] = match token {
+            T::TEndOfFile => return Some(false),
+            T::TIdentifier => lexer.identifier,
+            T::TImport => b"import",
+            T::TDot => b".",
+            _ => b"",
+        };
+        if token == T::TIdentifier {
+            let member_of = |object: &[u8]| before[0] == b"." && before[1] == object;
+            let reads = match word {
+                b"main" => {
+                    member_of(b"require")
+                        || member_of(b"Bun")
+                        || (member_of(b"meta") && before[2] == b"." && before[3] == b"import")
+                }
+                b"isMainThread" => before[0] != b"." || member_of(b"Bun"),
+                _ => false,
+            };
+            if reads {
+                return Some(true);
+            }
+        }
+        before = [word, before[0], before[1], before[2]];
+        match token {
+            T::TTemplateHead => templates.push(braces),
+            T::TOpenBrace => braces += 1,
+            T::TCloseBrace if templates.last() == Some(&braces) => {
+                lexer.rescan_close_brace_as_template_token().ok()?;
+                if lexer.token == T::TTemplateTail {
+                    templates.pop();
+                }
+            }
+            T::TCloseBrace => braces = braces.saturating_sub(1),
+            // A `/` where an expression starts begins a regular expression.
+            T::TSlash | T::TSlashEquals
+                if !matches!(
+                    previous,
+                    T::TIdentifier
+                        | T::TNumericLiteral
+                        | T::TStringLiteral
+                        | T::TBigIntegerLiteral
+                        | T::TNoSubstitutionTemplateLiteral
+                        | T::TTemplateTail
+                        | T::TPrivateIdentifier
+                        | T::TCloseParen
+                        | T::TCloseBracket
+                        | T::TCloseBrace
+                        | T::TThis
+                        | T::TSuper
+                        | T::TNull
+                        | T::TTrue
+                        | T::TFalse
+                ) =>
+            {
+                lexer.scan_reg_exp().ok()?;
+            }
+            _ => {}
+        }
+        previous = lexer.token;
+        lexer.next().ok()?;
+    }
+}
+
 pub struct Parser<'a> {
     pub(crate) options: Options<'a>,
     pub(crate) lexer: js_lexer::Lexer<'a>,

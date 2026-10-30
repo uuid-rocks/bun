@@ -121,7 +121,7 @@ const count = await Bun.go(new URL("./primes.ts#countPrimes", import.meta.url), 
 
 A module that a goroutine imports runs once on each pool thread. Its top-level variables belong to that thread, like thread-local storage. In a pool thread, `Bun.isMainThread` and `import.meta.main` are `false`.
 
-A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine, so put its top-level work inside `if (import.meta.main)`. An entry point that never reads `import.meta.main` would run its top-level code again on each pool thread, and call `Bun.go(double)` there again. So `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` on the main thread instead, before any pool thread imports it:
+A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine, so put its top-level work inside `if (import.meta.main)`. An entry point that never checks `import.meta.main`, `Bun.isMainThread` or `isMainThread` of `node:worker_threads` would run its top-level code again on each pool thread, and call `Bun.go(double)` there again. So `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` on the main thread instead, before any pool thread imports it:
 
 ```ts main.ts icon="/icons/typescript.svg"
 export function double(n: number) {
@@ -193,7 +193,7 @@ await group.wait(); // the first error, once the other fetches were aborted and 
 ```
 
 - `new Bun.WaitGroup({ signal })` aborts `group.signal` when `signal` aborts too, so the caller can cancel the whole group.
-- `await using` aborts `group.signal` and waits for every goroutine at the end of the scope, so none outlives it, even when the code in the scope throws. An error that `wait()` did not throw is thrown then.
+- `await using` aborts `group.signal` and waits for every goroutine at the end of the scope, so none outlives it, even when the code in the scope throws. An error that `wait()` did not throw is thrown then. To let the goroutines finish their work rather than cancel it, `await group.wait()` before the scope ends.
 - A goroutine the group started never causes an unhandled rejection: its error is the group's. `group.go()` returns the goroutine, which you can still await for its result.
 - There is no `add()` or `done()`: `group.go()` counts a goroutine when it starts it, so the count can't go wrong.
 - A goroutine that rejects with the reason of `group.signal`, or of any `AbortSignal` among its arguments, rejects with that reason itself, not a copy. So `error === group.signal.reason` tells a cancellation from a failure, and `wait()` rejects with the caller's own reason when `options.signal` cancelled the group.
@@ -209,7 +209,7 @@ const pages = urls.map(url => group.go(fetchPage, url, group.signal)); // 4 fetc
 console.log(await Promise.all(pages));
 ```
 
-`go()` does not wait for a slot, so a loop that starts a million goroutines holds a million waiting ones: start them in batches, or from a channel, when there are that many. A waiting goroutine's arguments are cloned when it starts. `go()` still throws at once when a function can't run on another thread, or an argument can't be cloned. Once `group.signal` has aborted, a goroutine that waits rejects with `signal.reason` and never starts: the error of the goroutine that failed, the caller's reason, or the group's disposal. So `error === group.signal.reason` tells a goroutine that was cancelled from one that failed.
+`go()` does not wait for a slot, so a loop that starts a million goroutines holds a million waiting ones: start them in batches, or from a channel, when there are that many. A waiting goroutine's arguments are cloned when it starts. `go()` still throws at once when a function can't run on another thread, or an argument can't be cloned. Once a failure or the caller has aborted `group.signal`, a goroutine that waits rejects with `signal.reason` and never starts: the error of the goroutine that failed, or the caller's reason. So `error === group.signal.reason` tells a goroutine that was cancelled from one that failed. Disposal drops nothing: a goroutine that waits when the scope ends still starts as a slot frees, and sees the aborted signal, as it would have without a limit.
 
 Goroutines that started other goroutines can wait for them too: a goroutine can call `Bun.go()`.
 
