@@ -258,7 +258,8 @@ console.log(balance[0]); // => 4000
 ```
 
 - `await mu.lock()` resolves with a lock once this thread holds the mutex. `using` unlocks it at the end of the scope, even when the scope throws; `lock.unlock()` unlocks it sooner. Only the first unlock does anything: a second is not an error, as it is in Go.
-- Waiting for a lock does not block the thread: the thread runs other goroutines meanwhile. Waiters get the lock in the order they asked for it.
+- Waiting for a lock does not block the thread: the thread runs other goroutines meanwhile.
+- As in Go, an unlocked mutex goes to whoever locks it first, so a thread that unlocks and locks again in a loop keeps it without waiting for another thread to wake up. Fairness is not strict: a waiter that has waited for more than a millisecond is handed the lock next.
 - `mu.tryLock()` returns the lock if the mutex is free, or `undefined`. `using lock = mu.tryLock()` works either way.
 - `mu.lock({ signal })` stops waiting when the signal aborts, and rejects with its reason. A loop such as `for (;;) { using _ = await mu.lock({ signal }); }` on a mutex no other thread holds never gives the event loop a turn, so a `setTimeout()` that would abort the signal never runs. That is ordinary microtask starvation: make the loop yield, as with `await Bun.sleep(0)`, or abort from another thread.
 - A mutex is shared, not copied: pass it to `Bun.go()`, send it through a channel or post it to a `Worker`, and every thread locks the same mutex.

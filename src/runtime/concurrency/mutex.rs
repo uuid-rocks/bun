@@ -3,14 +3,22 @@
 //! Like a channel, the lock is native and shared: a structured clone of a `Bun.Mutex` holds an
 //! `Arc` of the same [`MutexCore`]. A `lock()` that has to wait is a [`Waiter`] in the mutex's queue
 //! and a channel operation in its VM's table, and is settled, aborted and torn down the same way.
-//! Unlocking hands the lock straight to the oldest waiter that can still take it, so the lock
-//! never looks free while anyone waits, and waiters take it in the order they came. A handoff
-//! whose waiter is gone by the time it arrives ([`Handoff`] dropped unsettled) unlocks again, and
-//! so does a thread that ends holding a lock ([`Held`]), the way a process that exits releases its
-//! file locks.
+//!
+//! Go's two modes. Normally unlocking frees the lock and wakes the oldest waiter to try for it
+//! again ([`Wakeup`]), and a `lock()` that finds it free takes it: a thread that unlocks and locks
+//! again keeps the lock without waiting for another thread to wake up. One waiter is woken at a
+//! time. A woken waiter that finds the lock taken goes back to the head of the queue. Once one has
+//! waited over [`STARVING_AFTER`], the mutex starves: unlocking hands the lock straight to the
+//! oldest waiter ([`Handoff`]), which never looks free while anyone waits, until a waiter takes it
+//! that waited less than that, or the last one does.
+//!
+//! A wakeup or handoff whose waiter is gone by the time it arrives (dropped unsettled) is passed on
+//! to the next waiter or unlocks again, and a thread that ends holding a lock ([`Held`]) unlocks
+//! it, the way a process that exits releases its file locks.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bun_collections::smallvec::SmallVec;
 use bun_jsc::bindgen::{JsLocal, JsPayload as _, JsScope};
@@ -19,6 +27,9 @@ use bun_threading::Guarded;
 
 use super::channel::{OpKind, Options, Waiter, WakeResult, new_waiter, ops, wait_for};
 
+/// Go's `starvationThresholdNs`.
+const STARVING_AFTER: Duration = Duration::from_millis(1);
+
 pub(crate) struct MutexCore {
     state: Guarded<State>,
 }
@@ -26,8 +37,47 @@ pub(crate) struct MutexCore {
 #[derive(Default)]
 struct State {
     locked: bool,
-    /// Oldest first. Entries of waiters that were cancelled stay until their VM forgets them.
-    waiters: VecDeque<Arc<Waiter>>,
+    /// Oldest first, with when each started to wait. Entries of waiters that were cancelled stay
+    /// until their VM forgets them.
+    waiters: VecDeque<(Arc<Waiter>, Instant)>,
+    /// A [`Wakeup`] is on its way.
+    woken: bool,
+    /// Unlocking hands the lock to the oldest waiter.
+    starving: bool,
+}
+
+impl State {
+    /// The oldest waiter that can still be fired, fired.
+    fn pop_waiter(&mut self) -> Option<(Arc<Waiter>, Instant)> {
+        while let Some((waiter, since)) = self.waiters.pop_front() {
+            if waiter.fire() {
+                return Some((waiter, since));
+            }
+        }
+        None
+    }
+}
+
+/// A waiter woken to try for the lock again, on its way to the waiter's VM. Wakes the next one if
+/// it is dropped before the waiter's VM tries.
+pub(super) struct Wakeup {
+    mutex: Option<Arc<MutexCore>>,
+    since: Instant,
+}
+
+impl Drop for Wakeup {
+    fn drop(&mut self) {
+        if let Some(mutex) = self.mutex.take() {
+            let next = {
+                let mut state = mutex.state.lock();
+                state.woken = false;
+                mutex.next_to_wake(&mut state)
+            };
+            if let Some(next) = next {
+                mutex.wake(next);
+            }
+        }
+    }
 }
 
 /// The lock, on its way to the waiter it was handed to. Unlocks if it is dropped before the
@@ -37,9 +87,12 @@ pub(super) struct Handoff(Option<Arc<MutexCore>>);
 impl Handoff {
     /// The waiter's VM holds the lock now.
     pub(super) fn keep(mut self) {
-        held()
-            .0
-            .push(self.0.take().expect("a handoff is kept once"));
+        Self::kept(self.0.take().expect("a handoff is kept once"));
+    }
+
+    /// This VM holds `mutex` now.
+    pub(super) fn kept(mutex: Arc<MutexCore>) {
+        held().0.push(mutex);
     }
 }
 
@@ -85,28 +138,68 @@ impl MutexCore {
             return None;
         }
         let waiter = waiter();
-        state.waiters.push_back(Arc::clone(&waiter));
+        state.waiters.push_back((Arc::clone(&waiter), Instant::now()));
         Some(waiter)
     }
 
     fn unlock(self: &Arc<Self>) {
-        let next = {
-            let mut state = self.state.lock();
-            debug_assert!(state.locked, "only a holder unlocks");
-            loop {
-                match state.waiters.pop_front() {
-                    Some(waiter) if waiter.fire() => break Some(waiter),
-                    Some(_) => {}
-                    None => {
-                        state.locked = false;
-                        break None;
-                    }
+        let mut state = self.state.lock();
+        debug_assert!(state.locked, "only a holder unlocks");
+        if state.starving {
+            if let Some((waiter, since)) = state.pop_waiter() {
+                if since.elapsed() < STARVING_AFTER || state.waiters.is_empty() {
+                    state.starving = false;
                 }
+                drop(state);
+                waiter.wake(0, WakeResult::Acquired(Handoff(Some(Arc::clone(self)))));
+                return;
             }
-        };
-        if let Some(waiter) = next {
-            waiter.wake(0, WakeResult::Acquired(Handoff(Some(Arc::clone(self)))));
+            state.starving = false;
         }
+        state.locked = false;
+        let next = self.next_to_wake(&mut state);
+        drop(state);
+        if let Some(next) = next {
+            self.wake(next);
+        }
+    }
+
+    /// The waiter to wake now that the lock may be free, if none is on its way.
+    fn next_to_wake(&self, state: &mut State) -> Option<(Arc<Waiter>, Instant)> {
+        if state.woken || state.locked {
+            return None;
+        }
+        let next = state.pop_waiter()?;
+        state.woken = true;
+        Some(next)
+    }
+
+    /// Nothing locked.
+    fn wake(self: &Arc<Self>, (waiter, since): (Arc<Waiter>, Instant)) {
+        let wakeup = Wakeup {
+            mutex: Some(Arc::clone(self)),
+            since,
+        };
+        waiter.wake(0, WakeResult::Retry(wakeup));
+    }
+
+    /// The waiter `wakeup` woke tries for the lock: true if it took it, else it is queued again,
+    /// first. JS thread of the waiter's VM.
+    pub(super) fn retry(&self, mut wakeup: Wakeup, waiter: &Arc<Waiter>) -> bool {
+        // Not passed on: this waiter is the one that tries.
+        wakeup.mutex = None;
+        let mut state = self.state.lock();
+        state.woken = false;
+        if !state.locked {
+            state.locked = true;
+            return true;
+        }
+        if wakeup.since.elapsed() >= STARVING_AFTER {
+            state.starving = true;
+        }
+        waiter.rearm();
+        state.waiters.push_front((Arc::clone(waiter), wakeup.since));
+        false
     }
 
     /// Takes the entry of a waiter that fired or was cancelled out of the queue.
@@ -114,7 +207,7 @@ impl MutexCore {
         self.state
             .lock()
             .waiters
-            .retain(|queued| !Arc::ptr_eq(queued, waiter));
+            .retain(|(queued, _)| !Arc::ptr_eq(queued, waiter));
     }
 }
 

@@ -375,7 +375,11 @@ declare module "bun" {
    * promise, and the thread runs other goroutines meanwhile.
    *
    * A mutex is shared, not copied, like a {@link Channel}: pass it to {@link go}, send it through a channel or post
-   * it to a `Worker`, and every thread locks the same mutex. Waiters get the lock in the order they asked for it.
+   * it to a `Worker`, and every thread locks the same mutex.
+   *
+   * Like Go's, it favors throughput over strict order: an unlocked mutex goes to whoever locks it first, so a thread
+   * that unlocks and locks again can keep it. A waiter that has waited for more than a millisecond is handed the lock
+   * ahead of everyone else.
    *
    * A waiting `lock()` does not keep the process alive.
    *

@@ -28,6 +28,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::mem::ManuallyDrop;
+use core::ptr::NonNull;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
@@ -45,7 +46,7 @@ use bun_threading::Guarded;
 
 use super::graph;
 use super::message::{ChannelMessage, CloneSite};
-use super::mutex::{Handoff, MutexCore};
+use super::mutex::{Handoff, MutexCore, Wakeup};
 use super::ops::OpTable;
 use crate::node::util::validators;
 
@@ -240,6 +241,12 @@ impl Waiter {
             .is_ok()
     }
 
+    /// A waiter that [fired](Self::fire) for a [`Wakeup`] waits again. JS thread of its VM, which
+    /// queues it again under the lock of what it waits for.
+    pub(super) fn rearm(&self) {
+        self.state.store(WAITING, Ordering::Release);
+    }
+
     /// Wins the waiter for its own VM, which drops it. JS thread of that VM.
     fn cancel(&self) -> bool {
         self.state
@@ -282,6 +289,8 @@ pub(super) enum WakeResult {
     Closed,
     /// A `Bun.Mutex` was handed to the waiter.
     Acquired(Handoff),
+    /// A `Bun.Mutex` may be free: the waiter tries for it again.
+    Retry(Wakeup),
 }
 
 /// A value handed to a receiver, on its way to the receiver's VM. Given back to its channel if it
@@ -340,6 +349,12 @@ impl ChannelWake {
             // its context stops, and a value goes back to its channel.
             return Ok(());
         }
+        if let WakeResult::Retry(wakeup) = wake.result {
+            return match ops().get(wake.op_id) {
+                Some(op) => ChannelOp::retry(op, global, wakeup),
+                None => Ok(()),
+            };
+        }
         match ops().remove(wake.op_id) {
             Some(mut op) => op.settle(global, wake.case, wake.result),
             None => Ok(()),
@@ -371,8 +386,9 @@ pub(crate) struct ChannelOp {
     channels: OpChannels,
     /// A select's `AbortSignal` cases, which it follows while it waits.
     signal_cases: Box<[SignalCase]>,
-    /// The mutex a `lock()` waits for.
-    mutex: Option<Arc<MutexCore>>,
+    /// The mutex a `lock()` waits for, and the signal that aborts it: a lock woken to try again
+    /// whose signal aborted meanwhile rejects, as the signal could not cancel it.
+    mutex: Option<(Arc<MutexCore>, Option<AbortSignalRef>)>,
     /// Where module code waits: no async function's frame shows a top-level `await`.
     top_level: Option<(bun_core::String, u32, u32)>,
 }
@@ -486,8 +502,37 @@ impl ChannelOp {
         for channel in &self.channels.0 {
             channel.forget(&self.waiter);
         }
-        if let Some(mutex) = &self.mutex {
+        if let Some((mutex, _)) = &self.mutex {
             mutex.forget(&self.waiter);
+        }
+    }
+
+    /// A `lock()` woken to try for its mutex again.
+    fn retry(op: NonNull<ChannelOp>, global: &JSGlobalObject, wakeup: Wakeup) -> JsResult<()> {
+        // SAFETY: in the table, so live; nothing below runs script until it leaves.
+        let this = unsafe { op.as_ref() };
+        let (mutex, signal) = this.mutex.as_ref().expect("only a lock is woken to retry");
+        let mutex = Arc::clone(mutex);
+        let aborted = signal
+            .as_ref()
+            .filter(|signal| signal.aborted())
+            .map(|signal| signal.js_reason(global));
+        match aborted {
+            // The next waiter tries instead.
+            Some(_) => drop(wakeup),
+            None if mutex.retry(wakeup, &this.waiter) => {}
+            None => return Ok(()),
+        }
+        let mut op = ops()
+            .remove(this.id)
+            .expect("an operation is in the table until it settles");
+        op.abort_handle.disarm();
+        match aborted {
+            Some(reason) => op.promise.reject(global, Ok(reason)),
+            None => {
+                Handoff::kept(mutex);
+                op.promise.settle(global, Ok(JSValue::UNDEFINED))
+            }
         }
     }
 
@@ -518,7 +563,9 @@ impl ChannelOp {
                     JSValue::UNDEFINED,
                     true,
                 )),
-                WakeResult::Acquired(_) => unreachable!("only a lock is handed a mutex"),
+                WakeResult::Acquired(_) | WakeResult::Retry(_) => {
+                    unreachable!("only a lock is handed a mutex")
+                }
             };
             return promise.settle(global, value);
         }
@@ -544,8 +591,8 @@ impl ChannelOp {
             | (OpKind::Receive | OpKind::Next, WakeResult::Sent) => {
                 unreachable!("a sender is only sent to, a receiver only received from")
             }
-            (OpKind::Lock, _) | (_, WakeResult::Acquired(_)) => {
-                unreachable!("only a lock is handed a mutex")
+            (OpKind::Lock, _) | (_, WakeResult::Acquired(_) | WakeResult::Retry(_)) => {
+                unreachable!("only a lock is handed a mutex, and a retry is not settled here")
             }
             (OpKind::Select(_), _) => unreachable!("settled above"),
         };
@@ -956,7 +1003,7 @@ pub(super) fn wait_for(
                 case,
             })
             .collect(),
-        mutex,
+        mutex: mutex.map(|mutex| (mutex, signal.clone())),
         top_level: module_call_site(global),
     });
     let promise = op.promise.value();
