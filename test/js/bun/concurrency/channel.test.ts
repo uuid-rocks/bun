@@ -667,7 +667,7 @@ describe.concurrent("Bun.Channel process", () => {
   // Each runs `body` in a process of its own, where `reclaimed()` waits for the channels that only
   // unreachable channels hold to be freed and says how many channels are left beside the ones
   // that existed when it started.
-  async function runReclaiming(body: string) {
+  async function runReclaiming(body: string, env: Record<string, string | undefined> = {}) {
     await using proc = Bun.spawn({
       cmd: [
         bunExe(),
@@ -679,9 +679,17 @@ describe.concurrent("Bun.Channel process", () => {
           const deadline = Date.now() + 3_000;
           while (Date.now() < deadline) {
             Bun.gc(true);
-            // A pool thread lets go of its wrappers when it collects its own garbage. Goroutines
-            // started one at a time all run on the pool's one thread.
-            if (threads) await Bun.go(() => { Bun.gc(true); });
+            // A pool thread lets go of its wrappers when it collects its own garbage. The pool has
+            // two threads (GOMAXPROCS), and each of these goroutines holds one until both collected.
+            if (threads) {
+              const gate = new Int32Array(new SharedArrayBuffer(4));
+              await Promise.all([0, 1].map(() => Bun.go((gate) => {
+                Bun.gc(true);
+                Atomics.add(gate, 0, 1);
+                Atomics.notify(gate, 0);
+                while (Atomics.load(gate, 0) < 2) Atomics.wait(gate, 0, 1);
+              }, gate)));
+            }
             collectChannels();
             if (channelLiveCount() === base) break;
             await Bun.sleep(1);
@@ -691,7 +699,7 @@ describe.concurrent("Bun.Channel process", () => {
         ${body}
         `,
       ],
-      env: bunEnv,
+      env: { ...bunEnv, ...env },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -753,7 +761,8 @@ describe.concurrent("Bun.Channel process", () => {
   });
 
   test("a cycle made across threads is freed once no thread holds it", async () => {
-    const result = await runReclaiming(`
+    const result = await runReclaiming(
+      `
       async function cycles() {
         for (let i = 0; i < 5; i++) {
           // The goroutine sends each channel into the other, and sends one back.
@@ -767,7 +776,9 @@ describe.concurrent("Bun.Channel process", () => {
       }
       await cycles();
       console.log(await reclaimed(true));
-    `);
+    `,
+      { GOMAXPROCS: "2", UV_THREADPOOL_SIZE: undefined },
+    );
     expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   });
 
