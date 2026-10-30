@@ -26,6 +26,7 @@ pub(crate) struct FunctionNames {
     kind: u8,
     this: Position,
     import_meta: Position,
+    direct_eval: bool,
 }
 
 /// Calls `on_name(ctx, name, len, position)` for each identifier `text` uses that nothing in it
@@ -57,6 +58,7 @@ pub(crate) unsafe extern "C" fn Bun__Go__functionNames(
     out.kind = names.kind as u8;
     out.this = names.this.map_or(NONE, position_of);
     out.import_meta = names.import_meta.map_or(NONE, position_of);
+    out.direct_eval = names.direct_eval;
     for (name, at) in &names.free {
         // SAFETY: `on_name` reads `name` during the call only.
         unsafe { on_name(ctx, name.as_ptr(), name.len(), position_of(*at)) };

@@ -53,6 +53,8 @@ struct FunctionNames {
     uint8_t kind;
     NamePosition thisPosition;
     NamePosition importMetaPosition;
+    // It calls `eval` directly, which reads the variables around it.
+    bool directEval;
 };
 enum class FunctionTextKind : uint8_t {
     Other = 0,
@@ -569,8 +571,9 @@ static Binding bindingOf(JSFunction* function, const Identifier& name)
 // at zero-based `line` and `column` of `module` (sourceOf): where it starts in the module's own
 // text (Bun transpiled what sourceOf counts in), and what keeps it from running on another thread,
 // as [kind, name, line] with a one-based line of the module's own text. `kind` is "unparsable" (a method, a getter), "class",
-// "this", "arguments" (an arrow function's, from the code around it), "import.meta", "captured" (a
-// variable of the code around it), "imported" (by its module) or "undeclared" (not a global either).
+// "this", "arguments" (an arrow function's, from the code around it), "import.meta", "eval" (called
+// directly), "captured" (a variable of the code around it), "imported" (by its module) or
+// "undeclared" (not a global either).
 JSC_DEFINE_HOST_FUNCTION(jsGoCheck, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
     auto& vm = lexicalGlobalObject->vm();
@@ -606,41 +609,53 @@ JSC_DEFINE_HOST_FUNCTION(jsGoCheck, (JSGlobalObject * lexicalGlobalObject, CallF
         return NamePosition { frames[0].position.line_zero_based, frames[0].position.column_zero_based };
     };
     MarkedArgumentBuffer problems;
+    // Check for an exception after each.
     auto add = [&](ASCIILiteral kind, const String& name, NamePosition position) {
         MarkedArgumentBuffer problem;
         problem.append(jsString(vm, String(kind)));
         problem.append(jsString(vm, name));
         problem.append(jsNumber(original(position).line + 1));
-        problems.append(constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), problem));
+        if (auto* array = constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), problem))
+            problems.append(array);
     };
     auto kind = static_cast<FunctionTextKind>(found.kind);
     if (!parsed || kind == FunctionTextKind::Other) {
         add("unparsable"_s, emptyString(), {});
+        RETURN_IF_EXCEPTION(scope, {});
     } else if (kind == FunctionTextKind::Class || function->jsExecutable()->isClassConstructorFunction()) {
         add("class"_s, emptyString(), {});
+        RETURN_IF_EXCEPTION(scope, {});
     } else {
-        if (found.thisPosition.line >= 0)
+        if (found.thisPosition.line >= 0) {
             add("this"_s, "this"_s, found.thisPosition);
-        if (found.importMetaPosition.line >= 0)
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        if (found.importMetaPosition.line >= 0) {
             add("import.meta"_s, "import.meta"_s, found.importMetaPosition);
+            RETURN_IF_EXCEPTION(scope, {});
+        }
         for (auto& [name, position] : names) {
             // The thread gives the function a `require` of its module's (internal/go/runtime).
             if (name == "require"_s)
                 continue;
-            if (kind == FunctionTextKind::Arrow && name == "arguments"_s) {
-                add("arguments"_s, name, position);
+            if ((kind == FunctionTextKind::Arrow && name == "arguments"_s) || (found.directEval && name == "eval"_s)) {
+                add(name == "eval"_s ? "eval"_s : "arguments"_s, name, position);
+                RETURN_IF_EXCEPTION(scope, {});
                 continue;
             }
             auto identifier = Identifier::fromString(vm, name);
             auto binding = bindingOf(function, identifier);
             if (binding != Binding::Global) {
                 add(binding == Binding::Imported ? "imported"_s : "captured"_s, name, position);
+                RETURN_IF_EXCEPTION(scope, {});
                 continue;
             }
             bool isGlobal = lexicalGlobalObject->hasProperty(lexicalGlobalObject, identifier);
             RETURN_IF_EXCEPTION(scope, {});
-            if (!isGlobal)
+            if (!isGlobal) {
                 add("undeclared"_s, name, position);
+                RETURN_IF_EXCEPTION(scope, {});
+            }
         }
     }
     auto start = original({ 0, 1 });

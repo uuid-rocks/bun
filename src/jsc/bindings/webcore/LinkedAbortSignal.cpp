@@ -40,7 +40,7 @@ std::atomic<uint32_t> liveLinks { 0 };
 
 class Source : public ThreadSafeRefCounted<Source> {
 public:
-    static Ref<Source> create(JSGlobalObject* globalObject) { return adoptRef(*new Source(globalObject)); }
+    static Ref<Source> create(JSGlobalObject* globalObject, AbortSignal& signal) { return adoptRef(*new Source(globalObject, signal)); }
 
     // False if the original has aborted or is gone already.
     bool add(Link&);
@@ -49,17 +49,26 @@ public:
     // The original's thread.
     void abort(JSValue reason);
     void gone();
+    void setAlgorithm(uint32_t algorithm) { m_algorithm = algorithm; }
 
 private:
-    explicit Source(JSGlobalObject* globalObject)
+    Source(JSGlobalObject* globalObject, AbortSignal& signal)
         : m_globalObject(globalObject)
+        , m_context(defaultGlobalObject(globalObject)->scriptExecutionContext()->identifier())
+        , m_signal(&signal)
     {
     }
 
     Vector<Ref<Link>> settle();
+    // The original's thread: with no link left, the original stops being observed, so that an
+    // AbortSignal.timeout() nobody else watches can be collected.
+    void unhookIfUnused();
 
-    // The original's thread only. It outlives the signal.
+    // The original's thread only. They outlive the signal's Source hooks.
     JSGlobalObject* m_globalObject;
+    const ScriptExecutionContextIdentifier m_context;
+    AbortSignal* m_signal;
+    uint32_t m_algorithm { 0 };
     Lock m_lock;
     bool m_settled WTF_GUARDED_BY_LOCK(m_lock) { false };
     HashSet<RefPtr<Link>> m_links WTF_GUARDED_BY_LOCK(m_lock);
@@ -230,8 +239,32 @@ bool Source::add(Link& link)
 
 void Source::remove(Link& link)
 {
-    Locker locker { m_lock };
-    m_links.remove(&link);
+    bool unused;
+    {
+        Locker locker { m_lock };
+        m_links.remove(&link);
+        unused = m_links.isEmpty() && !m_settled;
+    }
+    if (unused) {
+        ScriptExecutionContext::postTaskTo(m_context, BunLoopKind::Regular, [source = Ref { *this }](ScriptExecutionContext&) {
+            source->unhookIfUnused();
+        });
+    }
+}
+
+void Source::unhookIfUnused()
+{
+    {
+        Locker locker { m_lock };
+        // Settled: the original aborted or was destroyed, and m_signal may be gone. Links are
+        // only added on this thread, so none can be added before the hooks are removed.
+        if (m_settled || !m_links.isEmpty())
+            return;
+    }
+    Ref signal = *m_signal;
+    signal->cleanNativeBindings(this);
+    // Destroys the SourceGuard, which forgets and settles this Source.
+    signal->removeAlgorithm(m_algorithm);
 }
 
 Vector<Ref<Link>> Source::settle()
@@ -404,7 +437,7 @@ Ref<Source> sourceOf(JSGlobalObject* globalObject, AbortSignal& signal)
         if (auto it = all.bySignal.find(&signal); it != all.bySignal.end())
             return it->value.copyRef();
     }
-    auto source = Source::create(globalObject);
+    auto source = Source::create(globalObject, signal);
     {
         Locker locker { all.lock };
         all.bySignal.add(&signal, source.copyRef());
@@ -412,17 +445,28 @@ Ref<Source> sourceOf(JSGlobalObject* globalObject, AbortSignal& signal)
     signal.addNativeCallback({ source.ptr(), [](void* source, EncodedJSValue reason) {
                                   static_cast<Source*>(source)->abort(JSValue::decode(reason));
                               } });
-    signal.addAlgorithm([guard = SourceGuard(signal, source.copyRef())](JSValue) {});
+    source->setAlgorithm(signal.addAlgorithm([guard = SourceGuard(signal, source.copyRef())](JSValue) {}));
     return source;
 }
 
 } // namespace
 
+// The aborted signals whose reasons this thread is cloning: a reason can hold its own signal.
+static thread_local std::array<AbortSignal*, 8> reasonsBeingCloned {};
+static thread_local unsigned reasonsBeingClonedCount { 0 };
+
 uint64_t retainForStructuredClone(JSGlobalObject* globalObject, AbortSignal& signal)
 {
     RefPtr<Link> link;
     if (signal.aborted()) {
-        link = Link::create(nullptr, Link::State::Aborted, cloneReason(globalObject, signal.jsReason(*globalObject)));
+        Reason reason;
+        auto cloning = std::span { reasonsBeingCloned }.first(reasonsBeingClonedCount);
+        if (reasonsBeingClonedCount < reasonsBeingCloned.size() && std::ranges::find(cloning, &signal) == cloning.end()) {
+            reasonsBeingCloned[reasonsBeingClonedCount++] = &signal;
+            reason = cloneReason(globalObject, signal.jsReason(*globalObject));
+            reasonsBeingClonedCount--;
+        }
+        link = Link::create(nullptr, Link::State::Aborted, WTF::move(reason));
     } else {
         auto source = sourceOf(globalObject, signal);
         link = Link::create(source.copyRef(), Link::State::Waiting);

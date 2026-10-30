@@ -80,6 +80,7 @@ describe.concurrent("Bun.go with an inline function", () => {
         attempt(class Task {});
         attempt({ method() {} }.method);
         attempt(Math.max);
+        attempt(() => eval("counter"));
       `,
     });
     expect(stdout).toMatchInlineSnapshot(`
@@ -90,7 +91,8 @@ describe.concurrent("Bun.go with an inline function", () => {
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: the arrow function uses the \`arguments\` of the function around it (<dir>/main.ts:22): pass them as arguments.
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run "Task" on another thread: it is a class. Pass a function or an arrow function.
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run "method" on another thread: it is a method. Pass a function or an arrow function.
-      ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run "max" on another thread: it has no source of its own (it is native or bound). Pass a function written in your code."
+      ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run "max" on another thread: it has no source of its own (it is native or bound). Pass a function written in your code.
+      ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it calls \`eval()\` directly (<dir>/main.ts:28), which can read the variables around it: call \`(0, eval)()\` instead."
     `);
     expect(exitCode).toBe(0);
   });
@@ -332,6 +334,16 @@ describe.concurrent("an AbortSignal sent to a goroutine", () => {
         await sent.receive();
         uncloneable.abort({ fn() {} });
         console.log(await fallback);
+
+        // A reason that holds its own signal
+        const own = new AbortController();
+        own.abort(own.signal);
+        console.log(
+          await Bun.go(
+            (s: AbortSignal) => [s.aborted, s.reason instanceof AbortSignal, s.reason.aborted, s.reason.reason.name],
+            own.signal,
+          ),
+        );
       `,
     });
     expect(stdout).toBe(
@@ -340,6 +352,7 @@ describe.concurrent("an AbortSignal sent to a goroutine", () => {
         '[ true, "TimeoutError" ]',
         '[ "RangeError", "too far", true ]',
         '[ true, "AbortError" ]',
+        '[ true, true, true, "AbortError" ]',
       ].join("\n"),
     );
     expect(exitCode).toBe(0);
@@ -397,23 +410,27 @@ describe.concurrent("an AbortSignal sent to a goroutine", () => {
           const threads = 2;
           const longLived = new AbortController();
           let during = Infinity;
+          const timeouts: WeakRef<AbortSignal>[] = [];
           for (let round = 0; round < 5; round++) {
-            const goroutines = Array.from({ length: 100 }, () =>
-              Bun.go(async (kept: AbortSignal, dropped: AbortSignal) => {
+            const goroutines = Array.from({ length: 100 }, () => {
+              const timeout = AbortSignal.timeout(1e9);
+              timeouts.push(new WeakRef(timeout));
+              return Bun.go(async (kept: AbortSignal, dropped: AbortSignal, timeout: AbortSignal) => {
                 dropped.addEventListener("abort", () => {});
                 const channel = new Bun.Channel<number>(1);
                 await channel.send(1, { signal: kept });
-                return (await channel.receive({ signal: kept })) + Number(kept.aborted);
-              }, longLived.signal, new AbortController().signal),
-            );
+                return (await channel.receive({ signal: timeout })) + Number(kept.aborted);
+              }, longLived.signal, new AbortController().signal, timeout);
+            });
             // Each argument is a link until its clone is read, and its signal collected.
             during = Math.min(during, linkedAbortSignals());
             await Promise.all(goroutines);
           }
           const sab = new SharedArrayBuffer(4);
+          const alive = () => timeouts.filter(ref => ref.deref() !== undefined).length;
           let after = linkedAbortSignals();
           let attempt = 0;
-          while (after > 0 && attempt < 20) {
+          while ((after > 0 || alive() > 0) && attempt < 20) {
             attempt++;
             Bun.gc(true);
             // A collection on every thread
@@ -431,12 +448,13 @@ describe.concurrent("an AbortSignal sent to a goroutine", () => {
             await Bun.sleep(0);
             after = linkedAbortSignals();
           }
-          console.log(during >= 200, after);
+          // A timeout that nothing watches any more is collected before it fires.
+          console.log(during >= 300, after, alive());
         `,
       },
       { threads: 2 },
     );
-    expect(stdout).toBe("true 0");
+    expect(stdout).toBe("true 0 0");
     expect(exitCode).toBe(0);
   });
 });

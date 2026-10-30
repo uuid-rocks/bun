@@ -150,6 +150,8 @@ pub struct FunctionFreeNames {
     /// Where an arrow function first uses the `this` of the code around it.
     pub this: Option<u32>,
     pub import_meta: Option<u32>,
+    /// It calls `eval` directly, which reads the variables around it.
+    pub direct_eval: bool,
 }
 
 /// Binds the symbols of `text`, which is meant to be one function expression, and reports what in
@@ -623,6 +625,7 @@ impl<'a> Parser<'a> {
         }
         out.free.sort_unstable_by_key(|(_, at)| *at);
         out.this = p.top_level_this.map(|loc| loc.start as u32);
+        out.direct_eval = p.module_scope().contains_direct_eval;
         if p.has_import_meta {
             // The parser keeps the last `import.meta`.
             out.import_meta = Some(p.esm_import_keyword.loc.start as u32);

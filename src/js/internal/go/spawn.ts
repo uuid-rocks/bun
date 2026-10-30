@@ -28,6 +28,7 @@ type ProblemKind =
   | "this"
   | "arguments"
   | "import.meta"
+  | "eval"
   | "captured"
   | "imported"
   | "undeclared";
@@ -154,6 +155,11 @@ function notSendable(fn: Function, url: string | undefined, problems?: Problem[]
         break;
       case "import.meta":
         reasons.push(`it uses \`import.meta\` (${at(line)}): pass what it needs from it as an argument`);
+        break;
+      case "eval":
+        reasons.push(
+          `it calls \`eval()\` directly (${at(line)}), which can read the variables around it: call \`(0, eval)()\` instead`,
+        );
         break;
     }
   }
