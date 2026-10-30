@@ -125,7 +125,8 @@ public:
     void threadFailedToStart();
     // Main thread: a thread that grow() asked it for is being created.
     void willCreateThread();
-    enum class Grow : bool { No, Yes };
+    enum class Grow : bool { No,
+        Yes };
     // Wake an idle thread for what is queued, or grow the pool. Called without the lock.
     void dispatch(Grow = Grow::Yes);
 
@@ -312,11 +313,12 @@ std::optional<Task> Scheduler::take(ScriptExecutionContextIdentifier thread)
         ASSERT(m_startingCount);
         m_startingCount--;
     }
-    bool wasWoken = m_woken.remove(thread);
-    // What starting and woken threads will take is theirs. A started goroutine never moves, so a
-    // thread that took it all as the pool grows would run it while the new threads idle.
+    m_woken.remove(thread);
+    // What is queued for the threads that are starting is theirs. A started goroutine never moves,
+    // so a thread that took it all as the pool grows would run it while the new threads idle. (A
+    // woken thread gets no such claim: a thread that is running takes the next goroutine sooner.)
     ASSERT(m_startingCount >= m_uncreatedCount);
-    size_t reserved = isNew || wasWoken ? 0 : m_startingCount - m_uncreatedCount + m_woken.size();
+    size_t reserved = isNew ? 0 : m_startingCount - m_uncreatedCount;
     if (m_queue.size() <= reserved) {
         if (!m_idle.contains(thread))
             m_idle.append(thread);

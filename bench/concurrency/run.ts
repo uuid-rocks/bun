@@ -58,13 +58,17 @@ if (only.has("pipeline")) {
       const env = workers === 0 ? {} : { GOMAXPROCS: String(Math.max(workers, 2)) };
       const ms = timeOf(await sample([pipeline, "--workers", String(workers), "--no-single"], env));
       times.push(ms);
-      record(`pipeline: ${workers === 0 ? "main thread" : `${workers} goroutines`} (ms)`, ms);
+      record(`pipeline: ${name(workers)} (ms)`, ms);
     }
     medians.set(workers, median(times));
   }
   for (const workers of sizes.slice(1)) {
-    record(`pipeline: speedup, ${workers} goroutines (x)`, medians.get(0)! / medians.get(workers)!);
+    record(`pipeline: speedup, ${name(workers)} (x)`, medians.get(0)! / medians.get(workers)!);
   }
+}
+
+function name(workers: number) {
+  return workers === 0 ? "main thread" : workers === 1 ? "1 goroutine" : `${workers} goroutines`;
 }
 
 function median(values: number[]) {

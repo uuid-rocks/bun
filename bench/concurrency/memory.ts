@@ -23,7 +23,7 @@ await Promise.all(
         const arrived = new Int32Array(sab);
         Atomics.add(arrived, 0, 1);
         Atomics.notify(arrived, 0);
-        for (let seen; (seen = Atomics.load(arrived, 0)) < parties; ) Atomics.wait(arrived, 0, seen);
+        for (let seen; (seen = Atomics.load(arrived, 0)) < parties;) Atomics.wait(arrived, 0, seen);
       },
       sab,
       threads,
