@@ -1704,11 +1704,15 @@ describe("Bun.go", () => {
         const router = { go: (url: URL) => console.log(url.href.slice(url.href.lastIndexOf("/") + 1)) };
         router.go(new URL("./settings", import.meta.url));
         router.go(new URL("./tasks.ts#label", import.meta.url));
+        // Not a WaitGroup where it is used.
+        let group: any = new Bun.WaitGroup();
+        group = router;
+        group.go(new URL("./missing", import.meta.url));
       `,
       "tasks.ts": `export const label = "tasks";`,
     });
     const root = String(dir);
-    const expected = "settings\ntasks.ts#label\n";
+    const expected = "settings\ntasks.ts#label\nmissing\n";
     const bundle = await run([bunExe(), "build", "--target=bun", "navigation.ts", "--outdir", "out"], root);
     expect(bundle.stderr).toBe("");
     expect(bundle.exitCode).toBe(0);
@@ -1722,6 +1726,34 @@ describe("Bun.go", () => {
     const compiled = await run([join(root, "bin", "app")], root);
     expect(compiled.stdout).toBe(expected);
     expect(compiled.exitCode).toBe(0);
+  });
+
+  test("bun build --compile: a URL passed to a WaitGroup declared after the function that uses it", async () => {
+    using dir = tempDir("bun-go-compile-hoisted-group", {
+      "main.ts": `
+        import { WaitGroup } from "bun";
+        async function run() {
+          return [
+            await group.go(new URL("./task.ts#double", import.meta.url), 4),
+            await other.go(new URL("./task.ts#double", import.meta.url), 5),
+          ];
+        }
+        await using group = new Bun.WaitGroup();
+        const other = new WaitGroup();
+        console.log(await run());
+      `,
+      "task.ts": `export const double = (n: number) => n * 2;`,
+    });
+    const root = String(dir);
+    const build = await run([bunExe(), "build", "--compile", "main.ts", "--outfile", join("out", "app")], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    rmSync(join(root, "main.ts"));
+    rmSync(join(root, "task.ts"));
+    const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
+    expect(stderr).toBe("");
+    expect(stdout).toBe("[ 8, 10 ]\n");
+    expect(exitCode).toBe(0);
   });
 
   test("bun build --compile: an entry point that exports its goroutine's function and guards its top-level code", async () => {
