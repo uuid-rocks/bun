@@ -117,8 +117,9 @@ describe.concurrent("Bun.go", () => {
   });
 
   // A pool thread's goroutine spawns while the pool could grow, but only the main thread creates
-  // threads, and it is blocked: an idle thread runs the goroutine.
-  test("a goroutine spawned on a pool thread runs while the main thread is blocked", async () => {
+  // threads: if it is blocked, an idle thread runs the goroutine, and if the spawning thread blocks,
+  // a new thread does.
+  test("a goroutine spawned on a pool thread runs while the main thread or the spawning thread is blocked", async () => {
     const { stdout, exitCode } = await run(
       {
         "main.ts": `
@@ -140,13 +141,26 @@ describe.concurrent("Bun.go", () => {
           );
           await started.receive();
           await go.send();
-          console.log(Atomics.wait(flag, 0, 0, 10_000));
+          // "not-equal" if the child was quicker: either way it ran on another thread.
+          console.log(Atomics.wait(flag, 0, 0, 10_000) !== "timed-out");
           await parent;
+
+          console.log(
+            await Bun.go(async (flag: Int32Array) => {
+              await new Promise(resolve => setImmediate(resolve));
+              Atomics.store(flag, 0, 0);
+              Bun.go((flag: Int32Array) => {
+                Atomics.store(flag, 0, 1);
+                Atomics.notify(flag, 0);
+              }, flag);
+              return Atomics.wait(flag, 0, 0, 10_000) !== "timed-out";
+            }, flag),
+          );
         `,
       },
       { threads: 4 },
     );
-    expect(stdout).toBe("ok");
+    expect(stdout).toBe("true\ntrue");
     expect(exitCode).toBe(0);
   });
 

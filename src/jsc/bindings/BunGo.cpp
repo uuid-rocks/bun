@@ -282,12 +282,11 @@ void Scheduler::dispatch(Grow mayGrow)
             if (unloaded != notFound) {
                 thread = m_idle[unloaded];
                 m_idle.removeAt(unloaded);
-            } else if (!onMainThread && !m_idle.isEmpty()) {
-                // A new thread would wait for the main thread, which may be blocked.
-                thread = m_idle.takeLast();
             } else {
                 grows = mayGrow == Grow::Yes && shouldGrow(onMainThread);
-                if (!grows && !m_idle.isEmpty())
+                // Off the main thread, a new thread waits for the main thread to create it, and the
+                // idle thread may be this one, about to block: ask both, the first to take runs it.
+                if ((!grows || !onMainThread) && !m_idle.isEmpty())
                     thread = m_idle.takeLast();
             }
             if (thread)
