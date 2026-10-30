@@ -66,6 +66,7 @@ pub type ExceptionList = Vec<crate::exception_list::JsException>;
 
 bun_core::declare_scope!(deadlock, hidden);
 
+#[cfg(unix)]
 unsafe extern "C" {
     safe fn Bun__JSC__hasDeferredWork(vm: &VM) -> bool;
 }
