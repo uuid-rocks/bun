@@ -149,7 +149,7 @@ pub(crate) fn select(
             None => state.try_receive(case.channel.capacity).map(Won::Received),
             Some(message) => match state.try_send(case.channel.capacity, message) {
                 Ok(sent) => {
-                    graph::register(&case.channel, state);
+                    graph::note_edges(&case.channel, state);
                     Some(Won::Sent(sent))
                 }
                 Err(message) => {
@@ -188,7 +188,7 @@ pub(crate) fn select(
             match case.send.take() {
                 Some(message) => {
                     state.push_sender(queued, message);
-                    graph::register(&case.channel, state);
+                    graph::note_edges(&case.channel, state);
                 }
                 None => state.receivers.push_back(queued),
             }

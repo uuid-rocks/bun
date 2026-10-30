@@ -82,6 +82,7 @@
 #include "BunPlugin.h"
 #include "BunProcess.h"
 #include "BunSecureContextCache.h"
+#include "SharedHandleWrappers.h"
 #include "NodeV8.h"
 #include "ProcessIdentifier.h"
 #include "GlobalEventScope.h"

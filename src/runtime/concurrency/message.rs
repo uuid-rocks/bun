@@ -2,6 +2,8 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use bun_collections::smallvec::SmallVec;
+
+use super::channel::ChannelCore;
 use bun_jsc::{JSGlobalObject, JSValue, JsResult};
 
 unsafe extern "C" {
@@ -66,14 +68,15 @@ pub(crate) enum CloneSite {
 /// process can read it, once. Owns a C++ `WebCore::MessageWithMessagePorts` (`ChannelMessage.cpp`).
 pub(crate) struct ChannelMessage {
     message: NonNull<c_void>,
-    /// It shares a `Bun.Channel`: in a channel's queue, an edge of the channel graph
-    /// ([`graph`](super::graph)).
-    carries_channels: bool,
+    /// The cores of the `Bun.Channel`s it shares, which its clone holds while it exists. In a
+    /// channel's queue, its edges in the channel graph ([`graph`](super::graph)).
+    targets: Box<[*const ChannelCore]>,
 }
 
 // SAFETY: the message holds no VM or JS state. Its bytes are its own; the buffers it moved or
 // shares, the native objects it shares and the ports it moves are refcounted thread-safely, so it
-// can be read or dropped on any thread. It is owned, so one thread uses it at a time.
+// can be read or dropped on any thread. It is owned, so one thread uses it at a time. `targets`
+// point to channel cores, which are `Sync`, and which its clone keeps alive.
 unsafe impl Send for ChannelMessage {}
 
 impl ChannelMessage {
@@ -94,39 +97,24 @@ impl ChannelMessage {
             Bun__ChannelMessage__createFor(global, value, transfer, site, index)
         })?;
         let message = NonNull::new(message).expect("a message, or an exception");
-        // SAFETY: ours; a capacity of 0 writes nothing.
-        let carries_channels =
-            unsafe { Bun__ChannelMessage__channelIds(message, core::ptr::null_mut(), 0) } != 0;
-        Ok(Self {
-            message,
-            carries_channels,
-        })
+        let ids = channel_ids(message);
+        let targets = if ids.is_empty() {
+            Box::default()
+        } else {
+            super::channel::cores_of(&ids)
+        };
+        Ok(Self { message, targets })
     }
 
     pub(super) fn carries_channels(&self) -> bool {
-        self.carries_channels
+        !self.targets.is_empty()
     }
 
-    /// The `Channel__retainForStructuredClone` ids of the channels it shares.
-    pub(super) fn channel_ids(&self) -> SmallVec<[u64; 4]> {
-        let mut ids = SmallVec::<[u64; 4]>::new();
-        if !self.carries_channels {
-            return ids;
-        }
-        loop {
-            let capacity = ids.capacity();
-            // SAFETY: ours; `ids` has room for `capacity` ids.
-            let count = unsafe {
-                Bun__ChannelMessage__channelIds(self.message, ids.as_mut_ptr(), capacity)
-            };
-            if count <= capacity {
-                // SAFETY: the first `count` were written.
-                unsafe { ids.set_len(count) };
-                return ids;
-            }
-            ids.reserve(count);
-        }
+    /// The cores of the channels it shares, alive while it is.
+    pub(super) fn targets(&self) -> &[*const ChannelCore] {
+        &self.targets
     }
+
 
     /// The value, in `global`'s realm. Throws if the value cannot be made there.
     pub(crate) fn deserialize(self, global: &JSGlobalObject) -> JsResult<JSValue> {
@@ -135,6 +123,23 @@ impl ChannelMessage {
         bun_jsc::host_fn::from_js_host_call(global, || unsafe {
             Bun__ChannelMessage__deserialize(global, message)
         })
+    }
+}
+
+/// The `Channel__retainForStructuredClone` ids of the channels `message` shares.
+fn channel_ids(message: NonNull<c_void>) -> SmallVec<[u64; 4]> {
+    let mut ids = SmallVec::<[u64; 4]>::new();
+    loop {
+        let capacity = ids.capacity();
+        // SAFETY: a live message; `ids` has room for `capacity` ids.
+        let count =
+            unsafe { Bun__ChannelMessage__channelIds(message, ids.as_mut_ptr(), capacity) };
+        if count <= capacity {
+            // SAFETY: the first `count` were written.
+            unsafe { ids.set_len(count) };
+            return ids;
+        }
+        ids.reserve(count);
     }
 }
 

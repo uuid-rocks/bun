@@ -30,8 +30,4 @@ private:
     JSC::WeakGCMap<uint64_t, JSC::JSObject, WTF::IntHash<uint64_t>, WTF::UnsignedWithZeroKeyHashTraits<uint64_t>> m_map;
 };
 
-// The same map, by the address of the native core a Bun.Channel or Bun.Mutex wrapper shares
-// (ChannelMessage.cpp): a realm has one wrapper per channel or mutex while it is alive.
-using SharedHandleWrappers = SecureContextCache;
-
 } // namespace Bun

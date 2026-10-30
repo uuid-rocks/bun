@@ -38,7 +38,7 @@ class HandleScopeImpl;
 class JSNextTickQueue;
 class Process;
 class SecureContextCache;
-using SharedHandleWrappers = SecureContextCache;
+class SharedHandleWrappers;
 class GCProfilerObserver;
 
 struct ModuleGraphState;

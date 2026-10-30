@@ -53,8 +53,11 @@ use crate::node::util::validators;
 pub(crate) struct ChannelCore {
     pub(super) capacity: u32,
     pub(super) state: Guarded<State>,
-    /// In the [`graph`]'s registry. Set and cleared under `state`'s lock.
-    pub(super) registered: AtomicBool,
+    /// Its queues may hold a value that shares a channel: set under `state`'s lock when they do,
+    /// cleared by the [`graph`]'s collection when they don't.
+    pub(super) holds_channels: AtomicBool,
+    /// Queued for the [`graph`]'s collection.
+    pub(super) candidate: AtomicBool,
 }
 
 /// How many channels exist, for `bun:internal-for-testing`.
@@ -66,7 +69,8 @@ impl ChannelCore {
         Arc::new(ChannelCore {
             capacity,
             state: Guarded::new(State::default()),
-            registered: AtomicBool::new(false),
+            holds_channels: AtomicBool::new(false),
+            candidate: AtomicBool::new(false),
         })
     }
 }
@@ -309,14 +313,14 @@ pub(super) enum WakeResult {
 /// under the channel's lock.
 pub(super) struct Delivery {
     message: Option<ChannelMessage>,
-    channel: Arc<ChannelCore>,
+    channel: ManuallyDrop<Arc<ChannelCore>>,
 }
 
 impl Delivery {
     pub(super) fn new(message: ChannelMessage, channel: &Arc<ChannelCore>) -> Self {
         Self {
             message: Some(message),
-            channel: Arc::clone(channel),
+            channel: ManuallyDrop::new(Arc::clone(channel)),
         }
     }
 
@@ -332,6 +336,8 @@ impl Drop for Delivery {
         if let Some(message) = self.message.take() {
             self.channel.give_back(message);
         }
+        // SAFETY: dropping; not used again.
+        graph::release(unsafe { ManuallyDrop::take(&mut self.channel) });
     }
 }
 
@@ -744,7 +750,7 @@ impl ChannelCore {
         let mut state = self.state.lock();
         let message = match state.try_send(self.capacity, message) {
             Ok(sent) => {
-                graph::register(self, &state);
+                graph::note_edges(self, &state);
                 drop(state);
                 return match sent {
                     SendNow::Closed(_) => SendStep::Closed,
@@ -765,7 +771,7 @@ impl ChannelCore {
             },
             message,
         );
-        graph::register(self, &state);
+        graph::note_edges(self, &state);
         SendStep::Wait(waiter)
     }
 
@@ -802,7 +808,7 @@ impl ChannelCore {
         }
         state.edges += u32::from(message.carries_channels());
         state.buffer.push_front(message);
-        graph::register(self, &state);
+        graph::note_edges(self, &state);
     }
 
     /// `Ok(None)`: closed and drained.
@@ -921,6 +927,7 @@ impl Channel {
                 Some(u32::MAX.into()),
             )? as u32
         };
+        graph::assist();
         Ok(Self {
             core: ManuallyDrop::new(ChannelCore::new(capacity)),
         })
@@ -1207,7 +1214,20 @@ impl Options {
 
 /// The channels in the structured clone messages that exist, on any thread, by what the message
 /// has in their place.
-static IN_FLIGHT: Guarded<BTreeMap<u64, Arc<ChannelCore>>> = Guarded::new(BTreeMap::new());
+/// Sharded by id: every send of a value that shares a channel takes one.
+static IN_FLIGHT: [Guarded<BTreeMap<u64, Arc<ChannelCore>>>; 16] =
+    [const { Guarded::new(BTreeMap::new()) }; 16];
+
+fn in_flight(id: u64) -> &'static Guarded<BTreeMap<u64, Arc<ChannelCore>>> {
+    &IN_FLIGHT[(id % IN_FLIGHT.len() as u64) as usize]
+}
+
+/// The cores of the channels that messages share by these ids, while those messages exist.
+pub(super) fn cores_of(ids: &[u64]) -> Box<[*const ChannelCore]> {
+    ids.iter()
+        .filter_map(|&id| in_flight(id).lock().get(&id).map(Arc::as_ptr))
+        .collect()
+}
 
 /// `channel` is a `Bun.Channel`.
 #[unsafe(no_mangle)]
@@ -1220,7 +1240,7 @@ pub(crate) extern "C" fn Channel__retainForStructuredClone(channel: JSValue) -> 
     let mut id = [0; 8];
     bun_boringssl_sys::rand_bytes(&mut id);
     let id = u64::from_ne_bytes(id);
-    IN_FLIGHT.lock().insert(id, Arc::clone(&channel.core));
+    in_flight(id).lock().insert(id, Arc::clone(&channel.core));
     message::remember_wrapper(channel_value, Arc::as_ptr(&channel.core));
     id
 }
@@ -1228,16 +1248,23 @@ pub(crate) extern "C" fn Channel__retainForStructuredClone(channel: JSValue) -> 
 /// `JSValue::ZERO` if no message has this id. A message can be read many times (`BroadcastChannel`).
 #[unsafe(no_mangle)]
 pub(crate) extern "C" fn Channel__fromStructuredClone(global: &JSGlobalObject, id: u64) -> JSValue {
-    let Some(core) = IN_FLIGHT.lock().get(&id).cloned() else {
+    let Some(core) = in_flight(id).lock().get(&id).cloned() else {
         return JSValue::ZERO;
     };
-    message::wrapper_of(global, Arc::as_ptr(&core), || {
+    let address = Arc::as_ptr(&core);
+    let mut core = Some(core);
+    let wrapper = message::wrapper_of(global, address, || {
         Channel {
-            core: ManuallyDrop::new(Arc::clone(&core)),
+            core: ManuallyDrop::new(core.take().expect("made once")),
         }
         .into_js_wrapper(global)
         .to_js()
-    })
+    });
+    // The wrapper this realm already had.
+    if let Some(core) = core {
+        graph::release(core);
+    }
+    wrapper
 }
 
 /// The message with this id is gone.
@@ -1245,16 +1272,10 @@ pub(crate) extern "C" fn Channel__fromStructuredClone(global: &JSGlobalObject, i
 pub(crate) extern "C" fn Channel__releaseStructuredClone(id: u64) {
     // The channel, outside the lock: it can be the last handle, and its buffer can hold messages
     // with channels of their own.
-    let core = IN_FLIGHT.lock().remove(&id);
+    let core = in_flight(id).lock().remove(&id);
     if let Some(core) = core {
         graph::release(core);
     }
-}
-
-/// `f` of the channels that messages share, by the id each message has in its place. Nothing else
-/// is locked under it.
-pub(super) fn with_in_flight<R>(f: impl FnOnce(&BTreeMap<u64, Arc<ChannelCore>>) -> R) -> R {
-    f(&IN_FLIGHT.lock())
 }
 
 pub(crate) fn live_count_for_testing() -> f64 {
@@ -1262,5 +1283,5 @@ pub(crate) fn live_count_for_testing() -> f64 {
 }
 
 pub(crate) fn collect_for_testing() -> f64 {
-    graph::collect() as f64
+    graph::collect_all() as f64
 }

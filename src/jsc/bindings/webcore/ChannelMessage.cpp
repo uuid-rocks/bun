@@ -16,8 +16,7 @@
 #include "ScriptExecutionContext.h"
 #include "SerializedScriptValue.h"
 #include "ZigGlobalObject.h"
-#include "BunSecureContextCache.h"
-#include <JavaScriptCore/WeakGCMapInlines.h>
+#include "SharedHandleWrappers.h"
 #include "BunClientData.h"
 #include <JavaScriptCore/ErrorInstance.h>
 #include <JavaScriptCore/IteratorOperations.h>
@@ -295,6 +294,6 @@ extern "C" void Bun__SharedHandle__remember(EncodedJSValue encodedWrapper, const
     auto* globalObject = defaultGlobalObject(wrapper->globalObject());
     auto& wrappers = globalObject->m_sharedHandleWrappers;
     if (!wrappers)
-        wrappers = makeUnique<Bun::SharedHandleWrappers>(globalObject->vm());
+        wrappers = makeUnique<Bun::SharedHandleWrappers>();
     wrappers->set(reinterpret_cast<uintptr_t>(address), wrapper);
 }

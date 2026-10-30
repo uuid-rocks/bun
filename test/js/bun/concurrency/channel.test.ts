@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe, isASAN, isDebug, withoutAsanQuarantine } from "harness";
+import { bunEnv, bunExe, isASAN, isDebug, tempDir, withoutAsanQuarantine } from "harness";
 
 /** A Worker running `src`. Its first message, its `error` and its exit settle `ready`. */
 function startWorker(src: string, data?: unknown) {
@@ -668,27 +668,26 @@ describe.concurrent("Bun.Channel process", () => {
   // unreachable channels hold to be freed and says how many channels are left beside the ones
   // that existed when it started.
   async function runReclaiming(body: string, env: Record<string, string | undefined> = {}) {
-    await using proc = Bun.spawn({
-      cmd: [
-        bunExe(),
-        "-e",
-        `
+    // From a file: the goroutines of a \`bun -e\` script keep what they made until a full collection.
+    using dir = tempDir("channel-reclaiming", {
+      "main.js": `
         import { channelLiveCount, collectChannels } from "bun:internal-for-testing";
         const base = channelLiveCount();
-        async function reclaimed(threads = false) {
+        // \`threads\`: the size of the goroutine pool (GOMAXPROCS), whose threads collect too.
+        async function reclaimed(threads = 0) {
           const deadline = Date.now() + 3_000;
           while (Date.now() < deadline) {
             Bun.gc(true);
-            // A pool thread lets go of its wrappers when it collects its own garbage. The pool has
-            // two threads (GOMAXPROCS), and each of these goroutines holds one until both collected.
+            // A pool thread lets go of its wrappers when it collects its own garbage. Each of these
+            // goroutines holds a thread of the pool until all of them collected.
             if (threads) {
               const gate = new Int32Array(new SharedArrayBuffer(4));
-              await Promise.all([0, 1].map(() => Bun.go((gate) => {
+              await Promise.all(Array.from({ length: threads }, () => Bun.go((gate, threads) => {
                 Bun.gc(true);
                 Atomics.add(gate, 0, 1);
                 Atomics.notify(gate, 0);
-                while (Atomics.load(gate, 0) < 2) Atomics.wait(gate, 0, 1);
-              }, gate)));
+                for (let n; (n = Atomics.load(gate, 0)) < threads; ) Atomics.wait(gate, 0, n);
+              }, gate, threads)));
             }
             collectChannels();
             if (channelLiveCount() === base) break;
@@ -697,8 +696,11 @@ describe.concurrent("Bun.Channel process", () => {
           return channelLiveCount() - base;
         }
         ${body}
-        `,
-      ],
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "main.js"],
+      cwd: String(dir),
       env: { ...bunEnv, ...env },
       stdout: "pipe",
       stderr: "pipe",
@@ -775,12 +777,67 @@ describe.concurrent("Bun.Channel process", () => {
         }
       }
       await cycles();
-      console.log(await reclaimed(true));
+      console.log(await reclaimed(2));
     `,
       { GOMAXPROCS: "2", UV_THREADPOOL_SIZE: undefined },
     );
     expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   });
+
+  test("a long chain of channels, each held by the next one's queue, is freed without recursing", async () => {
+    const result = await runReclaiming(`
+      async function chain(links) {
+        let head = new Bun.Channel(1);
+        for (let i = 0; i < links; i++) {
+          const link = new Bun.Channel(1);
+          await link.send(head);
+          head = link;
+        }
+        // Held by a channel that holds itself: only a collection frees it, on the collector's
+        // thread, and then the whole chain at once.
+        const keeper = new Bun.Channel(2);
+        await keeper.send(keeper);
+        await keeper.send(head);
+      }
+      await chain(20_000);
+      console.log(await reclaimed());
+    `);
+    expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
+  });
+
+  test("cycles that 8 goroutines make as fast as they can are freed as they go", async () => {
+    const result = await runReclaiming(
+      `
+      const stop = new Int32Array(new SharedArrayBuffer(4));
+      const perGoroutine = 4000;
+      const made = 8 * perGoroutine * 2;
+      const goroutines = Promise.all(
+        Array.from({ length: 8 }, () =>
+          Bun.go(async (stop, count) => {
+            for (let i = 0; i < count && !Atomics.load(stop, 0); i++) {
+              const a = new Bun.Channel(2), b = new Bun.Channel(2);
+              await a.send({ b, pad: new Uint8Array(1024) });
+              await b.send({ a });
+              if (i % 200 === 0) Bun.gc(false);
+            }
+          }, stop, perGoroutine),
+        ),
+      );
+      let done = false;
+      goroutines.then(() => (done = true));
+      let most = 0;
+      while (!done) {
+        most = Math.max(most, channelLiveCount() - base);
+        await Bun.sleep(1);
+      }
+      await goroutines;
+      console.log("at most half alive at once:", most < made / 2);
+      console.log("left:", await reclaimed(8));
+    `,
+      { GOMAXPROCS: "8", UV_THREADPOOL_SIZE: undefined },
+    );
+    expect(result).toEqual({ stdout: "at most half alive at once: true\nleft: 0\n", stderr: "", exitCode: 0 });
+  }, 60_000);
 
   test("channels, messages and waiters are freed", async () => {
     await using proc = Bun.spawn({
