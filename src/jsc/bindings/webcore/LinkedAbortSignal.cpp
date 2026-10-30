@@ -451,20 +451,27 @@ Ref<Source> sourceOf(JSGlobalObject* globalObject, AbortSignal& signal)
 
 } // namespace
 
-// The aborted signals whose reasons this thread is cloning: a reason can hold its own signal.
-static thread_local std::array<AbortSignal*, 8> reasonsBeingCloned {};
-static thread_local unsigned reasonsBeingClonedCount { 0 };
+// An aborted signal whose reason this thread is cloning, innermost first: a reason can hold its
+// own signal.
+struct ReasonBeingCloned {
+    AbortSignal* signal;
+    ReasonBeingCloned* outer;
+};
+static thread_local ReasonBeingCloned* reasonsBeingCloned { nullptr };
 
 uint64_t retainForStructuredClone(JSGlobalObject* globalObject, AbortSignal& signal)
 {
     RefPtr<Link> link;
     if (signal.aborted()) {
         Reason reason;
-        auto cloning = std::span { reasonsBeingCloned }.first(reasonsBeingClonedCount);
-        if (reasonsBeingClonedCount < reasonsBeingCloned.size() && std::ranges::find(cloning, &signal) == cloning.end()) {
-            reasonsBeingCloned[reasonsBeingClonedCount++] = &signal;
+        bool cloning = false;
+        for (auto* frame = reasonsBeingCloned; frame && !cloning; frame = frame->outer)
+            cloning = frame->signal == &signal;
+        if (!cloning) {
+            ReasonBeingCloned frame { &signal, reasonsBeingCloned };
+            reasonsBeingCloned = &frame;
             reason = cloneReason(globalObject, signal.jsReason(*globalObject));
-            reasonsBeingClonedCount--;
+            reasonsBeingCloned = frame.outer;
         }
         link = Link::create(nullptr, Link::State::Aborted, WTF::move(reason));
     } else {
