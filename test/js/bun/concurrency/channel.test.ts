@@ -180,6 +180,20 @@ describe("Bun.Channel", () => {
     sendController.abort();
     await expect(sending).rejects.toMatchObject({ name: "AbortError" });
 
+    // Cloning the value aborts the signal: the value is not sent.
+    const getterController = new AbortController();
+    const buffered = new Bun.Channel<object>(1);
+    const abortingValue = {
+      get field() {
+        getterController.abort();
+        return 1;
+      },
+    };
+    await expect(buffered.send(abortingValue, { signal: getterController.signal })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(buffered.length).toBe(0);
+
     // Neither left a waiter behind.
     const sent = ch.send(3);
     expect(await ch.receive()).toBe(3);

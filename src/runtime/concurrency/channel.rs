@@ -170,6 +170,8 @@ bun_jsc::impl_abort_handle_owner!(ChannelOp, abort_handle, |this, cause| {
 
 impl ChannelOp {
     fn settle(self: Box<Self>, global: &JSGlobalObject, result: WakeResult) -> JsResult<()> {
+        // Out of the table, so out of reach of a context stop that settling runs (a `then` getter).
+        self.abort_handle.disarm();
         let ChannelOp {
             kind, mut promise, ..
         } = *self;
@@ -385,6 +387,10 @@ impl Channel {
             return Ok(JSPromise::rejected_promise(global, closed_error(global)).to_js());
         }
         let message = ChannelMessage::create(global, value.to_js(), options.transfer)?;
+        // A getter the clone ran can have aborted it.
+        if let Some(rejected) = options.rejected_if_aborted(global) {
+            return Ok(rejected);
+        }
         let id = ops().next_id();
         Ok(match self.core.send(|| self.waiter(global, id), message) {
             SendStep::Done => JSPromise::resolved_promise_value(global, JSValue::UNDEFINED),
