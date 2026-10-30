@@ -274,7 +274,7 @@ Every send value is cloned when `select()` is called, also for the cases that lo
 Every value is a [structured clone](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm), made the way `postMessage()` makes one. This is true on one thread too, so a receiver never shares an object with its sender.
 
 - `SharedArrayBuffer` and `WebAssembly.Memory` are shared: both threads see the same memory.
-- Channels are shared: the receiver gets a handle to the same channel.
+- Channels and mutexes are shared: the receiver gets a handle to the same channel. On the thread where a channel already has an object, it gets that object back, so `(await a.receive()) === a` and a channel works as a `Map` key. Each thread has its own object for a channel.
 - An `AbortSignal` arrives as a signal that aborts when the original does, with a copy of its reason (see [Cancelling goroutines](/runtime/goroutines#cancelling-goroutines)). `postMessage()` still refuses an `AbortSignal`.
 - `ArrayBuffer`s listed in `transfer` move to the receiver and are detached for the sender.
 - Everything else is copied. Functions and other values that cannot be cloned reject with a `DataCloneError`.
