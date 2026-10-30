@@ -216,6 +216,87 @@ pub struct ReactRefreshImportClause<'a> {
     pub(crate) r#ref: Ref,
 }
 
+/// What `Bun.go(x, ...)` names when `x` is an imported binding or
+/// `new URL("./literal", import.meta.url)`. `cjs_source_path`: a CommonJS bundle inlines
+/// `import.meta.url` as this file's URL.
+fn bun_go_task<'a>(
+    call: bun_ast::StoreRef<E::Call>,
+    symbols: &[js_ast::Symbol],
+    cjs_source_path: Option<&[u8]>,
+    arena: &'a Bump,
+) -> Option<BunGoTask<'a>> {
+    let is_unbound_global = |target: &Expr, name: &[u8]| {
+        let Some(id) = target.data.e_identifier() else {
+            return false;
+        };
+        let symbol = &symbols[id.ref_.inner_index() as usize];
+        symbol.kind == js_ast::symbol::Kind::Unbound && symbol.original_name.slice() == name
+    };
+    let dot = call.target.data.e_dot()?;
+    if dot.name.slice() != b"go"
+        || dot.optional_chain.is_some()
+        || !is_unbound_global(&dot.target, b"Bun")
+    {
+        return None;
+    }
+    let first = call.args.slice().first().copied()?;
+    let task = match first.data {
+        js_ast::ExprData::EImportIdentifier(id) => BunGoTask::Import(id.ref_),
+        js_ast::ExprData::ENew(new) => {
+            let [href, base] = new.args.slice() else {
+                return None;
+            };
+            if !is_unbound_global(&new.target, b"URL") {
+                return None;
+            }
+            let base_is_import_meta_url = match base.data {
+                js_ast::ExprData::EDot(dot) => {
+                    dot.name.slice() == b"url"
+                        && matches!(dot.target.data, js_ast::ExprData::EImportMeta(_))
+                }
+                // A CommonJS bundle inlines `import.meta.url`.
+                js_ast::ExprData::EString(base) if base.is_utf8() => {
+                    cjs_source_path.is_some_and(|path| {
+                        let path = bun_core::StringView::from_bytes(path);
+                        base.slice8()
+                            == format!("{}", bun_url::file_url_from_string(&path)).as_bytes()
+                    })
+                }
+                _ => false,
+            };
+            let href_string = href.data.e_string()?;
+            if !base_is_import_meta_url || !href_string.is_utf8() {
+                return None;
+            }
+            let href_bytes = href_string.slice8();
+            let (path, fragment) = match strings::index_of_char_usize(href_bytes, b'#') {
+                Some(i) => (&href_bytes[..i], &href_bytes[i..]),
+                None => (href_bytes, &b""[..]),
+            };
+            // A path as the resolver reads it, relative to this file: no query, percent-escape or scheme.
+            if path.is_empty() || strings::index_of_any(path, b"%?:\\").is_some() {
+                return None;
+            }
+            let specifier: &'a [u8] =
+                if path.starts_with(b"./") || path.starts_with(b"../") || path.starts_with(b"/") {
+                    arena.alloc_slice_copy(path)
+                } else {
+                    let mut joined = bun_alloc::ArenaVec::with_capacity_in(path.len() + 2, arena);
+                    joined.extend_from_slice(b"./");
+                    joined.extend_from_slice(path);
+                    joined.into_bump_slice()
+                };
+            BunGoTask::Url {
+                specifier,
+                fragment: arena.alloc_slice_copy(fragment),
+                loc: href.loc,
+            }
+        }
+        _ => return None,
+    };
+    Some(task)
+}
+
 /// A `Bun.go()` call whose first argument names a module the bundle can make an entry point of.
 #[derive(Clone, Copy)]
 pub(crate) struct BunGoCall<'a> {
@@ -1122,86 +1203,11 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
     /// Remembers `Bun.go(x, ...)` when `x` is an imported binding or
     /// `new URL("./literal", import.meta.url)`. Called on the visited call.
     pub(crate) fn note_bun_go_call(&mut self, call: bun_ast::StoreRef<E::Call>) {
-        let is_unbound_global = |p: &Self, target: &Expr, name: &[u8]| {
-            let Some(id) = target.data.e_identifier() else {
-                return false;
-            };
-            let symbol = &p.symbols[id.ref_.inner_index() as usize];
-            symbol.kind == js_ast::symbol::Kind::Unbound && symbol.original_name.slice() == name
-        };
-        let Some(dot) = call.target.data.e_dot() else {
-            return;
-        };
-        if dot.name.slice() != b"go"
-            || dot.optional_chain.is_some()
-            || !is_unbound_global(self, &dot.target, b"Bun")
-        {
-            return;
+        let cjs_source_path = (self.options.output_format == crate::options::Format::Cjs)
+            .then(|| self.source.path.text);
+        if let Some(task) = bun_go_task(call, &self.symbols, cjs_source_path, self.arena) {
+            self.bun_go_calls.push(BunGoCall { call, task });
         }
-        let Some(first) = call.args.slice().first().copied() else {
-            return;
-        };
-        let task = match first.data {
-            js_ast::ExprData::EImportIdentifier(id) => BunGoTask::Import(id.ref_),
-            js_ast::ExprData::ENew(new) => {
-                let [href, base] = new.args.slice() else {
-                    return;
-                };
-                if !is_unbound_global(self, &new.target, b"URL") {
-                    return;
-                }
-                let base_is_import_meta_url = match base.data {
-                    js_ast::ExprData::EDot(dot) => {
-                        dot.name.slice() == b"url"
-                            && matches!(dot.target.data, js_ast::ExprData::EImportMeta(_))
-                    }
-                    // A CommonJS bundle inlines `import.meta.url`.
-                    js_ast::ExprData::EString(base)
-                        if self.options.output_format == crate::options::Format::Cjs
-                            && base.is_utf8() =>
-                    {
-                        let path = bun_core::StringView::from_bytes(self.source.path.text);
-                        base.slice8()
-                            == format!("{}", bun_url::file_url_from_string(&path)).as_bytes()
-                    }
-                    _ => false,
-                };
-                let Some(href_string) = href.data.e_string() else {
-                    return;
-                };
-                if !base_is_import_meta_url || !href_string.is_utf8() {
-                    return;
-                }
-                let href_bytes = href_string.slice8();
-                let (path, fragment) = match strings::index_of_char_usize(href_bytes, b'#') {
-                    Some(i) => (&href_bytes[..i], &href_bytes[i..]),
-                    None => (href_bytes, &b""[..]),
-                };
-                // A path as the resolver reads it, relative to this file: no query, percent-escape or scheme.
-                if path.is_empty() || strings::index_of_any(path, b"%?:\\").is_some() {
-                    return;
-                }
-                let specifier: &'a [u8] = if path.starts_with(b"./")
-                    || path.starts_with(b"../")
-                    || path.starts_with(b"/")
-                {
-                    self.arena.alloc_slice_copy(path)
-                } else {
-                    let mut joined =
-                        bun_alloc::ArenaVec::with_capacity_in(path.len() + 2, self.arena);
-                    joined.extend_from_slice(b"./");
-                    joined.extend_from_slice(path);
-                    joined.into_bump_slice()
-                };
-                BunGoTask::Url {
-                    specifier,
-                    fragment: self.arena.alloc_slice_copy(fragment),
-                    loc: href.loc,
-                }
-            }
-            _ => return,
-        };
-        self.bun_go_calls.push(BunGoCall { call, task });
     }
 
     /// Points each call `note_bun_go_call` kept at its module's entry point: an
