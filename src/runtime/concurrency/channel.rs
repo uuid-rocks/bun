@@ -123,7 +123,7 @@ impl ChannelWake {
         // SAFETY: the dispatch hands over the boxed wake.
         let wake = unsafe { bun_core::heap::take(this) };
         match ops().remove(wake.op_id) {
-            Some(op) => op.settle(global, wake.result),
+            Some(mut op) => op.settle(global, wake.result),
             None => Ok(()),
         }
     }
@@ -169,13 +169,11 @@ bun_jsc::impl_abort_handle_owner!(ChannelOp, abort_handle, |this, cause| {
 });
 
 impl ChannelOp {
-    fn settle(self: Box<Self>, global: &JSGlobalObject, result: WakeResult) -> JsResult<()> {
+    fn settle(&mut self, global: &JSGlobalObject, result: WakeResult) -> JsResult<()> {
         // Out of the table, so out of reach of a context stop that settling runs (a `then` getter).
         self.abort_handle.disarm();
-        let ChannelOp {
-            kind, mut promise, ..
-        } = *self;
-        let value = match (kind, result) {
+        let promise = &mut self.promise;
+        let value = match (self.kind, result) {
             (OpKind::Send, WakeResult::Sent) => Ok(JSValue::UNDEFINED),
             (OpKind::Send | OpKind::Receive, WakeResult::Closed) => {
                 return promise.reject(global, Ok(closed_error(global)));
@@ -243,7 +241,7 @@ impl ChannelCore {
             return SendStep::Done;
         }
         let waiter = waiter();
-        state.senders.push_back((waiter.clone(), message));
+        state.senders.push_back((Arc::clone(&waiter), message));
         SendStep::Wait(waiter)
     }
 
@@ -267,7 +265,7 @@ impl ChannelCore {
             return Ok(None);
         } else {
             let waiter = waiter();
-            state.receivers.push_back(waiter.clone());
+            state.receivers.push_back(Arc::clone(&waiter));
             return Err(waiter);
         };
         drop(state);
@@ -466,7 +464,7 @@ impl Channel {
             kind,
             promise: JSPromiseStrong::init(global),
             waiter,
-            channel: self.core.clone(),
+            channel: Arc::clone(&self.core),
         });
         let promise = op.promise.value();
         let op = ops().insert(id, op).as_ptr();
@@ -544,7 +542,7 @@ pub(crate) extern "C" fn Channel__retainForStructuredClone(channel: JSValue) -> 
     let mut id = [0; 8];
     bun_boringssl_sys::rand_bytes(&mut id);
     let id = u64::from_ne_bytes(id);
-    IN_FLIGHT.lock().insert(id, channel.core.clone());
+    IN_FLIGHT.lock().insert(id, Arc::clone(&channel.core));
     id
 }
 
