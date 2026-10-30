@@ -29,7 +29,7 @@ class Goroutine<T> extends Promise<T> {
   static start<T>(id: number): Goroutine<T> {
     let entry!: Pending;
     const goroutine = new Goroutine<T>((resolve, reject) => {
-      entry = { resolve, reject, keepsAlive: true };
+      entry = { resolve: resolve as Pending["resolve"], reject, keepsAlive: true };
     });
     goroutine.#id = id;
     pending.$set(id, entry);
