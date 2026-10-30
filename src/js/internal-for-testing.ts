@@ -1326,4 +1326,8 @@ export function membersUnderNamesOfTheRuntime(tag: string): string[] {
 }
 
 // Clones of AbortSignals made by Bun.go and Bun.Channel (LinkedAbortSignal.cpp) that are still alive.
-export const linkedAbortSignals: () => number = $newCppFunction("LinkedAbortSignal.cpp", "linkedAbortSignalsForTesting", 0);
+export const linkedAbortSignals: () => number = $newCppFunction(
+  "LinkedAbortSignal.cpp",
+  "linkedAbortSignalsForTesting",
+  0,
+);

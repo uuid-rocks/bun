@@ -1,15 +1,9 @@
 // Bun.go: start a goroutine on the pool (BunGo.cpp), on any JS thread.
 
-const {
-  spawn,
-  spawnInline,
-  keepAlive,
-  moduleOf,
-  resolveModule,
-  sourceOf,
-  check,
-  codeGenerationAllowed,
-} = $cpp("BunGo.cpp", "createGoSpawnBinding") as {
+const { spawn, spawnInline, keepAlive, moduleOf, resolveModule, sourceOf, check, codeGenerationAllowed } = $cpp(
+  "BunGo.cpp",
+  "createGoSpawnBinding",
+) as {
   spawn(module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]): number;
   spawnInline(source: string, module: string, line: number, column: number, strict: boolean, args: unknown[]): number;
   keepAlive(delta: number): void;
@@ -23,15 +17,7 @@ const {
 // A function's text, and where it starts in its module (zero-based).
 type Source = [source: string, module: string, line: number, column: number, strict: boolean];
 type ProblemKind =
-  | "unparsable"
-  | "class"
-  | "this"
-  | "arguments"
-  | "import.meta"
-  | "eval"
-  | "captured"
-  | "imported"
-  | "undeclared";
+  "unparsable" | "class" | "this" | "arguments" | "import.meta" | "eval" | "captured" | "imported" | "undeclared";
 // The line is one-based, in the module's own text.
 type Problem = [kind: ProblemKind, name: string, line: number];
 // Where the function starts in its module's own text (zero-based), which Bun may have transpiled,
@@ -146,7 +132,9 @@ function notSendable(fn: Function, url: string | undefined, problems?: Problem[]
         outside.push(`"${name}" (${at(line)})`);
         break;
       case "this":
-        reasons.push(`the arrow function uses the \`this\` of the code around it (${at(line)}): pass it as an argument`);
+        reasons.push(
+          `the arrow function uses the \`this\` of the code around it (${at(line)}): pass it as an argument`,
+        );
         break;
       case "arguments":
         reasons.push(
@@ -163,8 +151,9 @@ function notSendable(fn: Function, url: string | undefined, problems?: Problem[]
         break;
     }
   }
-  if (outside.length > 0) {
-    const one = outside.length === 1;
+  const { length } = outside;
+  if (length > 0) {
+    const one = length === 1;
     reasons.unshift(
       `it uses ${list(outside)}, which ${one ? "is neither its own nor a global" : "are neither its own nor globals"}. ${one ? "Pass it as an argument" : "Pass them as arguments"}, or import ${one ? "it" : "them"} inside the function with \`await import()\``,
     );
@@ -203,12 +192,14 @@ function inlineOf(fn: Function, source: Source | undefined): Target {
       module,
       line,
       column,
-      target: problems === undefined ? [TargetKind.Inline, text, module, originalLine, originalColumn, strict] : undefined,
+      target:
+        problems === undefined ? [TargetKind.Inline, text, module, originalLine, originalColumn, strict] : undefined,
       problems,
     };
     verdicts.$set(text, verdict);
   }
-  if (verdict.problems !== undefined) throw notSendable(fn, module, verdict.problems);
+  const { problems } = verdict;
+  if (problems !== undefined) throw notSendable(fn, module, problems);
   if (!codeGenerationAllowed()) throw notSendable(fn, module);
   return verdict.target!;
 }

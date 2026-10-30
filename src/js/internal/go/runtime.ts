@@ -6,13 +6,28 @@
 const { take, settle, compile } = $cpp("BunGo.cpp", "createGoRuntimeBinding") as {
   take(): Task | Failed | undefined;
   settle(id: number, outcome: 0 | 1, value: unknown): void;
-  compile(source: string, module: string, line: number, column: number, strict: boolean): (require: unknown) => Function;
+  compile(
+    source: string,
+    module: string,
+    line: number,
+    column: number,
+    strict: boolean,
+  ): (require: unknown) => Function;
 };
 
 // internal/go/spawn's targets.
 type Task =
   | [id: number, args: unknown[], kind: 0, module: string, exportName: string, fromCommonJSExports: boolean]
-  | [id: number, args: unknown[], kind: 1, module: string, source: string, line: number, column: number, strict: boolean];
+  | [
+      id: number,
+      args: unknown[],
+      kind: 1,
+      module: string,
+      source: string,
+      line: number,
+      column: number,
+      strict: boolean,
+    ];
 // The goroutine's arguments could not be read on this thread.
 type Failed = [id: number, error: unknown];
 

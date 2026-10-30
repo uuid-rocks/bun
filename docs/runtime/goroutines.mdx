@@ -33,13 +33,10 @@ console.log(counts.reduce((a, b) => a + b)); // => 78498
 The four calls run at the same time on four threads. The function can also be written in place:
 
 ```ts
-const total = await Bun.go(
-  async (url: string) => {
-    const response = await fetch(url);
-    return (await response.text()).length;
-  },
-  "https://example.com",
-);
+const total = await Bun.go(async (url: string) => {
+  const response = await fetch(url);
+  return (await response.text()).length;
+}, "https://example.com");
 ```
 
 ---
@@ -96,8 +93,8 @@ const digest = await Bun.go(async (text: string) => {
 TypeScript works in either form: the function runs as Bun transpiled it, and errors and stack traces name the lines of your source.
 
 <Note>
-  A function written in place is compiled again on the pool thread from its source, the way `new Function()` compiles
-  a string. When code generation from strings is disallowed (`--disallow-code-generation-from-strings`), only exported
+  A function written in place is compiled again on the pool thread from its source, the way `new Function()` compiles a
+  string. When code generation from strings is disallowed (`--disallow-code-generation-from-strings`), only exported
   functions and module URLs can run.
 </Note>
 

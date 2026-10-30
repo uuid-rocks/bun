@@ -618,8 +618,7 @@ impl<'a> Parser<'a> {
         }
 
         for (name, member) in p.module_scope().members.iter() {
-            if p.symbols[member.ref_.inner_index() as usize].kind == js_ast::symbol::Kind::Unbound
-            {
+            if p.symbols[member.ref_.inner_index() as usize].kind == js_ast::symbol::Kind::Unbound {
                 out.free.push((name.into(), member.loc.start as u32));
             }
         }

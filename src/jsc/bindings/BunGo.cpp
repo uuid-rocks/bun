@@ -594,9 +594,7 @@ JSC_DEFINE_HOST_FUNCTION(jsGoCheck, (JSGlobalObject * lexicalGlobalObject, CallF
     Names names;
     FunctionNames found {};
     auto text = makeString('(', source, ')').utf8();
-    bool parsed = Bun__Go__functionNames(text.data(), text.length(), &names, [](void* context, const uint8_t* name, size_t length, NamePosition position) {
-        static_cast<Names*>(context)->append({ String::fromUTF8(std::span { name, length }), position });
-    }, &found);
+    bool parsed = Bun__Go__functionNames(text.data(), text.length(), &names, [](void* context, const uint8_t* name, size_t length, NamePosition position) { static_cast<Names*>(context)->append({ String::fromUTF8(std::span { name, length }), position }); }, &found);
 
     // Where a position of the text is in the module's own text, which Bun transpiled (TypeScript,
     // JSX). The text begins with the "(" around the source.

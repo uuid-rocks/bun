@@ -118,7 +118,6 @@ public:
     ~Link() { liveLinks.fetch_sub(1, std::memory_order_relaxed); }
 
 private:
-
     // The linked signal's thread.
     void abortSignal(ScriptExecutionContext&, Reason&&);
     void unlink();
