@@ -156,3 +156,14 @@ jobs:
         run: |
           df -h . "$TOOLCHAIN_DIR"
           du -sh build "$TOOLCHAIN_DIR"/* 2>/dev/null || true
+
+      # The sticky disks are saved when they unmount, which fails while a
+      # process the build or the tests left behind still has files open there.
+      - name: Release the sticky disks
+        if: always()
+        working-directory: /
+        run: |
+          for disk in "$TREE" "$TOOLCHAIN_DIR"; do
+            sudo fuser -vm "$disk" 2>&1 || true
+            sudo fuser -km "$disk" || true
+          done
