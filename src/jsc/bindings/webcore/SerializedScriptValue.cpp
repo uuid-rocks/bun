@@ -98,6 +98,7 @@
 #include "GeneratedBlockList.h"
 #include "GeneratedHistogram.h"
 #include "GeneratedChannel.h"
+#include "GeneratedMutex.h"
 #include "JSAbortSignal.h"
 #include "LinkedAbortSignal.h"
 #include "JSX509Certificate.h"
@@ -208,6 +209,7 @@ enum SerializationTag {
     Bun__NodePerformanceHooksHistogramTag = 250,
     Bun__ChannelTag = 249,
     Bun__AbortSignalTag = 248,
+    Bun__MutexTag = 247,
 
     ErrorTag = 255
 };
@@ -232,6 +234,10 @@ extern "C" void Histogram__releaseStructuredClone(uint64_t id);
 extern "C" uint64_t Channel__retainForStructuredClone(JSC::EncodedJSValue channel);
 extern "C" JSC::EncodedJSValue Channel__fromStructuredClone(JSC::JSGlobalObject*, uint64_t id);
 extern "C" void Channel__releaseStructuredClone(uint64_t id);
+// A clone of a `Bun.Mutex` is a handle to the same lock, the way a channel's is.
+extern "C" uint64_t Mutex__retainForStructuredClone(JSC::EncodedJSValue mutex);
+extern "C" JSC::EncodedJSValue Mutex__fromStructuredClone(JSC::JSGlobalObject*, uint64_t id);
+extern "C" void Mutex__releaseStructuredClone(uint64_t id);
 
 // SharedArrayBuffers and shared WebAssembly memories are shared, not copied.
 static bool sharesMemory(SerializationContext context)
@@ -1483,6 +1489,20 @@ private:
                 uint64_t id = Channel__retainForStructuredClone(JSValue::encode(channel));
                 m_serializedHandles.append({ Channel__releaseStructuredClone, id });
                 write(Bun__ChannelTag);
+                write(id);
+                return true;
+            }
+
+            if (auto* mutex = dynamicDowncast<Bun::Bindgen::Generated::JSMutex>(obj)) {
+                if (m_forTransfer == SerializationForCrossProcessTransfer::Yes || m_forStorage == SerializationForStorage::Yes) {
+                    code = SerializationReturnCode::DataCloneError;
+                    return true;
+                }
+                if (!startObjectInternal(mutex)) // handle duplicates
+                    return true;
+                uint64_t id = Mutex__retainForStructuredClone(JSValue::encode(mutex));
+                m_serializedHandles.append({ Mutex__releaseStructuredClone, id });
+                write(Bun__MutexTag);
                 write(id);
                 return true;
             }
@@ -3561,6 +3581,25 @@ private:
         return channel;
     }
 
+    JSValue readMutex()
+    {
+        VM& vm = m_globalObject->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        uint64_t id;
+        if (!read(id)) {
+            fail();
+            return JSValue();
+        }
+        JSValue mutex = JSValue::decode(Mutex__fromStructuredClone(defaultGlobalObject(m_globalObject), id));
+        RETURN_IF_EXCEPTION(scope, JSValue());
+        if (mutex.isEmpty()) {
+            fail();
+            return JSValue();
+        }
+        addTerminalToObjectPool(mutex);
+        return mutex;
+    }
+
     JSValue readAbortSignal()
     {
         VM& vm = m_globalObject->vm();
@@ -4108,6 +4147,9 @@ private:
 
         case Bun__AbortSignalTag:
             return readAbortSignal();
+
+        case Bun__MutexTag:
+            return readMutex();
 
         default:
             m_ptr = preTagPtr; // Push the tag back

@@ -418,6 +418,8 @@ const PUBLISHED_AS: Record<string, string | null> = {
   "jsc_hooks.bind.ts": null,
   "linear_fifo_testing.bind.ts": null,
   "memory_pressure.bind.ts": null,
+  "mutex.bind.ts": "typeof Bun",
+  "mutex_testing.bind.ts": null,
   "mysql.bind.ts": null,
   "napi_body.bind.ts": null,
   "node_assert_binding.bind.ts": null,

@@ -80,6 +80,20 @@ declare module "bun" {
      */
     [Symbol.asyncIterator](): AsyncIterableIterator<T, undefined>;
 
+    /**
+     * Like `for await (const value of channel)`, and `options.signal` stops it: once the signal aborts, the waiting
+     * `next()` rejects with `signal.reason`, and so does every `next()` after it. The channel stays open, and a value
+     * is never lost: it is either received by the loop or left in the channel for other receivers.
+     *
+     * @example
+     * ```ts
+     * for await (const job of jobs.values({ signal })) {
+     *   await handle(job);
+     * }
+     * ```
+     */
+    values(options?: { signal?: AbortSignal }): AsyncIterableIterator<T, undefined>;
+
     /** {@link close}: `using channel = new Bun.Channel()` closes it at the end of the scope. */
     [Symbol.dispose](): void;
   }
@@ -165,11 +179,13 @@ declare module "bun" {
   function go<R = unknown>(module: string | URL, ...args: unknown[]): Goroutine<R>;
 
   /**
-   * A case of {@link select}: a channel to receive from, or `[channel, value]` to send `value` on it.
+   * A case of {@link select}: a channel to receive from, `[channel, value]` to send `value` on it, or an
+   * `AbortSignal`, which is ready once it aborts (`AbortSignal.timeout(ms)` for Go's `time.After`, a cancellation
+   * signal for `ctx.Done()`).
    *
    * @category Concurrency
    */
-  type SelectCase = Channel<any> | readonly [Channel<any>, unknown];
+  type SelectCase = Channel<any> | readonly [Channel<any>, unknown] | AbortSignal;
 
   /** @category Concurrency */
   interface SelectOptions {
@@ -187,11 +203,13 @@ declare module "bun" {
    *
    * @category Concurrency
    */
-  type SelectCaseResult<Case, I extends number> = Case extends readonly [Channel<any>, unknown]
-    ? { index: I; value: undefined; closed: false }
-    : Case extends Channel<infer T>
-      ? { index: I; value: T; closed: false } | { index: I; value: undefined; closed: true }
-      : never;
+  type SelectCaseResult<Case, I extends number> = Case extends AbortSignal
+    ? { index: I; value: unknown; closed: false }
+    : Case extends readonly [Channel<any>, unknown]
+      ? { index: I; value: undefined; closed: false }
+      : Case extends Channel<infer T>
+        ? { index: I; value: T; closed: false } | { index: I; value: undefined; closed: true }
+        : never;
 
   /**
    * What {@link select} resolves to: the result of the case that happened, typed by its index in `C`.
@@ -217,14 +235,16 @@ declare module "bun" {
   /**
    * Waits until one of several channel operations can happen, and does exactly that one, like Go's `select`.
    *
-   * Each case is a channel to receive from, or `[channel, value]` to send `value` on it. When several cases are
-   * ready, one of them is picked at random; the others do nothing. The result says which case happened, by its
-   * index in `cases`:
+   * Each case is a channel to receive from, `[channel, value]` to send `value` on it, or an `AbortSignal`. When
+   * several cases are ready, one of them is picked at random; the others do nothing. The result says which case
+   * happened, by its index in `cases`:
    *
    * - A receive: `{ index, value, closed: false }`, or `{ index, value: undefined, closed: true }` once the channel
    *   is closed and drained.
    * - A send: `{ index, value: undefined, closed: false }`. A send on a closed channel rejects with
    *   `ERR_CHANNEL_CLOSED` if it is picked.
+   * - An `AbortSignal`: `{ index, value: signal.reason, closed: false }` once it has aborted. This is Go's
+   *   `case <-time.After(d)` with `AbortSignal.timeout(ms)`, and `case <-ctx.Done()` with a cancellation signal.
    *
    * Every send value is cloned when `select()` is called, also for the cases that lose. Send cases take no
    * `transfer` list, so a losing case never detaches a buffer.
@@ -237,14 +257,17 @@ declare module "bun" {
    * const quit = new Bun.Channel<void>();
    *
    * while (true) {
-   *   const result = await Bun.select([jobs, quit], { signal: AbortSignal.timeout(1000) });
-   *   if (result.index === 1 || result.closed) break;
-   *   console.log("job", result.value);
+   *   const result = await Bun.select([jobs, quit, AbortSignal.timeout(1000)]);
+   *   if (result.index === 0 && !result.closed) console.log("job", result.value);
+   *   else if (result.index === 2) console.log("no job for a second");
+   *   else break;
    * }
    * ```
    *
    * @param cases The operations to wait for. An empty list waits until `options.signal` aborts, or resolves at once
    * with `default: true`; without either it rejects with `ERR_INVALID_ARG_VALUE`.
+   * @param options.signal Rejects instead: use it to give up on the whole `select()`. To handle a signal like any
+   * other case, put it in `cases`.
    *
    * @category Concurrency
    */
@@ -260,4 +283,115 @@ declare module "bun" {
     cases: C & SelectCases<C>,
     options?: SelectOptions,
   ): Promise<SelectResult<C> | SelectDefault>;
+
+  /**
+   * Starts goroutines and waits for them, like Go's `sync.WaitGroup` with its `Go` method, and cancels them on the
+   * first failure, like `errgroup`.
+   *
+   * - {@link WaitGroup.go} runs a function on another thread as {@link go} does, and counts it.
+   * - {@link WaitGroup.signal} aborts with the error of the first goroutine that fails, or when `options.signal`
+   *   aborts. Pass it to the goroutines that should stop then: like Go's `context.Context`, nothing stops a
+   *   goroutine that does not look at it.
+   * - {@link WaitGroup.wait} waits for every goroutine, the ones started while it waits too, then rejects with the
+   *   first error, if one failed.
+   * - `await using` aborts the signal and waits for every goroutine when the scope ends, so none outlives it. An
+   *   error that `wait()` did not throw is thrown then.
+   *
+   * A goroutine that a `WaitGroup` started never causes an unhandled rejection; its error is the group's.
+   *
+   * A `WaitGroup` belongs to the thread that made it. It is not shared with other threads.
+   *
+   * @example
+   * ```ts
+   * await using group = new Bun.WaitGroup();
+   * for (const url of urls) {
+   *   group.go(async (url, signal) => (await fetch(url, { signal })).text(), url, group.signal);
+   * }
+   * await group.wait(); // rejects with the first error, after the other fetches were aborted and ended
+   * ```
+   *
+   * @category Concurrency
+   */
+  class WaitGroup implements AsyncDisposable {
+    /**
+     * @param options.signal Aborts {@link signal} too: the goroutines are cancelled when the caller is.
+     */
+    constructor(options?: { signal?: AbortSignal });
+
+    /**
+     * Aborts when the first goroutine fails (`signal.reason` is its error), when `options.signal` aborts (with its
+     * reason), or when the group is disposed.
+     */
+    readonly signal: AbortSignal;
+
+    /** Runs `fn(...args)` on another thread, like {@link go}, and counts it. Returns the goroutine. */
+    go<A extends unknown[], R>(fn: (...args: A) => R, ...args: A): Goroutine<Awaited<R>>;
+    /** Runs the default export of a module on another thread, like {@link go}, and counts it. */
+    go<R = unknown>(module: string | URL, ...args: unknown[]): Goroutine<R>;
+
+    /**
+     * Resolves once every goroutine has settled, including those started while it waits. Rejects with the error of
+     * the first goroutine that failed.
+     */
+    wait(): Promise<void>;
+
+    /** Aborts {@link signal}, waits for every goroutine, and throws the first error if {@link wait} did not. */
+    [Symbol.asyncDispose](): Promise<void>;
+  }
+
+  /**
+   * What {@link Mutex.lock} and {@link Mutex.tryLock} return: it holds the lock until {@link unlock} or the end of
+   * its `using` scope, whichever comes first.
+   *
+   * @category Concurrency
+   */
+  interface MutexLock extends Disposable {
+    /** Unlocks the mutex. Only the first call does anything. */
+    unlock(): void;
+  }
+
+  /**
+   * A lock that every thread shares, like Go's `sync.Mutex`. Waiting for it does not block the thread: `lock()` is a
+   * promise, and the thread runs other goroutines meanwhile.
+   *
+   * A mutex is shared, not copied, like a {@link Channel}: pass it to {@link go}, send it through a channel or post
+   * it to a `Worker`, and every thread locks the same mutex. Waiters get the lock in the order they asked for it.
+   *
+   * A waiting `lock()` does not keep the process alive.
+   *
+   * @example
+   * ```ts
+   * const mu = new Bun.Mutex();
+   * const counter = new Int32Array(new SharedArrayBuffer(4));
+   * await Promise.all(
+   *   Array.from({ length: 4 }, () =>
+   *     Bun.go(
+   *       async (mu, counter) => {
+   *         for (let i = 0; i < 1000; i++) {
+   *           using _ = await mu.lock();
+   *           counter[0]++;
+   *         }
+   *       },
+   *       mu,
+   *       counter,
+   *     ),
+   *   ),
+   * );
+   * ```
+   *
+   * @category Concurrency
+   */
+  class Mutex {
+    constructor();
+
+    /**
+     * Resolves with the lock once this thread holds it. Unlock it with `using`, or with {@link MutexLock.unlock}.
+     *
+     * @param options.signal Stops waiting: the promise rejects with `signal.reason`, and the lock is not taken.
+     */
+    lock(options?: { signal?: AbortSignal }): Promise<MutexLock>;
+
+    /** The lock if it is free now, otherwise `undefined`. `using lock = mu.tryLock()` works either way. */
+    tryLock(): MutexLock | undefined;
+  }
 }

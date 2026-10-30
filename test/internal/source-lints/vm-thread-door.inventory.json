@@ -123,6 +123,11 @@
       "SharedWatcher"
     ]
   },
+  "src/runtime/concurrency/deadlock.rs": {
+    "unsafe impl Send": [
+      "Registry"
+    ]
+  },
   "src/runtime/concurrency/message.rs": {
     "unsafe impl Send": [
       "ChannelMessage"

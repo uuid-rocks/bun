@@ -6,7 +6,32 @@ export function asyncIterator(this: Channel) {
   const channel = this;
   return {
     next() {
-      return channel.$channelNext();
+      return channel.$channelNext(undefined);
+    },
+    return(value) {
+      return Promise.$resolve({ value, done: true });
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+}
+
+// As `for await`, and an abort rejects the waiting `next()` with `signal.reason`. A value is either received or
+// left in the channel.
+export function values(this: Channel, options?: { signal?: AbortSignal }) {
+  let signal: AbortSignal | undefined;
+  if (options !== undefined) {
+    if (!$isObject(options)) throw $ERR_INVALID_ARG_TYPE("options", "object", options);
+    signal = options.signal;
+    if (signal !== undefined && !(signal instanceof AbortSignal)) {
+      throw $ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+    }
+  }
+  const channel = this;
+  return {
+    next() {
+      return channel.$channelNext(signal);
     },
     return(value) {
       return Promise.$resolve({ value, done: true });

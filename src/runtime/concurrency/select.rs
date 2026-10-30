@@ -7,12 +7,17 @@
 //! waiter ([`Waiter::fire`](super::channel::Waiter)) picks the case that wins; its VM then takes the
 //! waiter out of the other channels. Two selects meet on a channel when one finds the other's
 //! waiter while it tries its cases: one select is never queued as both.
+//!
+//! An `AbortSignal` case is ready once its signal aborts. A select that waits follows its signals;
+//! the first to abort wins the waiter for its case the way its own VM cancels it.
 
 use std::sync::Arc;
 
 use bun_collections::smallvec::SmallVec;
 use bun_jsc::bindgen::{JsLocal, JsScope};
-use bun_jsc::{ErrorCode, JSGlobalObject, JSPromise, JSValue, JsResult};
+use bun_jsc::{
+    AbortSignal, AbortSignalRef, ErrorCode, JSGlobalObject, JSPromise, JSValue, JsResult,
+};
 
 use super::channel::{
     Channel, ChannelCore, Channels, OpKind, Options, Queued, ReceiveNow, SendNow, WakeResult,
@@ -30,10 +35,16 @@ struct Case {
     lock: usize,
 }
 
+enum Read {
+    Channel(Case),
+    Signal(AbortSignalRef),
+}
+
 /// What the case that won did, once the channels are unlocked.
 enum Won {
     Received(ReceiveNow),
     Sent(SendNow),
+    Aborted,
 }
 
 pub(crate) fn select(
@@ -78,10 +89,19 @@ pub(crate) fn select(
         return Ok(rejected);
     }
 
-    let mut channels: Channels = read.iter().map(|case| Arc::clone(&case.channel)).collect();
+    let mut channels: Channels = read
+        .iter()
+        .filter_map(|case| match case {
+            Read::Channel(case) => Some(Arc::clone(&case.channel)),
+            Read::Signal(_) => None,
+        })
+        .collect();
     channels.sort_unstable_by_key(|channel| Arc::as_ptr(channel) as usize);
     channels.dedup_by(|a, b| Arc::ptr_eq(a, b));
     for case in &mut read {
+        let Read::Channel(case) = case else {
+            continue;
+        };
         case.lock = channels
             .binary_search_by_key(&(Arc::as_ptr(&case.channel) as usize), |channel| {
                 Arc::as_ptr(channel) as usize
@@ -98,7 +118,16 @@ pub(crate) fn select(
         .collect();
     let mut won = None;
     for &i in &order {
-        let case = &mut read[i as usize];
+        let case = match &mut read[i as usize] {
+            Read::Channel(case) => case,
+            Read::Signal(signal) => {
+                if signal.aborted() {
+                    won = Some((i, Won::Aborted));
+                    break;
+                }
+                continue;
+            }
+        };
         let state = &mut *locks[case.lock];
         let done = match case.send.take() {
             None => state.try_receive().map(Won::Received),
@@ -129,7 +158,9 @@ pub(crate) fn select(
         let waiter = new_waiter(global, id);
         // In the random order too: cases on one channel are ready together.
         for &i in &order {
-            let case = &mut read[i as usize];
+            let Read::Channel(case) = &mut read[i as usize] else {
+                continue;
+            };
             let queued = Queued {
                 waiter: Arc::clone(&waiter),
                 case: i,
@@ -141,21 +172,38 @@ pub(crate) fn select(
             }
         }
         drop(locks);
-        let sends = read.iter().map(|case| case.is_send).collect();
+        let sends = read
+            .iter()
+            .map(|case| matches!(case, Read::Channel(case) if case.is_send))
+            .collect();
+        let signals = read
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, case)| match case {
+                Read::Signal(signal) => Some((i as u32, signal)),
+                Read::Channel(_) => None,
+            })
+            .collect();
         return Ok(wait(
             global,
             OpKind::Select(sends),
             waiter,
             channels,
             parsed.signal,
+            signals,
         ));
     };
     drop(locks);
+    let reason = match (&won, &read[index as usize]) {
+        (Won::Aborted, Read::Signal(signal)) => signal.js_reason(global),
+        _ => JSValue::UNDEFINED,
+    };
     // The values of the cases that lost, outside the locks.
     drop(read);
 
     let index = i64::from(index);
     let value = match won {
+        Won::Aborted => select_result(global, index, reason, false),
         Won::Received(ReceiveNow::Value(message, sender)) => {
             if let Some(sender) = sender {
                 sender.wake(WakeResult::Sent);
@@ -176,15 +224,19 @@ pub(crate) fn select(
     Ok(JSPromise::resolved_promise_value(global, value))
 }
 
-/// A receive is a channel; a send is `[channel, value]`, whose value this clones.
-fn read_case(global: &JSGlobalObject, case: JSValue, i: u32) -> JsResult<Case> {
+/// A receive is a channel; a send is `[channel, value]`, whose value this clones; an
+/// `AbortSignal` is ready once it aborts.
+fn read_case(global: &JSGlobalObject, case: JSValue, i: u32) -> JsResult<Read> {
     if let Some(channel) = case.as_class_ref::<Channel>() {
-        return Ok(Case {
+        return Ok(Read::Channel(Case {
             channel: Arc::clone(channel.core()),
             send: None,
             is_send: false,
             lock: 0,
-        });
+        }));
+    }
+    if let Some(signal) = AbortSignal::ref_from_js(case) {
+        return Ok(Read::Signal(signal));
     }
     if case.js_type().is_array() && case.get_length(global)? == 2 {
         if let Some(channel) = case.get_index(global, 0)?.as_class_ref::<Channel>() {
@@ -196,19 +248,19 @@ fn read_case(global: &JSGlobalObject, case: JSValue, i: u32) -> JsResult<Case> {
                 JSValue::UNDEFINED,
                 CloneSite::SelectSend(i),
             )?;
-            return Ok(Case {
+            return Ok(Read::Channel(Case {
                 channel,
                 send: Some(message),
                 is_send: true,
                 lock: 0,
-            });
+            }));
         }
     }
     Err(global
         .err(
             ErrorCode::INVALID_ARG_TYPE,
             format_args!(
-                "The \"cases[{i}]\" argument must be a Bun.Channel to receive from, or a [Bun.Channel, value] array to send on"
+                "The \"cases[{i}]\" argument must be a Bun.Channel to receive from, a [Bun.Channel, value] array to send on, or an AbortSignal"
             ),
         )
         .throw())

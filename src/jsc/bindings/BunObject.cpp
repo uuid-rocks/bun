@@ -39,6 +39,7 @@
 #include "ErrorCode.h"
 #include "GeneratedArchive.h"
 #include "GeneratedChannel.h"
+#include "GeneratedMutex.h"
 #include "GeneratedBlob.h"
 #include "GeneratedBunObject.h"
 #include "GeneratedBunObjectInternals.h"
@@ -434,6 +435,16 @@ static JSValue createBunGo(VM& vm, Zig::GlobalObject* globalObject)
 }
 
 static JSValue constructBunGo(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunGo); }
+
+static JSValue createBunWaitGroup(VM& vm, Zig::GlobalObject* globalObject)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    JSValue exports = BUN_REQUIRE_INTERNAL_MODULE(globalObject, InternalGoSpawn, "Bun.WaitGroup", "WaitGroup"_s);
+    RETURN_IF_EXCEPTION(scope, {});
+    RELEASE_AND_RETURN(scope, exports.getObject()->get(globalObject, Identifier::fromString(vm, "WaitGroup"_s)));
+}
+
+static JSValue constructBunWaitGroup(VM& vm, JSObject* bunObject) { return checkedBunObjectValue(vm, bunObject, createBunWaitGroup); }
 
 static JSValue constructDNSObject(VM& vm, JSObject* bunObject)
 {
@@ -1013,6 +1024,8 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     MD4                                            Bun::Bindgen::Generated::CryptoHasher::getMD4Constructor            DontDelete|PropertyCallback
     MD5                                            Bun::Bindgen::Generated::CryptoHasher::getMD5Constructor            DontDelete|PropertyCallback
     ModuleGraph                                    constructModuleGraphObject                                          DontDelete|ReadOnly|PropertyCallback
+    Mutex                                          Bun::Bindgen::Generated::Mutex::getMutexConstructor                 DontDelete|PropertyCallback
+    WaitGroup                                      constructBunWaitGroup                                               DontDelete|PropertyCallback
     SHA1                                           Bun::Bindgen::Generated::CryptoHasher::getSHA1Constructor           DontDelete|PropertyCallback
     SHA224                                         Bun::Bindgen::Generated::CryptoHasher::getSHA224Constructor         DontDelete|PropertyCallback
     SHA256                                         Bun::Bindgen::Generated::CryptoHasher::getSHA256Constructor         DontDelete|PropertyCallback

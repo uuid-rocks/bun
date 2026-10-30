@@ -134,6 +134,9 @@ using namespace JSC;
     macro(mode) \
     macro(moduleGraph) \
     macro(mtimeMs) \
+    macro(mutexLock) \
+    macro(mutexTryLock) \
+    macro(mutexUnlock) \
     macro(napiDlopenHandle) \
     macro(napiWrappedContents) \
     macro(normalize) \

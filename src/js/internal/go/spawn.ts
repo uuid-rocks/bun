@@ -442,6 +442,82 @@ function settle(id: number, outcome: Outcome, value: unknown) {
   else entry.reject(outcome === Outcome.Rejected ? fromThread(value as Thrown) : value);
 }
 
+// What disposal aborts a WaitGroup's goroutines with. A goroutine's signal is a clone of the group's, so what it
+// rejects with because of the abort is a clone of this: the same name and message.
+const kDisposed = "The WaitGroup was disposed";
+
+function isDisposal(error: unknown) {
+  return error instanceof Error && error.name === "AbortError" && error.message === kDisposed;
+}
+
+// Go's sync.WaitGroup with its Go method (Go 1.25), and errgroup's first-error cancellation.
+class WaitGroup {
+  #controller = new AbortController();
+  #signal: AbortSignal;
+  #running = new Set<Promise<unknown>>();
+  // The first goroutine that failed, and whether wait() has thrown it.
+  #failure: { error: unknown; thrown: boolean } | undefined;
+  // Disposal aborted the goroutines: the reason they throw from then on is what it asked for.
+  #disposed = false;
+
+  constructor(options?: { signal?: AbortSignal }) {
+    let parent: AbortSignal | undefined;
+    if (options !== undefined) {
+      if (!$isObject(options)) throw $ERR_INVALID_ARG_TYPE("options", "object", options);
+      parent = options.signal;
+      if (parent !== undefined && !(parent instanceof AbortSignal)) {
+        throw $ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", parent);
+      }
+    }
+    // AbortSignal.any() holds what it makes weakly: a long-lived parent does not keep this alive.
+    this.#signal = parent === undefined ? this.#controller.signal : AbortSignal.any([parent, this.#controller.signal]);
+  }
+
+  get signal() {
+    return this.#signal;
+  }
+
+  go(fn: unknown, ...args: unknown[]) {
+    const goroutine = go(fn, ...args);
+    const running = this.#running;
+    running.add(goroutine);
+    goroutine.then(
+      () => running.delete(goroutine),
+      error => {
+        running.delete(goroutine);
+        if (this.#failure !== undefined || (this.#disposed && isDisposal(error))) return;
+        this.#failure = { error, thrown: false };
+        this.#controller.abort(error);
+      },
+    );
+    return goroutine;
+  }
+
+  async wait() {
+    const running = this.#running;
+    // Goroutines can start more while it waits.
+    while (running.size > 0) await Promise.allSettled(running);
+    const failure = this.#failure;
+    if (failure !== undefined) {
+      failure.thrown = true;
+      throw failure.error;
+    }
+  }
+
+  async [Symbol.asyncDispose]() {
+    this.#disposed = true;
+    // A DOMException keeps its name through the clone; an Error's custom name does not.
+    this.#controller.abort(new DOMException(kDisposed, "AbortError"));
+    const running = this.#running;
+    while (running.size > 0) await Promise.allSettled(running);
+    const failure = this.#failure;
+    if (failure !== undefined && !failure.thrown) {
+      failure.thrown = true;
+      throw failure.error;
+    }
+  }
+}
+
 export default {
   go,
   settle,
@@ -449,4 +525,5 @@ export default {
   enterPool() {
     onPoolThread = true;
   },
+  WaitGroup,
 };

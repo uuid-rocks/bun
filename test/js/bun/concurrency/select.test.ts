@@ -530,4 +530,85 @@ describe("Bun.select", () => {
     expect(ch.length).toBe(0);
     expect(channelQueueLengths(ch)).toEqual(empty);
   });
+
+  test("an AbortSignal is a case: ready once it aborts, with its reason as the value", async () => {
+    const ch = new Bun.Channel<number>();
+    const timeout = await Bun.select([ch, AbortSignal.timeout(1)]);
+    expect(timeout).toEqual({ index: 1, value: expect.any(DOMException), closed: false });
+    expect((timeout.value as DOMException).name).toBe("TimeoutError");
+    // The receive case that lost is no longer queued.
+    expect(channelQueueLengths(ch)).toEqual(empty);
+
+    const controller = new AbortController();
+    const waiting = Bun.select([ch, controller.signal]);
+    expect(channelQueueLengths(ch)).toEqual({ receivers: 1, senders: 0 });
+    controller.abort("quit");
+    expect(await waiting).toEqual({ index: 1, value: "quit", closed: false });
+    expect(channelQueueLengths(ch)).toEqual(empty);
+
+    // A signal that already aborted is ready at once.
+    expect(await Bun.select([ch, controller.signal])).toEqual({ index: 1, value: "quit", closed: false });
+    expect(channelQueueLengths(ch)).toEqual(empty);
+    expect(await Bun.select([ch, new AbortController().signal], { default: true })).toEqual({
+      index: -1,
+      value: undefined,
+      closed: false,
+    });
+  });
+
+  test("a channel case that wins leaves the signal case alone, and options.signal still rejects", async () => {
+    const ch = new Bun.Channel<number>(1);
+    const quit = new AbortController();
+    const waiting = Bun.select([ch, quit.signal]);
+    await ch.send(7);
+    expect(await waiting).toEqual({ index: 0, value: 7, closed: false });
+    // Aborting it afterwards changes nothing.
+    quit.abort("late");
+    expect(ch.length).toBe(0);
+
+    const cancel = new AbortController();
+    const rejected = Bun.select([ch, new AbortController().signal], { signal: cancel.signal });
+    cancel.abort(new Error("gave up"));
+    expect(await rejected.catch(e => e.message)).toBe("gave up");
+    expect(channelQueueLengths(ch)).toEqual(empty);
+  });
+
+  test("an aborted signal and a ready channel are each picked at random", async () => {
+    const ch = new Bun.Channel<number>(1);
+    const seen = new Set<number>();
+    for (let i = 0; i < 200 && seen.size < 2; i++) {
+      if (ch.length === 0) await ch.send(i);
+      seen.add((await Bun.select([ch, AbortSignal.abort()])).index);
+    }
+    expect([...seen].sort()).toEqual([0, 1]);
+  });
+
+  test("a goroutine selects on a signal from another thread, like ctx.Done()", async () => {
+    const jobs = new Bun.Channel<number>();
+    const done = new AbortController();
+    const goroutine = Bun.go(
+      async (jobs: Bun.Channel<number>, done: AbortSignal) => {
+        let handled = 0;
+        while (true) {
+          const result = await Bun.select([jobs, done]);
+          if (result.index === 1) return { handled, reason: result.value };
+          handled++;
+        }
+      },
+      jobs,
+      done.signal,
+    );
+    await jobs.send(1);
+    await jobs.send(2);
+    while (channelQueueLengths(jobs).receivers === 0) await Bun.sleep(1);
+    done.abort("shutting down");
+    expect(await goroutine).toEqual({ handled: 2, reason: "shutting down" });
+    expect(channelQueueLengths(jobs)).toEqual(empty);
+  });
+
+  test("a case that is neither a channel, a send nor a signal names what it may be", async () => {
+    expect(await Bun.select([1 as any]).catch(e => e.message)).toBe(
+      'The "cases[0]" argument must be a Bun.Channel to receive from, a [Bun.Channel, value] array to send on, or an AbortSignal',
+    );
+  });
 });

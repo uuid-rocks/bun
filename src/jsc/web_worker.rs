@@ -419,8 +419,12 @@ unsafe extern "C" fn Bun__Go__releaseSourceMap(map: *const bun_sourcemap::Parsed
     drop(unsafe { std::sync::Arc::from_raw(map) });
 }
 
+/// `WebWorker`s that exist, whether or not their VM does yet or still.
+pub static LIVE_WORKERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 impl Drop for WebWorker {
     fn drop(&mut self) {
+        LIVE_WORKERS.fetch_sub(1, Ordering::SeqCst);
         log!("[{}] destroy", self.execution_context_id);
         debug_assert!(
             self.join_handle.with_mut(|h| h.is_none()),
@@ -454,6 +458,10 @@ impl WebWorker {
     /// Whether this worker was started in eval mode (entry source is a
     /// string, not a file).
     #[inline]
+    pub(crate) fn is_goroutine(&self) -> bool {
+        self.kind == WorkerKind::Goroutine
+    }
+
     pub fn eval_mode(&self) -> bool {
         self.eval_mode
     }
@@ -673,6 +681,7 @@ impl WebWorker {
         };
 
         // The construction ref: handed to C++ on success, dropped on failure.
+        LIVE_WORKERS.fetch_add(1, Ordering::SeqCst);
         let worker = bun_ptr::RefPtr::new(WebWorker {
             messaging_proxy: proxy,
             parent,

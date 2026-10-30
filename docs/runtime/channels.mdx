@@ -135,11 +135,29 @@ try {
 
 A value that a receiver took before the signal aborted stays sent and is received.
 
+### Stopping a `for await` loop
+
+`for await` receives until the channel is closed. To stop it sooner without closing the channel for everyone else, iterate `channel.values({ signal })`. When the signal aborts, the loop throws the signal's reason:
+
+```ts
+const controller = new AbortController();
+
+try {
+  for await (const job of jobs.values({ signal: controller.signal })) {
+    await handle(job);
+  }
+} catch (error) {
+  if (error !== controller.signal.reason) throw error;
+}
+```
+
+No value is lost: each one is either received by the loop or left in the channel for another receiver. `break` stops the loop too, and also leaves the channel open.
+
 ---
 
 ## Waiting on several channels with `select`
 
-`Bun.select()` waits until one of several channel operations can happen, then does exactly that one, the way Go's `select` does. Each case is a channel to receive from, or `[channel, value]` to send `value` on it.
+`Bun.select()` waits until one of several channel operations can happen, then does exactly that one, the way Go's `select` does. Each case is a channel to receive from, `[channel, value]` to send `value` on it, or an `AbortSignal`.
 
 ```ts
 const jobs = new Bun.Channel<string>();
@@ -160,6 +178,7 @@ The result says which case happened, by its index in the list:
 | receive, closed    | `{ index, value: undefined, closed: true }`, once the channel is closed and every value is received |
 | send               | `{ index, value: undefined, closed: false }`                                                        |
 | send, closed       | rejects with `ERR_CHANNEL_CLOSED`                                                                   |
+| `AbortSignal`      | `{ index, value: signal.reason, closed: false }`, once the signal aborts                            |
 | nothing, `default` | `{ index: -1, value: undefined, closed: false }`                                                    |
 
 Only the case that happens takes a value or sends one. The others do nothing. When several cases are ready, `select()` picks one at random, so a busy channel does not starve the others.
@@ -198,7 +217,27 @@ if (result.index === -1) console.log("no job yet");
 
 ### Timeouts and cancelling
 
-Pass a `signal` to stop waiting. The promise rejects with the signal's reason, and no case happens. `AbortSignal.timeout()` is a timeout:
+An `AbortSignal` in the list is a case like any other: it is ready once it aborts. `AbortSignal.timeout(ms)` is Go's `case <-time.After(d)`, and the signal of an `AbortController` is `case <-ctx.Done()`:
+
+```ts
+const shutdown = new AbortController();
+
+while (true) {
+  const result = await Bun.select([jobs, shutdown.signal, AbortSignal.timeout(1000)]);
+  if (result.index === 0) {
+    if (result.closed) break;
+    console.log("job:", result.value);
+  } else if (result.index === 1) {
+    break; // shutting down
+  } else {
+    console.log("no job for a second");
+  }
+}
+```
+
+A signal that has already aborted is ready at once. When nothing else is ready, the signal case wins and the other cases leave their channels.
+
+To give up on the whole `select()` instead, pass `options.signal`: the promise rejects with the signal's reason, and no case happens. A case that happened before the signal aborted stays done.
 
 ```ts
 try {
@@ -207,8 +246,6 @@ try {
   console.log(error.name); // => "TimeoutError"
 }
 ```
-
-A case that happened before the signal aborted stays done.
 
 ### Send values
 
@@ -241,4 +278,4 @@ A channel that holds a value containing a handle to itself is freed only once th
 
 ## The event loop
 
-A waiting `send()`, `receive()` or `select()` does not keep the process alive. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel.
+A waiting `send()`, `receive()` or `select()` does not keep the process alive. When every thread waits on a channel or a mutex and nothing else can wake one, Bun reports a [deadlock](/runtime/goroutines#deadlocks) and exits. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel.

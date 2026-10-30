@@ -106,6 +106,10 @@ pub(crate) struct RuntimeState {
     /// `Bun.Channel` operations waiting for another thread.
     pub(crate) channel_ops:
         crate::concurrency::ops::OpTable<crate::concurrency::channel::ChannelOp>,
+    /// Whether this VM is asleep, for `Bun.go`'s deadlock detection.
+    pub(crate) deadlock: crate::concurrency::deadlock::Local,
+    /// The `Bun.Mutex`es this VM holds.
+    pub(crate) mutexes_held: crate::concurrency::mutex::Held,
     /// `bun lint`: what runs the rules of JavaScript plugins in this VM.
     pub(crate) lint: core::cell::OnceCell<Box<crate::cli::lint_js::LintVm>>,
     /// The `uv_loop_t` that addons get for this VM. Stored inline because addons
@@ -392,6 +396,8 @@ unsafe fn init_runtime_state(
         wake_ctx: None,
         cron_jobs: Vec::new(),
         channel_ops: Default::default(),
+        deadlock: Default::default(),
+        mutexes_held: Default::default(),
         lint: core::cell::OnceCell::new(),
         // SAFETY: `vm` is the live VM being initialized. `VirtualMachine::init`
         // wrote `handle` before calling this hook (the wake context below reads
@@ -402,6 +408,7 @@ unsafe fn init_runtime_state(
         },
     }));
     RUNTIME_STATE.with(|c| c.set(state));
+    crate::concurrency::deadlock::register(vm, state);
 
     // `Timespec::now_allow_mocked_time` reads `bun_core::mock_time` directly;
     // `FakeTimers::{set_now,clear_now}` write that storage so timers
@@ -518,6 +525,7 @@ unsafe fn init_runtime_state(
                 // Mirrors `deinit_runtime_state`, which is the teardown the
                 // `Ok` path would otherwise reach.
                 RUNTIME_STATE.with(|c| c.set(ptr::null_mut()));
+                crate::concurrency::deadlock::unregister(state);
                 // SAFETY: `state` is the unique `heap::into_raw` result from the
                 // top of this fn; the TLS slot was just nulled so no other live
                 // alias exists on this thread.
@@ -725,6 +733,7 @@ unsafe fn deinit_runtime_state(_vm: *mut VirtualMachine, state: OpaqueRuntimeSta
         drop(unsafe { bun_core::heap::take(printer) });
     }
     if !state.is_null() {
+        crate::concurrency::deadlock::unregister(state.cast::<RuntimeState>());
         // SAFETY: per fn contract — `state` is the unique `heap::alloc` result
         // from `init_runtime_state`; the TLS was just cleared so no other live
         // alias exists on this thread.
@@ -1069,6 +1078,9 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
         // Fold the QUIC deadline into the poll timeout.
         let quic_next_tick_us = loop_.internal_loop_data.quic_next_tick_us();
         let mut timespec = bun_core::Timespec { sec: 0, nsec: 0 };
+        // SAFETY: `state` is the live per-thread `RuntimeState`; `vm` per fn contract.
+        let asleep =
+            !uv_idle_started && unsafe { crate::concurrency::deadlock::before_poll(vm, state) };
         if loop_.is_active() {
             // Before `get_timeout`: the first call arms the idle GC timer, and a
             // timer armed after the poll deadline is computed is not in that deadline.
@@ -1103,6 +1115,9 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
             loop_.tick_with_timeout(if have_timeout { Some(&timespec) } else { None }, now_ns);
         } else {
             loop_.tick_without_idle();
+        }
+        if asleep {
+            crate::concurrency::deadlock::after_poll(state);
         }
     }
 
@@ -1198,6 +1213,9 @@ unsafe fn auto_tick_active(vm: *mut VirtualMachine) {
             || unsafe { &*el }.has_pending_tasks();
         let quic_next_tick_us = loop_.internal_loop_data.quic_next_tick_us();
         let mut timespec = bun_core::Timespec { sec: 0, nsec: 0 };
+        // SAFETY: `state` is the live per-thread `RuntimeState`; `vm` per fn contract.
+        let asleep =
+            !uv_idle_started && unsafe { crate::concurrency::deadlock::before_poll(vm, state) };
         if loop_.is_active() {
             // Before `get_timeout` — see the matching call in `auto_tick`.
             // SAFETY: `el` is the live per-thread event loop.
@@ -1222,6 +1240,9 @@ unsafe fn auto_tick_active(vm: *mut VirtualMachine) {
             loop_.tick_with_timeout(if have_timeout { Some(&timespec) } else { None }, now_ns);
         } else {
             loop_.tick_without_idle();
+        }
+        if asleep {
+            crate::concurrency::deadlock::after_poll(state);
         }
     }
 

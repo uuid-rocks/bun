@@ -96,6 +96,11 @@ export const channelQueueLengths = $bindgen("channel_testing.bind.ts", "queueLen
   channel: import("bun").Channel<any>,
 ) => { receivers: number; senders: number };
 
+/** The entries a `Bun.Mutex`'s queue of waiters holds, including those of `lock()`s that were aborted. */
+export const mutexWaiters = $bindgen("mutex_testing.bind.ts", "waitersForTesting") as (
+  mutex: import("bun").Mutex,
+) => number;
+
 export const semverIntersects = $bindgen("SemverObjectInternals.bind.ts", "intersects") as (
   left: string,
   right: string,
