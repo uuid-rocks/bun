@@ -38,8 +38,14 @@ function errorRecord(error: Error, depth: number, withProps: boolean) {
   } = { name, message, stack, props: undefined };
   if (withProps) {
     if ("cause" in error && depth < kMaxCauseDepth) record.cause = thrown(error.cause, depth + 1, true);
-    const props = { ...error };
-    if ($isObject(props) && Reflect.ownKeys(props).length > 0) record.props = props;
+    const props: Record<string, unknown> = { ...error };
+    // Node's error codes are not enumerable.
+    let code;
+    try {
+      code = (error as { code?: unknown }).code;
+    } catch {}
+    if (typeof code === "string" && !("code" in props)) props.code = code;
+    if (Reflect.ownKeys(props).length > 0) record.props = props;
   }
   return record;
 }
