@@ -33,6 +33,8 @@
 #include "SerializedScriptValue.h"
 #include "MessagePort.h"
 #include "JSStructuredSerializeOptions.h"
+#include "ChannelMessage.h"
+#include "JSDOMException.h"
 
 namespace WebCore {
 using namespace JSC;
@@ -62,12 +64,19 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionStructuredClone, (JSC::JSGlobalObject * globa
     // only the WorkerPostMessage context takes the SAB-sharing path; Default would copy to a plain AB.
     ExceptionOr<Ref<SerializedScriptValue>> serialized = SerializedScriptValue::create(*globalObject, value, WTF::move(serializeOptions.transfer), ports,
         SerializationForStorage::No, SerializationContext::WorkerPostMessage);
-    RETURN_IF_EXCEPTION(throwScope, {});
-    if (serialized.hasException()) {
+    if (!throwScope.exception() && serialized.hasException())
         WebCore::propagateException(*globalObject, throwScope, serialized.releaseException());
-        RELEASE_AND_RETURN(throwScope, {});
+    if (JSC::Exception* exception = throwScope.exception()) {
+        // A WaitGroup or a MutexLock says what to do instead.
+        auto* domException = dynamicDowncast<JSDOMException>(exception->value());
+        if (!vm.isTerminationException(exception) && domException && domException->wrapped().name() == "DataCloneError"_s) {
+            if (auto marked = Bun::markedUncloneable(vm, value)) {
+                (void)throwScope.tryClearException();
+                throwException(globalObject, throwScope, createDOMException(globalObject, ExceptionCode::DataCloneError, makeString("structuredClone(): value is "_s, marked->what, ", which can't be cloned."_s, Bun::hintSentence(marked->hint))));
+            }
+        }
+        return {};
     }
-    RETURN_IF_EXCEPTION(throwScope, {});
 
     JSValue deserialized = serialized.releaseReturnValue()->deserialize(*globalObject, globalObject, ports);
     RETURN_IF_EXCEPTION(throwScope, {});

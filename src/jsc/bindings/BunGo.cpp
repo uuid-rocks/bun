@@ -798,15 +798,15 @@ JSC_DEFINE_HOST_FUNCTION(jsGoCheck, (JSGlobalObject * lexicalGlobalObject, CallF
     auto text = makeString('(', source, ')').utf8();
     bool parsed = Bun__Go__functionNames(text.data(), text.length(), &names, [](void* context, const uint8_t* name, size_t length, NamePosition position) { static_cast<Names*>(context)->append({ String::fromUTF8(std::span { name, length }), position }); }, &found);
 
-    // Where a position of the text is in the module's own text, which Bun transpiled (TypeScript,
-    // JSX). The text begins with the "(" around the source.
+    // Where a position of the text is in the source of the module, which Bun transpiled (TypeScript,
+    // JSX) or bundled: its file and line. The text begins with the "(" around the source.
     auto original = [&](NamePosition position) {
         Bun::OwnedZigStackFrames frames(1);
         frames[0].position.line_zero_based = firstLine + std::max(position.line, 0);
         frames[0].position.column_zero_based = position.line > 0 ? position.column : firstColumn + std::max(position.column - 1, 0);
         frames[0].source_url = Bun::toStringRef(module);
         frames.remap(defaultGlobalObject(lexicalGlobalObject)->bunVM());
-        return NamePosition { frames[0].position.line_zero_based, frames[0].position.column_zero_based };
+        return std::pair { frames[0].source_url.toWTFString(), frames[0].position.line_zero_based + 1 };
     };
     MarkedArgumentBuffer problems;
     // Check for an exception after each.
@@ -814,7 +814,8 @@ JSC_DEFINE_HOST_FUNCTION(jsGoCheck, (JSGlobalObject * lexicalGlobalObject, CallF
         MarkedArgumentBuffer problem;
         problem.append(jsString(vm, String(kind)));
         problem.append(jsString(vm, name));
-        problem.append(jsNumber(original(position).line + 1));
+        auto [file, line] = original(position);
+        problem.append(jsString(vm, makeString(file, ':', line)));
         problem.append(jsString(vm, String(valueKindOf(lexicalGlobalObject, name, found.value))));
         problem.append(found.from.isNull() ? jsUndefined() : jsString(vm, found.from));
         problem.append(found.importName.isNull() ? jsUndefined() : jsString(vm, found.importName));

@@ -10,7 +10,7 @@ export async function lock(this: Mutex, options?: { signal?: AbortSignal }) {
     held = false;
     mutex.$mutexUnlock();
   };
-  const lock = { unlock, [Symbol.dispose]: unlock };
+  const lock = { unlock, [Symbol.dispose]: unlock, [Symbol.toStringTag]: "MutexLock" };
   // What a DataCloneError says to do instead (ChannelMessage.cpp).
   $putByIdDirectPrivate(
     lock as typeof lock & { $isUncloneable: string },
@@ -29,7 +29,7 @@ export function tryLock(this: Mutex) {
     held = false;
     mutex.$mutexUnlock();
   };
-  const lock = { unlock, [Symbol.dispose]: unlock };
+  const lock = { unlock, [Symbol.dispose]: unlock, [Symbol.toStringTag]: "MutexLock" };
   // What a DataCloneError says to do instead (ChannelMessage.cpp).
   $putByIdDirectPrivate(
     lock as typeof lock & { $isUncloneable: string },

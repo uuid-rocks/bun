@@ -407,7 +407,11 @@ It writes a `Bun.go()` call with the URL of that entry point's output, and the e
 Bun.go(new URL("./primes.js#countPrimes", import.meta.url), 0, 5e5);
 ```
 
-The build looks at the first argument of any method named `go`, because it can't tell a `WaitGroup` from another object. There it keeps the function, and tells `Bun.go()` the URL on the way, so a `go()` method that isn't Bun's still gets the same function. A method that is not a `WaitGroup`'s only costs an extra entry point.
+For `group.go()`, the build has to know that `group` is a `WaitGroup`: a variable of the same module, declared with `new Bun.WaitGroup()` or `new WaitGroup()` of `"bun"`, and never assigned another value. Any other `.go()` call builds exactly as written, the way it would without goroutines, whether or not it is Bun's: a `WaitGroup` passed to a helper as a parameter, one stored in a property such as `this.group`, or a router's `go()`. A `WaitGroup` reached that way gets a function the build didn't trace (see below), and a URL that names a source file, which `--compile` can't import (`ERR_MODULE_NOT_FOUND`). There, pass the imported function instead of a URL, list its module as an entry point of the build, and build with `--splitting`.
+
+An imported binding passed to a call the build knows is passed as it is, so `Bun.go(WORKER)` of a constant `WORKER = "./worker.ts"` still gets the string. The build doesn't know until run time whether the binding holds a function, so its module becomes an entry point either way.
+
+Because the build makes more entry points, it writes more than one file. Build with `--outdir` or `--compile`. With `--outfile` alone, `bun build` stops with an error that names the entry point `Bun.go()` added.
 
 ```ts main.ts icon="/icons/typescript.svg"
 import { resize } from "./images.ts";
@@ -425,7 +429,7 @@ bun build --compile ./main.ts --outfile resize
 
 So you can move the output and delete the sources. Each task module's output keeps its exports under their own names, with `--minify` too. An executable holds the task modules, so it runs from any directory.
 
-The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment. Or list the module as an entry point of the build, as for a [Worker](/runtime/workers), and build with `--splitting`. Without `--splitting`, the bundle of `main.ts` holds its own copy of the module, and the function it passes is that copy's:
+The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`. The message names the bindings and their lines, in your source files if the build wrote a source map (`--sourcemap`), and says what to do: pass the imported function itself, as in `Bun.go(task)`. Or list the module as an entry point of the build, as for a [Worker](/runtime/workers), and build with `--splitting`. Without `--splitting`, the bundle of `main.ts` holds its own copy of the module, and the function it passes is that copy's:
 
 ```sh terminal icon="terminal"
 bun build --compile --splitting ./main.ts ./tasks/*.ts --outfile app

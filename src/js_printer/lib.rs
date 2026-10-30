@@ -2661,10 +2661,10 @@ pub(crate) mod __gated_printer {
         }
 
         #[inline]
-        /// The function given to `Bun.go()` (`E::Special::BunGoTask`): the URL of its module's
-        /// entry chunk with the export as the fragment, or the expression as written when the
-        /// module is not part of the bundle. Given to another `.go()` method (a third argument),
-        /// the function itself, which Bun.go's registry learns that URL of on the way.
+        /// What names the function given to `Bun.go()` (`E::Special::BunGoTask`): the URL of its
+        /// module's entry chunk with the export as the fragment, or the expression as written when
+        /// the module is not part of the bundle. An imported binding (a third argument) keeps its
+        /// value, a function among them registered with that URL on the way.
         fn print_bun_go_task(&mut self, call: &E::Call, level: Level, flags: ExprFlagSet) {
             let ExprData::ESpecial(E::Special::BunGoTask(import_record_index)) = call.target.data
             else {

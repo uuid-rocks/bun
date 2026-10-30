@@ -216,7 +216,7 @@ pub struct ReactRefreshImportClause<'a> {
     pub(crate) r#ref: Ref,
 }
 
-/// What `Bun.go(x, ...)`, `go(x, ...)` or any `<expr>.go(x, ...)` names when `x` is an imported
+/// What `Bun.go(x, ...)`, `go(x, ...)` or `<identifier>.go(x, ...)` names when `x` is an imported
 /// binding or `new URL("./literal", import.meta.url)`. `cjs_source_path`: a CommonJS bundle inlines
 /// `import.meta.url` as this file's URL.
 fn bun_go_task<'a>(
@@ -236,10 +236,9 @@ fn bun_go_task<'a>(
         js_ast::ExprData::EDot(dot) if dot.name.slice() == b"go" => {
             if dot.optional_chain.is_none() && is_unbound_global(&dot.target, b"Bun") {
                 BunGoCallee::Bun
-            } else if let Some(id) = dot.target.data.e_identifier() {
-                BunGoCallee::Local(id.ref_)
             } else {
-                BunGoCallee::Method
+                // Another receiver is not known to be a `Bun.WaitGroup`: its call builds as written.
+                BunGoCallee::Local(dot.target.data.e_identifier()?.ref_)
             }
         }
         js_ast::ExprData::EImportIdentifier(id) => BunGoCallee::Import(id.ref_),
@@ -300,11 +299,6 @@ fn bun_go_task<'a>(
         }
         _ => return None,
     };
-    // A URL is the argument of a Bun API only for a call known to be one: another `go()` method
-    // gets it as written, whether or not it names a module.
-    if matches!(callee, BunGoCallee::Method) && matches!(task, BunGoTask::Url { .. }) {
-        return None;
-    }
     Some((callee, task))
 }
 
@@ -348,12 +342,8 @@ pub(crate) enum BunGoCallee {
     /// An imported binding: `Bun.go` if it is `go` of "bun", which is known once the imports are.
     Import(Ref),
     /// The `go` method of a binding: a `Bun.WaitGroup`'s if `is_wait_group` says so once every
-    /// declaration and assignment has been visited; otherwise a `Method`.
+    /// declaration and assignment has been visited. Another's call builds as written.
     Local(Ref),
-    /// Any other `go` method, perhaps a `Bun.WaitGroup`'s. An imported function passed to it stays
-    /// what it is, and is registered with its module's URL on the way (`print_bun_go_task`): a
-    /// method that is not one of Bun's still gets the same value. A URL passed to it is left alone.
-    Method,
 }
 
 #[derive(Clone, Copy)]
@@ -1322,23 +1312,17 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                 callee,
                 task,
             } = self.bun_go_calls[i];
-            let keeps_value = match callee {
-                BunGoCallee::Bun => false,
-                BunGoCallee::Import(ref_) => {
-                    if !self.is_import_of_bun(ref_, b"go") {
-                        continue;
-                    }
-                    false
-                }
-                BunGoCallee::Local(ref_) => {
-                    if !self.is_wait_group(ref_) && matches!(task, BunGoTask::Url { .. }) {
-                        continue;
-                    }
-                    // A URL is printed as the URL of its module's entry chunk.
-                    matches!(task, BunGoTask::Import(_))
-                }
-                BunGoCallee::Method => true,
+            let is_bun_go = match callee {
+                BunGoCallee::Bun => true,
+                BunGoCallee::Import(ref_) => self.is_import_of_bun(ref_, b"go"),
+                BunGoCallee::Local(ref_) => self.is_wait_group(ref_),
             };
+            if !is_bun_go {
+                continue;
+            }
+            // An imported binding may be a constant (a module's path, say), not a function: its value
+            // is what the call gets, and a function among them is registered with its URL on the way.
+            let keeps_value = matches!(task, BunGoTask::Import(_));
             let (specifier, fragment, range): (&'a [u8], &'a [u8], bun_ast::Range) = match task {
                 BunGoTask::Import(ref_) => {
                     let Some(import) = self.named_imports.get(&ref_) else {
@@ -1387,7 +1371,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
                 self.add_import_record_by_range(ImportKind::BunGo, range, specifier);
             let original = call.args.slice()[0];
             let fragment_expr = self.new_expr(E::String::init(fragment), original.loc);
-            // A third argument: `print_bun_go_task` keeps the value (`BunGoCallee::Method`).
+            // A third argument: `print_bun_go_task` keeps the value.
             let args = if keeps_value {
                 let keep = self.new_expr(E::Boolean { value: true }, original.loc);
                 ExprNodeList::from_arena_slice(self.arena.alloc_slice_copy(&[

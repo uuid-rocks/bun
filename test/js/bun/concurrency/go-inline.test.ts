@@ -113,9 +113,9 @@ describe.concurrent("Bun.go with an inline function", () => {
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run "max" on another thread: it has no source of its own (it is native). Pass a function written in your code.
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it calls \`eval()\` directly (<dir>/main.ts:31), which can read the variables around it: call \`(0, eval)()\` instead.
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it uses "sleep" (<dir>/main.ts:32), which is Bun.sleep: use Bun.sleep instead.
-      ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it uses "helper" (<dir>/main.ts:34), a function of the code around it: define it inside this function, or export it from a module other than the entry point and import it inside this function with \`await import()\`.
+      ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it uses "helper" (<dir>/main.ts:34), a function of the code around it: define it inside this function, or export it from another module and \`await import()\` it there.
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it uses "Shape" (<dir>/main.ts:35), which its module imports from "./tasks.ts": import it inside this function with \`const { Shape } = await import("./tasks.ts")\`, or export a function that uses it from a module of your own and pass that function to Bun.go().
-      ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it uses "tasks" (<dir>/main.ts:36), a module's namespace: import the module inside this function with \`await import()\`.
+      ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it uses "tasks" (<dir>/main.ts:36), a module's namespace: \`await import()\` the module inside this function.
       ERR_GOROUTINE_NOT_SENDABLE Bun.go() can't run this function on another thread: it uses "triple" (<dir>/main.ts:37), which its module imports from "./tasks.ts": pass it to Bun.go() itself, as in Bun.go(triple, ...args), or import it inside this function with \`const { triple } = await import("./tasks.ts")\`."
     `);
     expect(exitCode).toBe(0);

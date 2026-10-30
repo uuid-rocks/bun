@@ -14,5 +14,9 @@ struct Uncloneable {
     String hint;
 };
 std::optional<Uncloneable> findUncloneable(JSC::JSGlobalObject*, JSC::JSValue);
+// The Uncloneable of `value` itself if it belongs to its thread, from the mark it carries; runs no getter.
+std::optional<Uncloneable> markedUncloneable(JSC::VM&, JSC::JSValue);
+// " A lock belongs to ...", or nothing.
+String hintSentence(const String& hint);
 
 }

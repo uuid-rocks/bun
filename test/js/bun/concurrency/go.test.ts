@@ -561,6 +561,61 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(1);
   });
 
+  test("what go() throws keeps the frame of a function that calls it, and a DataCloneError's stack starts with its name", async () => {
+    const { stdout, exitCode } = await run({
+      "main.ts": `
+        let captured = 1;
+        function spawn(fn: Function, arg: unknown) {
+          const goroutine = Bun.go(fn, arg);
+          console.log("not reached");
+          return goroutine;
+        }
+        for (const [fn, arg] of [[() => captured, 1], [() => 1, () => {}]] as const) {
+          try {
+            spawn(fn, arg);
+          } catch (e) {
+            console.log(e.stack.split("\\n").slice(0, 3).map((line: string, i: number) => (i === 0 ? line.slice(0, 60) : line.trim())).join("\\n"));
+          }
+        }
+      `,
+    });
+    expect(stdout).toMatchInlineSnapshot(`
+      "TypeError: Bun.go() can't run this function on another threa
+      at spawn (<dir>/main.ts:4:33)
+      at <dir>/main.ts:10:13
+      DataCloneError: Bun.go() argument 1 is a function, which can
+      at spawn (<dir>/main.ts:4:33)
+      at <dir>/main.ts:10:13"
+    `);
+    expect(exitCode).toBe(0);
+  });
+
+  test("in a Worker, the advice for a goroutine its own script exports is to move the function first", async () => {
+    const { stdout, exitCode } = await run({
+      "main.ts": `
+        const worker = new Worker(new URL("./worker.ts", import.meta.url));
+        worker.onmessage = event => {
+          console.log(event.data);
+          worker.terminate();
+        };
+      `,
+      "worker.ts": `
+        export function work(x: number) {
+          return x * 2;
+        }
+        try {
+          Bun.go(work, 1);
+        } catch (error) {
+          postMessage(error.message);
+        }
+      `,
+    });
+    expect(stdout).toMatchInlineSnapshot(
+      `"Bun.go() can't run "work" on another thread: it is exported by the entry point, <dir>/worker.ts, which each pool thread would import to run it, and the entry point's top-level code would run there again. Move "work" to a module of its own, or put that code inside if (import.meta.main) { ... }, which is false on a pool thread."`,
+    );
+    expect(exitCode).toBe(0);
+  });
+
   test("an unhandled goroutine rejection is an unhandled rejection in the spawner", async () => {
     const { stdout, stderr, exitCode } = await run({
       "task.ts": `export function fail() { throw new RangeError("goroutine failed"); }`,

@@ -35,12 +35,13 @@ const {
 type Source = [source: string, module: string, line: number, column: number, strict: boolean];
 type ProblemKind =
   "unparsable" | "class" | "this" | "arguments" | "import.meta" | "eval" | "captured" | "imported" | "undeclared";
-// The line is one-based, in the module's own text. What a captured or imported binding holds, and
-// where an import comes from (its specifier, and its name there; none for a namespace).
+// Where: the file and one-based line in the module's source, which a source map gives for a bundle.
+// What a captured or imported binding holds, and where an import comes from (its specifier, and its
+// name there; none for a namespace).
 type Problem = [
   kind: ProblemKind,
   name: string,
-  line: number,
+  at: string,
   valueKind: "function" | "native" | "class" | "namespace" | "data" | "bun" | "",
   from: string | undefined,
   importName: string | undefined,
@@ -156,18 +157,25 @@ function keyOf(object: object, fn: Function): string | undefined {
   }
 }
 
-// bun build finds the module of a function only from the call itself.
+// bun build finds the module of a function only from the call itself, and a bundle has no module to
+// import() inside the function.
 function inBundle(api: string) {
-  return ` In a bundle, bun build finds the module of a function passed to ${api}() as an imported binding, as in ${api}(task) or ${api}(tasks.task), or as the module's URL with the export as its fragment, as in ${api}(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build and build with --splitting, so that the function is that entry point's export.`;
+  return ` In a bundle, pass ${api}() the function as an import, as in ${api}(task): bun build makes its module an entry point.`;
 }
 
 function notSendable(api: string, fn: Function, url: string | undefined, problems?: Problem[], bundled = false) {
-  const error = notSendableIn(api, fn, url, problems);
+  const error = notSendableIn(api, fn, url, problems, bundled);
   if (bundled) error.message += inBundle(api);
   return error;
 }
 
-function notSendableIn(api: string, fn: Function, url: string | undefined, problems?: Problem[]) {
+function notSendableIn(
+  api: string,
+  fn: Function,
+  url: string | undefined,
+  problems: Problem[] | undefined,
+  bundled: boolean,
+) {
   const name = fn.name;
   if (url === undefined) {
     // What Function.prototype.bind() makes is named "bound " and the name of what it binds.
@@ -192,75 +200,116 @@ function notSendableIn(api: string, fn: Function, url: string | undefined, probl
       `${api}() can't run ${label} on another thread: it is ${kind === "class" ? "a class" : "a method"}. Pass a function or an arrow function.`,
     );
   }
-  const at = (line: number) => `${url}:${line}`;
-  const reasons: string[] = [];
-  for (const [kind, name, line, valueKind, from, importName] of problems) {
-    const uses = `it uses "${name}" (${at(line)})`;
+  // Bindings that take the same advice are named together, in the order they come.
+  const groups = new Map<string, [what: (one: boolean) => string, uses: [name: string, at: string][]]>();
+  const add = (key: string, name: string, at: string, what: (one: boolean) => string) => {
+    const group = groups.get(key);
+    if (group === undefined) groups.set(key, [what, [[name, at]]]);
+    else group[1].push([name, at]);
+  };
+  const say = (key: string, text: string) => groups.set(`${groups.size} ${key}`, [() => text, []]);
+  const them = (one: boolean) => (one ? "it" : "them");
+  const fromAround = (one: boolean, a: string, many: string) =>
+    `${one ? a : many} of the code around it: define ${them(one)} inside this function${bundled ? "" : `, or export ${them(one)} from another module and \`await import()\` ${them(one)} there`}`;
+  for (const [kind, name, at, valueKind, from, importName] of problems) {
     switch (kind) {
       case "captured":
         if (valueKind === "bun") {
-          reasons.push(`${uses}, which is Bun.${name}: use Bun.${name} instead`);
-        } else if (valueKind === "function" || valueKind === "native" || valueKind === "class") {
-          reasons.push(
-            `${uses}, a ${valueKind === "class" ? "class" : "function"} of the code around it: define it inside this function, or export it from a module other than the entry point and import it inside this function with \`await import()\``,
-          );
+          say(kind, `it uses "${name}" (${at}), which is Bun.${name}: use Bun.${name} instead`);
+        } else if (valueKind === "function" || valueKind === "native") {
+          add("function", name, at, one => fromAround(one, "a function", "functions"));
+        } else if (valueKind === "class") {
+          add("class", name, at, one => fromAround(one, "a class", "classes"));
         } else if (valueKind === "namespace") {
-          reasons.push(`${uses}, a module's namespace: import the module inside this function with \`await import()\``);
+          add("namespace", name, at, one =>
+            bundled
+              ? `${one ? "a module's namespace" : "modules' namespaces"}`
+              : `${one ? "a module's namespace" : "modules' namespaces"}: \`await import()\` ${one ? "the module" : "them"} inside this function`,
+          );
         } else if (valueKind === "data") {
-          reasons.push(`${uses}, a variable of the code around it: pass it as an argument`);
+          add(
+            "data",
+            name,
+            at,
+            one =>
+              `${one ? "a variable" : "variables"} of the code around it: pass ${them(one)} as ${one ? "an argument" : "arguments"}`,
+          );
         } else {
           // Not readable yet, as a function declaration may not be.
-          reasons.push(
-            `${uses}, which belongs to the code around it: pass it as an argument, or, for a function, define it inside this function or export it from a module other than the entry point and import it inside this function with \`await import()\``,
+          add(
+            "around",
+            name,
+            at,
+            one =>
+              `which ${one ? "belongs" : "belong"} to the code around it: pass ${them(one)} as ${one ? "an argument" : "arguments"}, or define ${them(one)} inside this function`,
           );
         }
         break;
       case "imported": {
-        const imports = `${uses}, which its module imports from "${from}"`;
+        const imports = `it uses "${name}" (${at}), which its module imports from "${from}"`;
         const importInside =
           importName === undefined
             ? `\`const ${name} = await import(${JSON.stringify(from)})\``
             : `\`const { ${importName === name ? name : `${importName}: ${name}`} } = await import(${JSON.stringify(from)})\``;
         if (from === "bun" || valueKind === "bun") {
-          reasons.push(
+          say(
+            kind,
             `${imports}: use ${importName === undefined || importName === "default" ? "the global Bun" : `Bun.${importName}`} instead`,
           );
         } else if (valueKind === "function") {
-          reasons.push(
-            `${imports}: pass it to ${api}() itself, as in ${api}(${name}, ...args), or import it inside this function with ${importInside}`,
+          say(
+            kind,
+            `${imports}: pass it to ${api}() itself, as in ${api}(${name}, ...args)${bundled ? "" : `, or import it inside this function with ${importInside}`}`,
           );
         } else if (valueKind === "class" || valueKind === "native") {
           // Neither has a source of its own to send, nor can it be an argument.
-          reasons.push(
-            `${imports}: import it inside this function with ${importInside}, or export a function that uses it from a module of your own and pass that function to ${api}()`,
-          );
+          const own = `export a function that uses it from a module of your own and pass that function to ${api}()`;
+          say(kind, `${imports}: ${bundled ? own : `import it inside this function with ${importInside}, or ${own}`}`);
+        } else if (bundled) {
+          say(kind, `${imports}: pass it as an argument`);
         } else {
-          reasons.push(`${imports}: import it inside this function with ${importInside}, or pass it as an argument`);
+          say(kind, `${imports}: import it inside this function with ${importInside}, or pass it as an argument`);
         }
         break;
       }
       case "undeclared":
-        reasons.push(`${uses}, which is neither its own nor a global: define it inside this function`);
-        break;
-      case "this":
-        reasons.push(
-          `the arrow function uses the \`this\` of the code around it (${at(line)}): pass it as an argument`,
+        add(
+          kind,
+          name,
+          at,
+          one => `which ${one ? "is" : "are"} neither its own nor a global: define ${them(one)} inside this function`,
         );
         break;
+      case "this":
+        say(kind, `the arrow function uses the \`this\` of the code around it (${at}): pass it as an argument`);
+        break;
       case "arguments":
-        reasons.push(
-          `the arrow function uses the \`arguments\` of the function around it (${at(line)}): pass them as arguments`,
+        say(
+          kind,
+          `the arrow function uses the \`arguments\` of the function around it (${at}): pass them as arguments`,
         );
         break;
       case "import.meta":
-        reasons.push(`it uses \`import.meta\` (${at(line)}): pass what it needs from it as an argument`);
+        say(kind, `it uses \`import.meta\` (${at}): pass what it needs from it as an argument`);
         break;
       case "eval":
-        reasons.push(
-          `it calls \`eval()\` directly (${at(line)}), which can read the variables around it: call \`(0, eval)()\` instead`,
+        say(
+          kind,
+          `it calls \`eval()\` directly (${at}), which can read the variables around it: call \`(0, eval)()\` instead`,
         );
         break;
     }
+  }
+  const reasons: string[] = [];
+  for (const [what, uses] of groups.values()) {
+    if (uses.length === 0) {
+      reasons.push(what(true));
+      continue;
+    }
+    const sameAt = uses.every(([, at]) => at === uses[0][1]);
+    const names = uses.map(([name, at]) => (sameAt ? `"${name}"` : `"${name}" (${at})`));
+    const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+    reasons.push(`it uses ${list}${sameAt ? ` (${uses[0][1]})` : ""}, ${what(uses.length === 1)}`);
   }
   return $ERR_GOROUTINE_NOT_SENDABLE(`${api}() can't run ${label} on another thread: ${reasons.join("; ")}.`);
 }
@@ -359,8 +408,12 @@ function cachedTargetOf(api: string, fn: Function): Target {
 // there again, and its own call to go() would wait for itself.
 function unguardedMain(api: string, fn: Function, module: string) {
   const label = fn.name ? `"${fn.name}"` : "this function";
+  const guard = "put that code inside if (import.meta.main) { ... }, which is false on a pool thread";
+  const move = `move ${label} to a module of its own`;
+  // A Worker's script is its own entry point, whose top-level code is the Worker's work.
+  const advice = Bun.isMainThread ? `${guard}, or ${move}` : `${move}, or ${guard}`;
   return $ERR_GOROUTINE_NOT_SENDABLE(
-    `${api}() can't run ${label} on another thread: it is exported by the entry point, ${module}, which each pool thread would import to run it, and the entry point's top-level code would run there again. Put that code inside if (import.meta.main) { ... }, which is false on a pool thread, or move ${label} to a module of its own.`,
+    `${api}() can't run ${label} on another thread: it is exported by the entry point, ${module}, which each pool thread would import to run it, and the entry point's top-level code would run there again. ${advice[0].toUpperCase()}${advice.slice(1)}.`,
   );
 }
 
@@ -424,6 +477,12 @@ function start(api: string, goroutine: Goroutine<unknown>, task: unknown, target
 function thrownBy(error: unknown, caller: Function) {
   if (error instanceof Error && ((error as { code?: unknown }).code !== undefined || error.name === "DataCloneError")) {
     Error.captureStackTrace(error, caller);
+    // A DOMException is not an ErrorInstance: the header of what captureStackTrace writes is "Error".
+    const stack = (error as { stack?: unknown }).stack;
+    if (error instanceof DOMException && typeof stack === "string") {
+      const end = stack.indexOf("\n");
+      (error as { stack?: unknown }).stack = `${error.name}: ${error.message}${end === -1 ? "" : stack.slice(end)}`;
+    }
   }
   return error;
 }
