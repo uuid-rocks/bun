@@ -1,0 +1,453 @@
+import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe, isASAN, isDebug, withoutAsanQuarantine } from "harness";
+
+/** A Worker running `src`. Its first message, its `error` and its exit settle `ready`. */
+function startWorker(src: string, data?: unknown) {
+  const worker = new Worker(URL.createObjectURL(new Blob([src], { type: "application/javascript" })));
+  const closed = Promise.withResolvers<void>();
+  const ready = Promise.withResolvers<unknown>();
+  worker.addEventListener("message", e => ready.resolve(e.data), { once: true });
+  worker.addEventListener("error", e => {
+    const error = e.error ?? new Error(e.message);
+    ready.reject(error);
+    closed.reject(error);
+  });
+  worker.addEventListener("close", () => {
+    ready.reject(new Error("the worker exited before it was ready"));
+    closed.resolve();
+  });
+  // The rejection of a promise nobody awaits is not an unhandled one.
+  ready.promise.catch(() => {});
+  closed.promise.catch(() => {});
+  if (data !== undefined) worker.postMessage(data);
+  return {
+    worker,
+    ready: ready.promise,
+    closed: closed.promise,
+    [Symbol.dispose]() {
+      worker.terminate();
+    },
+  };
+}
+
+describe("Bun.Channel", () => {
+  test("constructor validates the capacity", () => {
+    expect(new Bun.Channel().capacity).toBe(0);
+    expect(new Bun.Channel(undefined).capacity).toBe(0);
+    expect(new Bun.Channel(0).capacity).toBe(0);
+    expect(new Bun.Channel(2 ** 32 - 1).capacity).toBe(2 ** 32 - 1);
+    for (const capacity of [-1, 1.5, 2 ** 32, NaN, Infinity]) {
+      expect(() => new Bun.Channel(capacity)).toThrow(
+        expect.objectContaining({ name: "RangeError", code: "ERR_OUT_OF_RANGE" }),
+      );
+    }
+    for (const capacity of ["1", null, 1n, {}]) {
+      expect(() => new Bun.Channel(capacity as any)).toThrow(
+        expect.objectContaining({ name: "TypeError", code: "ERR_INVALID_ARG_TYPE" }),
+      );
+    }
+    // @ts-expect-error
+    expect(() => Bun.Channel()).toThrow(TypeError);
+  });
+
+  test("options are validated", async () => {
+    const ch = new Bun.Channel(1);
+    await expect(ch.send(1, null as any)).rejects.toMatchObject({ code: "ERR_INVALID_ARG_TYPE" });
+    await expect(ch.send(1, { signal: {} as any })).rejects.toMatchObject({ code: "ERR_INVALID_ARG_TYPE" });
+    await expect(ch.receive({ signal: 1 as any })).rejects.toMatchObject({ code: "ERR_INVALID_ARG_TYPE" });
+    await expect(ch.send(1, { transfer: 1 as any })).rejects.toBeInstanceOf(TypeError);
+    // A function cannot be cloned, and a channel is shared, not transferred.
+    await expect(ch.send(() => {})).rejects.toMatchObject({ name: "DataCloneError" });
+    await expect(ch.send(ch, { transfer: [ch as any] })).rejects.toMatchObject({ name: "DataCloneError" });
+    expect(() => structuredClone(ch, { transfer: [ch as any] })).toThrow(
+      expect.objectContaining({ name: "DataCloneError" }),
+    );
+    // Bytes that leave the process cannot hold a channel.
+    expect(() => require("bun:jsc").serialize(ch)).toThrow(expect.objectContaining({ name: "DataCloneError" }));
+    expect(ch.length).toBe(0);
+  });
+
+  test("unbuffered send waits for a receiver", async () => {
+    const ch = new Bun.Channel<string>();
+    const log: string[] = [];
+    const sent = ch.send("a").then(() => log.push("sent"));
+    await Bun.sleep(0);
+    log.push("receiving");
+    log.push(await ch.receive());
+    await sent;
+    expect(log).toEqual(["receiving", "a", "sent"]);
+
+    const received = ch.receive().then(v => log.push(`received ${v}`));
+    await ch.send("b");
+    log.push("send resolved");
+    await received;
+    expect(log).toEqual(["receiving", "a", "sent", "send resolved", "received b"]);
+  });
+
+  test("buffered send waits only when the buffer is full", async () => {
+    const ch = new Bun.Channel<number>(2);
+    await ch.send(1);
+    await ch.send(2);
+    expect(ch.length).toBe(2);
+    let thirdSent = false;
+    const third = ch.send(3).then(() => (thirdSent = true));
+    await Bun.sleep(0);
+    expect(thirdSent).toBe(false);
+    expect(await ch.receive()).toBe(1);
+    // The waiting sender's value moved into the buffer.
+    expect(ch.length).toBe(2);
+    await third;
+    expect(await ch.receive()).toBe(2);
+    expect(await ch.receive()).toBe(3);
+    expect(ch.length).toBe(0);
+  });
+
+  test("values are cloned, even on one thread", async () => {
+    const ch = new Bun.Channel<any>(1);
+    const value = { nested: { n: 1 }, date: new Date(0), map: new Map([[1, 2]]) };
+    await ch.send(value);
+    value.nested.n = 2;
+    const received = await ch.receive();
+    expect(received).not.toBe(value);
+    expect(received).toEqual({ nested: { n: 1 }, date: new Date(0), map: new Map([[1, 2]]) });
+    await ch.send(undefined);
+    expect(await ch.receive()).toBeUndefined();
+  });
+
+  test("close drains buffered values, then ends receivers and rejects senders", async () => {
+    const ch = new Bun.Channel<number>(2);
+    await ch.send(1);
+    await ch.send(2);
+    const waitingSender = ch.send(3);
+    ch.close();
+    ch.close();
+    expect(ch.closed).toBe(true);
+    await expect(waitingSender).rejects.toMatchObject({ name: "Error", code: "ERR_CHANNEL_CLOSED" });
+    await expect(ch.send(4)).rejects.toMatchObject({ code: "ERR_CHANNEL_CLOSED" });
+    expect(await ch.receive()).toBe(1);
+    const rest: number[] = [];
+    for await (const v of ch) rest.push(v);
+    expect(rest).toEqual([2]);
+    await expect(ch.receive()).rejects.toMatchObject({ code: "ERR_CHANNEL_CLOSED" });
+
+    const empty = new Bun.Channel();
+    const waitingReceiver = empty.receive();
+    empty.close();
+    await expect(waitingReceiver).rejects.toMatchObject({ code: "ERR_CHANNEL_CLOSED" });
+  });
+
+  test("for await ranges until close, and break does not close", async () => {
+    const ch = new Bun.Channel<number>(4);
+    for (const v of [1, 2, 3]) await ch.send(v);
+    for await (const v of ch) {
+      expect(v).toBe(1);
+      break;
+    }
+    expect(ch.closed).toBe(false);
+    expect(await ch.receive()).toBe(2);
+    const producer = (async () => {
+      await ch.send(4);
+      ch.close();
+    })();
+    const rest: number[] = [];
+    for await (const v of ch) rest.push(v);
+    await producer;
+    expect(rest).toEqual([3, 4]);
+  });
+
+  test("Symbol.dispose closes", async () => {
+    let outer: Bun.Channel;
+    {
+      using ch = new Bun.Channel();
+      outer = ch;
+    }
+    expect(outer.closed).toBe(true);
+  });
+
+  test("an aborted operation rejects with the reason and takes nothing", async () => {
+    const ch = new Bun.Channel<number>();
+    const already = AbortSignal.abort(new Error("already"));
+    await expect(ch.receive({ signal: already })).rejects.toThrow("already");
+    await expect(ch.send(1, { signal: already })).rejects.toThrow("already");
+
+    const controller = new AbortController();
+    const receiving = ch.receive({ signal: controller.signal });
+    controller.abort();
+    await expect(receiving).rejects.toMatchObject({ name: "AbortError" });
+
+    const sendController = new AbortController();
+    const sending = ch.send(2, { signal: sendController.signal });
+    sendController.abort();
+    await expect(sending).rejects.toMatchObject({ name: "AbortError" });
+
+    // Neither left a waiter behind.
+    const sent = ch.send(3);
+    expect(await ch.receive()).toBe(3);
+    await sent;
+  });
+
+  test("a structured clone is a handle to the same channel", async () => {
+    const ch = new Bun.Channel<string>(1);
+    const clone = structuredClone(ch);
+    expect(clone).toBeInstanceOf(Bun.Channel);
+    expect(clone).not.toBe(ch);
+    await clone.send("through the clone");
+    expect(ch.length).toBe(1);
+    expect(await ch.receive()).toBe("through the clone");
+    // Within one message, one channel is one object.
+    const [a, b] = structuredClone([ch, ch]);
+    expect(a).toBe(b);
+    clone.close();
+    expect(ch.closed).toBe(true);
+  });
+
+  test("a channel can be sent through a channel", async () => {
+    const outer = new Bun.Channel<Bun.Channel<number>>(1);
+    const inner = new Bun.Channel<number>(1);
+    await outer.send(inner);
+    const received = await outer.receive();
+    await received.send(42);
+    expect(await inner.receive()).toBe(42);
+  });
+
+  test("SharedArrayBuffer is shared and transfer moves", async () => {
+    const ch = new Bun.Channel<any>(1);
+    const sab = new SharedArrayBuffer(4);
+    await ch.send({ sab });
+    const { sab: received } = await ch.receive();
+    new Int32Array(received)[0] = 7;
+    expect(new Int32Array(sab)[0]).toBe(7);
+
+    const buffer = new Uint8Array([1, 2, 3]).buffer;
+    await ch.send(buffer, { transfer: [buffer] });
+    expect(buffer.byteLength).toBe(0);
+    expect([...new Uint8Array(await ch.receive())]).toEqual([1, 2, 3]);
+
+    // Without `transfer`, it is copied.
+    const copied = new Uint8Array([4]).buffer;
+    await ch.send(copied);
+    expect(copied.byteLength).toBe(1);
+    expect([...new Uint8Array(await ch.receive())]).toEqual([4]);
+  });
+
+  test("main <-> Worker ping-pong, 10k round trips", async () => {
+    const ping = new Bun.Channel<number>();
+    const pong = new Bun.Channel<number>();
+    using w = startWorker(
+      `self.onmessage = async ({ data: { ping, pong } }) => {
+        postMessage("ready");
+        for await (const n of ping) await pong.send(n + 1);
+      };`,
+      { ping, pong },
+    );
+    await w.ready;
+    for (let i = 0; i < 10_000; i++) {
+      await ping.send(i);
+      expect(await pong.receive()).toBe(i + 1);
+    }
+    ping.close();
+  });
+
+  test("MPMC across 4 Workers: every value exactly once", async () => {
+    const PRODUCERS = 2;
+    const CONSUMERS = 2;
+    const PER_PRODUCER = 1000;
+    const work = new Bun.Channel<number>(8);
+    const results = new Bun.Channel<number>(8);
+    const done = new Bun.Channel<void>(PRODUCERS);
+    const producers = Array.from({ length: PRODUCERS }, (_, id) =>
+      startWorker(
+        `self.onmessage = async ({ data: { work, done, id, count } }) => {
+          postMessage("ready");
+          for (let i = 0; i < count; i++) await work.send(id * count + i);
+          await done.send();
+        };`,
+        { work, done, id, count: PER_PRODUCER },
+      ),
+    );
+    const consumers = Array.from({ length: CONSUMERS }, () =>
+      startWorker(
+        `self.onmessage = async ({ data: { work, results } }) => {
+          postMessage("ready");
+          for await (const n of work) await results.send(n);
+        };`,
+        { work, results },
+      ),
+    );
+    try {
+      await Promise.all([...producers, ...consumers].map(w => w.ready));
+      const seen = new Uint8Array(PRODUCERS * PER_PRODUCER);
+      let sum = 0;
+      for (let i = 0; i < PRODUCERS * PER_PRODUCER; i++) {
+        const n = await results.receive();
+        seen[n]++;
+        sum += n;
+      }
+      for (let i = 0; i < PRODUCERS; i++) await done.receive();
+      work.close();
+      const total = PRODUCERS * PER_PRODUCER;
+      expect(sum).toBe((total * (total - 1)) / 2);
+      expect(seen.every(count => count === 1)).toBe(true);
+      expect(results.length).toBe(0);
+    } finally {
+      for (const w of [...producers, ...consumers]) w[Symbol.dispose]();
+    }
+  });
+
+  test("SharedArrayBuffer sent to a Worker is the same memory", async () => {
+    const ch = new Bun.Channel<SharedArrayBuffer>();
+    const reply = new Bun.Channel<string>();
+    using w = startWorker(
+      `self.onmessage = async ({ data: { ch, reply } }) => {
+        postMessage("ready");
+        const sab = await ch.receive();
+        Atomics.store(new Int32Array(sab), 0, 123);
+        await reply.send("stored");
+      };`,
+      { ch, reply },
+    );
+    await w.ready;
+    const sab = new SharedArrayBuffer(4);
+    await ch.send(sab);
+    expect(await reply.receive()).toBe("stored");
+    expect(Atomics.load(new Int32Array(sab), 0)).toBe(123);
+  });
+
+  test("abort racing a Worker's send never loses a value", async () => {
+    const COUNT = 500;
+    const ch = new Bun.Channel<number>();
+    using w = startWorker(
+      `self.onmessage = async ({ data: { ch, count } }) => {
+        postMessage("ready");
+        for (let i = 0; i < count; i++) await ch.send(i);
+      };`,
+      { ch, count: COUNT },
+    );
+    await w.ready;
+    const received: number[] = [];
+    let aborted = 0;
+    for (let i = 0; received.length < COUNT; i++) {
+      const controller = new AbortController();
+      const receiving = ch.receive({ signal: controller.signal });
+      if (i % 2) controller.abort();
+      try {
+        received.push(await receiving);
+      } catch (e) {
+        expect((e as Error).name).toBe("AbortError");
+        aborted++;
+      }
+    }
+    expect(received).toEqual(Array.from({ length: COUNT }, (_, i) => i));
+    expect(aborted).toBeGreaterThan(0);
+  });
+
+  test("a terminated Worker's waiting receive does not take later values", async () => {
+    const ch = new Bun.Channel<string>();
+    const w = startWorker(
+      `self.onmessage = ({ data: { ch } }) => {
+        ch.receive().then(v => { throw new Error("the worker received " + v); });
+        postMessage("waiting");
+      };`,
+      { ch },
+    );
+    expect(await w.ready).toBe("waiting");
+    w.worker.terminate();
+    await w.closed;
+    const sent = ch.send("after");
+    expect(await ch.receive()).toBe("after");
+    await sent;
+  });
+
+  test("a Worker's buffered values outlive it", async () => {
+    const ch = new Bun.Channel<number>(3);
+    const w = startWorker(
+      `self.onmessage = async ({ data: { ch } }) => {
+        for (const n of [1, 2, 3]) await ch.send(n);
+        ch.close();
+        postMessage("sent");
+      };`,
+      { ch },
+    );
+    expect(await w.ready).toBe("sent");
+    w.worker.terminate();
+    await w.closed;
+    const values: number[] = [];
+    for await (const n of ch) values.push(n);
+    expect(values).toEqual([1, 2, 3]);
+  });
+});
+
+describe.concurrent("Bun.Channel process", () => {
+  test("a waiting operation does not keep the process alive", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const ch = new Bun.Channel();
+         ch.receive().then(v => console.log("received " + v));
+         ch.send(1);
+         new Bun.Channel().send(2, { signal: new AbortController().signal });
+         new Bun.Channel().receive();
+         console.log("end of script");`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // The first send meets the waiting receive.
+    expect({ stdout, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+      stdout: "end of script\nreceived 1\n",
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
+  });
+
+  test("channels, messages and waiters are freed", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+        async function round() {
+          for (let i = 0; i < 500; i++) {
+            // A string would be shared by every clone: bytes are copied into each.
+            const payload = new Uint8Array(64 * 1024);
+            // A buffered message dropped with its channel.
+            const dropped = new Bun.Channel(1);
+            await dropped.send(payload);
+            // A channel cloned into a message that is received.
+            const carrier = new Bun.Channel(1);
+            await carrier.send({ inner: new Bun.Channel(), payload });
+            await carrier.receive();
+            // A waiter that is aborted.
+            const controller = new AbortController();
+            const waiting = new Bun.Channel().receive({ signal: controller.signal });
+            controller.abort();
+            await waiting.catch(() => {});
+          }
+          Bun.gc(true);
+        }
+        await round();
+        await round();
+        const before = process.memoryUsage.rss();
+        await round();
+        await round();
+        const deltaMB = (process.memoryUsage.rss() - before) / 1024 / 1024;
+        // Leaking the dropped messages grows it by ~75 MB.
+        if (deltaMB > ${isASAN || isDebug ? 32 : 16}) {
+          console.error("RSS grew by " + deltaMB.toFixed(1) + " MB");
+          process.exit(1);
+        }
+        console.log("ok");
+        `,
+      ],
+      env: withoutAsanQuarantine(bunEnv),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: "ok\n", stderr: "", exitCode: 0 });
+  });
+});
