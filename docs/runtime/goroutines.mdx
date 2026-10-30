@@ -62,15 +62,16 @@ A goroutine's function runs on another thread, which has only the function's own
 - **A function that uses only its parameters, what it declares, and globals.** Bun sends its source to the pool thread, which compiles it once. Globals such as `Bun`, `fetch`, `Atomics` and `structuredClone` are there. This is the usual way to start a goroutine.
 - **A function that a module exports** (ES module or CommonJS). Each pool thread imports that module once, then calls the export. Use this for large code, or code that shares its module's imports and helpers with other code. When a function is exported, Bun runs it this way.
 
-A function written in place can't use the variables of the code around it: they stay on their own thread. `Bun.go()` throws a `TypeError` with the code `ERR_GOROUTINE_NOT_SENDABLE` that names each variable and its line:
+A function written in place can't use the variables of the code around it: they stay on their own thread. `Bun.go()` throws a `TypeError` with the code `ERR_GOROUTINE_NOT_SENDABLE` that names each variable and its line, and says what to do about it:
 
 ```ts
 const config = { limit: 10 };
 Bun.go(() => config.limit * 2);
 // TypeError: Bun.go() can't run this function on another thread: it uses "config" (/app/main.ts:2),
-// which is neither its own nor a global. Pass it as an argument, or import it inside the function
-// with `await import()`.
+// a variable of the code around it: pass it as an argument.
 ```
+
+The advice depends on what the variable holds. For a function imported from a module, the message suggests passing that function to `Bun.go()` itself (`Bun.go(triple, x)`), for a named import from `"bun"` it suggests the `Bun` global (`Bun.sleep`), and for a helper function of the code around it, it suggests moving the helper into the function or into a module other than the entry point.
 
 Pass values as arguments instead:
 
@@ -81,7 +82,13 @@ await Bun.go(config => config.limit * 2, config); // => 20
 
 The same goes for an arrow function that uses the `this` or `arguments` of the code around it, and a function that uses `import.meta`. A method, a class, and a bound or native function throw `ERR_GOROUTINE_NOT_SENDABLE` too.
 
-To use a module, import it inside the function. `await import()` and `require()` resolve from the file the function is written in, as they would there:
+<Note>
+  Bun checks the function as it transpiled it. The transpiler replaces a `const` that holds a literal, such as `const
+  limit = 10`, with its value, so a function that uses one runs. A `const` that holds an object, or a `let`, is still a
+  variable of the code around it. Pass values as arguments rather than rely on this.
+</Note>
+
+To use a module, import it inside the function. `await import()` and `require()` resolve from the file the function is written in, as they would there. Only the module's own `require` is given to the function: a parameter or variable named `require` of the code around it is a variable like any other.
 
 ```ts main.ts icon="/icons/typescript.svg"
 const digest = await Bun.go(async (text: string) => {
@@ -118,7 +125,7 @@ const count = await Bun.go(new URL("./primes.ts#countPrimes", import.meta.url), 
 
 A module that a goroutine imports runs once on each pool thread. Its top-level variables belong to that thread, like thread-local storage. In a pool thread, `Bun.isMainThread` and `import.meta.main` are `false`.
 
-A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine. Guard its top-level work with `import.meta.main`:
+A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine. Guard its top-level work with `import.meta.main`. Without the guard, a pool thread evaluating the entry point would call `Bun.go(double)` again, and that goroutine would wait for the entry point, which waits for it. `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` there rather than wait forever, and the goroutine on the main thread rejects with that error:
 
 ```ts main.ts icon="/icons/typescript.svg"
 export function double(n: number) {
@@ -141,13 +148,13 @@ Arguments and results are [structured clones](https://developer.mozilla.org/en-U
 - An `AbortSignal` arrives as a signal that aborts when the original does (see [Cancelling goroutines](#cancelling-goroutines)).
 - Everything else is copied.
 
-Arguments that can't be cloned, such as functions, throw a `DataCloneError` from `Bun.go()`. A result that can't be cloned rejects the goroutine with a `DataCloneError`.
+Arguments that can't be cloned, such as functions, throw a `DataCloneError` from `Bun.go()` that says which argument holds what, for example `Bun.go() argument 1 has a function at .callback, which can't be sent to another thread.` A result that can't be cloned rejects the goroutine with a `DataCloneError` that says where it is.
 
 ---
 
 ## Errors
 
-If the function throws, the goroutine rejects with a copy of the error. The copy has the error's name, message, stack, `cause` and own properties such as `code`.
+If the function throws, the goroutine rejects with a copy of the error. The copy has the error's name, message, stack, `cause` and own properties such as `code`. An `AggregateError` arrives as an `AggregateError`, with copies of its `errors`, and a `DOMException` as a `DOMException` with its `name` and `code`. Stack traces of a function written in place name the lines and columns of your source, and leave out the frames of the pool itself.
 
 ```ts
 try {
@@ -158,6 +165,8 @@ try {
 ```
 
 A rejected goroutine that nothing handles is an unhandled rejection on the thread that started it, so by default the process exits, as a panic does in Go. An error that a goroutine's code throws outside of the goroutine, for example in a `setTimeout()` callback, goes to `process.on("uncaughtException")` on the main thread.
+
+`process.exit(code)` in a goroutine ends the program with that code, as `os.Exit` does in Go. The goroutine's thread stops at once. The main thread calls `process.exit(code)` when its event loop next runs, so its `exit` listeners run; other goroutines may run until then.
 
 ---
 
@@ -221,7 +230,7 @@ console.log(total); // => 338350
 
 ## Cancelling goroutines
 
-Pass an `AbortSignal` to a goroutine to tell it to stop. In the goroutine, the signal aborts when the original aborts, with a copy of its reason, so it works with `fetch()`, channel operations and `abort` listeners there. A goroutine stops only where its code checks the signal or passes it on: nothing interrupts code that computes.
+Pass an `AbortSignal` to a goroutine to tell it to stop. In the goroutine, the signal aborts when the original aborts, with a copy of its reason, so it works with `fetch()`, channel operations and `abort` listeners there. A goroutine stops only where its code checks the signal or passes it on: nothing interrupts code that computes. A loop that computes without awaiting can check `signal.aborted` or call `signal.throwIfAborted()`: these see the abort as soon as the original aborts, and fire the signal's `abort` listeners there and then.
 
 ```ts
 const controller = new AbortController();

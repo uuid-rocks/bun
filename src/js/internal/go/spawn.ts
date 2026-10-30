@@ -1,28 +1,43 @@
 // Bun.go: start a goroutine on the pool (BunGo.cpp), on any JS thread.
 
-const { spawn, spawnInline, keepAlive, moduleOf, resolveModule, sourceOf, check, codeGenerationAllowed } = $cpp(
-  "BunGo.cpp",
-  "createGoSpawnBinding",
-) as {
+const {
+  spawn,
+  spawnInline,
+  keepAlive,
+  moduleOf,
+  resolveModule,
+  sourceOf,
+  check,
+  codeGenerationAllowed,
+  evaluating,
+  describe,
+} = $cpp("BunGo.cpp", "createGoSpawnBinding") as {
   spawn(module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]): number;
   spawnInline(source: string, module: string, line: number, column: number, strict: boolean, args: unknown[]): number;
   keepAlive(delta: number): void;
   moduleOf(fn: Function): [url: string, namespace: object | undefined, bundled: boolean] | undefined;
   resolveModule(specifier: string): string;
   sourceOf(fn: Function): Source | undefined;
-  check(fn: Function, source: string, module: string, line: number, column: number): Checked;
+  check(fn: Function, source: string, module: string, line: number, column: number): Problem[] | undefined;
   codeGenerationAllowed(): boolean;
+  evaluating(module: string): boolean;
+  describe(value: unknown): [path: string, what: string] | undefined;
 };
 
 // A function's text, and where it starts in its module (zero-based).
 type Source = [source: string, module: string, line: number, column: number, strict: boolean];
 type ProblemKind =
   "unparsable" | "class" | "this" | "arguments" | "import.meta" | "eval" | "captured" | "imported" | "undeclared";
-// The line is one-based, in the module's own text.
-type Problem = [kind: ProblemKind, name: string, line: number];
-// Where the function starts in its module's own text (zero-based), which Bun may have transpiled,
-// and what keeps it from running on another thread.
-type Checked = [line: number, column: number, problems?: Problem[]];
+// The line is one-based, in the module's own text. What a captured or imported binding holds, and
+// where an import comes from (its specifier, and its name there; none for a namespace).
+type Problem = [
+  kind: ProblemKind,
+  name: string,
+  line: number,
+  valueKind: "function" | "class" | "namespace" | "data" | "bun" | "",
+  from: string | undefined,
+  importName: string | undefined,
+];
 
 const enum TargetKind {
   // [module key, export name, the export is a property of a CommonJS module's `module.exports`]
@@ -41,6 +56,8 @@ type Pending = {
 };
 
 const pending = new Map<number, Pending>();
+// internal/go/runtime runs here: modules are imported here to run goroutines.
+let onPoolThread = false;
 const targets = new WeakMap<Function, Target>();
 // What `check` found for the code of a function no module exports, by its source: an inline
 // function is a new object each time the code around it runs.
@@ -99,10 +116,6 @@ function keyOf(object: object, fn: Function): string | undefined {
   }
 }
 
-function list(items: string[]) {
-  return items.length === 1 ? items[0] : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
-}
-
 // bun build finds the module of a function only from the call itself.
 const inBundle =
   ' In a bundle, pass Bun.go() the imported binding itself, as in Bun.go(task) or Bun.go(tasks.task), or the module\'s URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)): bun build makes that module an entry point. List a module named any other way as an entry point of the build.';
@@ -132,14 +145,47 @@ function notSendableIn(fn: Function, url: string | undefined, problems?: Problem
     );
   }
   const at = (line: number) => `${url}:${line}`;
-  const outside: string[] = [];
   const reasons: string[] = [];
-  for (const [kind, name, line] of problems) {
+  for (const [kind, name, line, valueKind, from, importName] of problems) {
+    const uses = `it uses "${name}" (${at(line)})`;
     switch (kind) {
       case "captured":
-      case "imported":
+        if (valueKind === "bun") {
+          reasons.push(`${uses}, which is Bun.${name}: use Bun.${name} instead`);
+        } else if (valueKind === "function" || valueKind === "class") {
+          reasons.push(
+            `${uses}, a ${valueKind} of the code around it: define it inside this function, or export it from a module other than the entry point and import it inside this function with \`await import()\``,
+          );
+        } else if (valueKind === "namespace") {
+          reasons.push(`${uses}, a module's namespace: import the module inside this function with \`await import()\``);
+        } else if (valueKind === "data") {
+          reasons.push(`${uses}, a variable of the code around it: pass it as an argument`);
+        } else {
+          // Not readable yet, as a function declaration may not be.
+          reasons.push(
+            `${uses}, which belongs to the code around it: pass it as an argument, or, for a function, define it inside this function or export it from a module other than the entry point and import it inside this function with \`await import()\``,
+          );
+        }
+        break;
+      case "imported": {
+        const imports = `${uses}, which its module imports from "${from}"`;
+        if (from === "bun" || valueKind === "bun") {
+          reasons.push(
+            `${imports}: use ${importName === undefined || importName === "default" ? "the global Bun" : `Bun.${importName}`} instead`,
+          );
+        } else if (valueKind === "function") {
+          reasons.push(
+            `${imports}: pass it to Bun.go() itself, as in Bun.go(${name}, ...args), or import it inside this function with \`await import(${JSON.stringify(from)})\``,
+          );
+        } else {
+          reasons.push(
+            `${imports}: import it inside this function with \`await import(${JSON.stringify(from)})\`, or pass it as an argument`,
+          );
+        }
+        break;
+      }
       case "undeclared":
-        outside.push(`"${name}" (${at(line)})`);
+        reasons.push(`${uses}, which is neither its own nor a global: define it inside this function`);
         break;
       case "this":
         reasons.push(
@@ -160,13 +206,6 @@ function notSendableIn(fn: Function, url: string | undefined, problems?: Problem
         );
         break;
     }
-  }
-  const { length } = outside;
-  if (length > 0) {
-    const one = length === 1;
-    reasons.unshift(
-      `it uses ${list(outside)}, which ${one ? "is neither its own nor a global" : "are neither its own nor globals"}. ${one ? "Pass it as an argument" : "Pass them as arguments"}, or import ${one ? "it" : "them"} inside the function with \`await import()\``,
-    );
   }
   return $ERR_GOROUTINE_NOT_SENDABLE(`Bun.go() can't run ${label} on another thread: ${reasons.join("; ")}.`);
 }
@@ -196,13 +235,12 @@ function inlineOf(fn: Function, source: Source | undefined, bundled: boolean): T
   let verdict = verdicts.$get(text);
   if (verdict === undefined || verdict.module !== module || verdict.line !== line || verdict.column !== column) {
     if (verdicts.size >= kMaxVerdicts) verdicts.clear();
-    const [originalLine, originalColumn, problems] = check(fn, text, module, line, column);
+    const problems = check(fn, text, module, line, column);
     verdict = {
       module,
       line,
       column,
-      target:
-        problems === undefined ? [TargetKind.Inline, text, module, originalLine, originalColumn, strict] : undefined,
+      target: problems === undefined ? [TargetKind.Inline, text, module, line, column, strict] : undefined,
       problems,
     };
     verdicts.$set(text, verdict);
@@ -265,8 +303,49 @@ function go(task: unknown, ...args: unknown[]) {
   } else {
     throw $ERR_INVALID_ARG_TYPE("fn", ["function", "string", "URL"], task);
   }
-  if (target[0] === TargetKind.Export) return Goroutine.start(spawn(target[1], target[2], target[3], args));
-  return Goroutine.start(spawnInline(target[1], target[2], target[3], target[4], target[5], args));
+  let id: number;
+  if (target[0] === TargetKind.Export) {
+    if (onPoolThread && evaluating(target[1])) throw evaluatingHere(task, target[1], target[2]);
+    try {
+      id = spawn(target[1], target[2], target[3], args);
+    } catch (error) {
+      throw argumentCloneError(error, args);
+    }
+  } else {
+    try {
+      id = spawnInline(target[1], target[2], target[3], target[4], target[5], args);
+    } catch (error) {
+      throw argumentCloneError(error, args);
+    }
+  }
+  return Goroutine.start(id);
+}
+
+// A pool thread imports the module of each export it runs. A module this thread is still evaluating
+// (the entry point's top level, say, waiting on its own goroutines) would wait for the goroutine,
+// which would wait for the module.
+function evaluatingHere(task: unknown, module: string, exportName: string) {
+  const label = $isCallable(task) && (task as Function).name ? `"${(task as Function).name}"` : `"${exportName}"`;
+  return $ERR_GOROUTINE_NOT_SENDABLE(
+    `Bun.go() can't run ${label} here: it is exported by ${module}, which this pool thread is still evaluating (a pool thread evaluates the module of each export it runs). The goroutine would wait for the module, and the module for the goroutine. Run that module's top-level code only on the main thread, inside if (import.meta.main) { ... }, or move ${label} to a module of its own.`,
+  );
+}
+
+// What in the arguments can't be cloned, and which argument holds it.
+function argumentCloneError(error: unknown, args: unknown[]) {
+  if ((error as Error)?.name !== "DataCloneError") return error;
+  for (let i = 0; i < args.length; i++) {
+    const found = describe(args[i]);
+    if (found === undefined) continue;
+    const [path, what] = found;
+    return new DOMException(
+      path === ""
+        ? `Bun.go() argument ${i + 1} is ${what}, which can't be sent to another thread.`
+        : `Bun.go() argument ${i + 1} has ${what} at ${path}, which can't be sent to another thread.`,
+      "DataCloneError",
+    );
+  }
+  return error;
 }
 
 const errorConstructors = {
@@ -285,6 +364,10 @@ type ErrorRecord = {
   message: string;
   stack: string | undefined;
   cause?: Thrown;
+  // An AggregateError's
+  errors?: Thrown[];
+  // A DOMException: its name gives its code.
+  domException?: true;
   props: object | undefined;
 };
 // What a goroutine threw (internal/go/runtime): an Error as its parts, which the structured clone
@@ -293,10 +376,26 @@ type Thrown = ["error", ErrorRecord] | ["value", unknown];
 
 function fromThread(thrown: Thrown): unknown {
   if (thrown[0] !== "error") return thrown[1];
-  const { name, message, stack, props } = thrown[1];
-  const Constructor = errorConstructors[name] ?? Error;
-  const error =
-    "cause" in thrown[1] ? new Constructor(message, { cause: fromThread(thrown[1].cause!) }) : new Constructor(message);
+  const record = thrown[1];
+  const { name, message, stack, props } = record;
+  const options = "cause" in record ? { cause: fromThread(record.cause!) } : undefined;
+  let error;
+  if (record.domException) {
+    error = new DOMException(message, name);
+    if (options !== undefined) {
+      Object.defineProperty(error, "cause", {
+        value: options.cause,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+    }
+  } else if (record.errors !== undefined) {
+    error = new AggregateError(record.errors.map(fromThread), message, options);
+  } else {
+    const Constructor = errorConstructors[name] ?? Error;
+    error = new Constructor(message, options);
+  }
   if (error.name !== name) {
     Object.defineProperty(error, "name", { value: name, writable: true, configurable: true, enumerable: false });
   }
@@ -328,4 +427,8 @@ function settle(id: number, outcome: Outcome, value: unknown) {
 export default {
   go,
   settle,
+  // internal/go/runtime, when it starts on a pool thread
+  enterPool() {
+    onPoolThread = true;
+  },
 };

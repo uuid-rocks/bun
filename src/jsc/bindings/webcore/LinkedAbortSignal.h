@@ -17,6 +17,9 @@ uint64_t retainForStructuredClone(JSC::JSGlobalObject*, WebCore::AbortSignal&);
 JSC::JSValue fromStructuredClone(JSC::JSGlobalObject*, uint64_t id);
 // Any thread.
 void releaseStructuredClone(uint64_t id);
+// The linked signal's thread (AbortSignal::observeLinkedAbort): if its original has aborted, it
+// aborts now. Exceptions of its listeners are reported; a termination stays pending.
+void observe(WebCore::AbortSignal&);
 
 }
 

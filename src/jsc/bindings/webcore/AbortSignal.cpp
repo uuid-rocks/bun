@@ -32,6 +32,7 @@
 #include "Event.h"
 #include "EventNames.h"
 #include "JSDOMException.h"
+#include "LinkedAbortSignal.h"
 #include "JavaScriptCore/JSCJSValue.h"
 #include "ScriptExecutionContext.h"
 #include "WebCoreOpaqueRoot.h"
@@ -335,6 +336,26 @@ void AbortSignal::removeAlgorithm(uint32_t algorithmIdentifier)
             return pair.first == algorithmIdentifier;
         }))
         m_timeoutObserverCount.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void AbortSignal::observeLinkedAbortSlow()
+{
+    if (aborted())
+        return;
+    if (isLinked()) {
+        Bun::LinkedAbortSignal::observe(*this);
+        return;
+    }
+    Vector<Ref<AbortSignal>> linked;
+    for (auto& source : m_sourceSignals) {
+        if (source.isLinked())
+            linked.append(source);
+    }
+    for (auto& source : linked) {
+        if (aborted())
+            return;
+        Bun::LinkedAbortSignal::observe(source);
+    }
 }
 
 void AbortSignal::throwIfAborted(JSC::JSGlobalObject& lexicalGlobalObject)

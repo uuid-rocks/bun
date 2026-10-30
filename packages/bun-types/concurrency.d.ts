@@ -78,7 +78,7 @@ declare module "bun" {
      * Receives until the channel is closed and empty. `break` ends the loop and leaves the channel open, so other
      * receivers keep receiving.
      */
-    [Symbol.asyncIterator](): AsyncIterator<T, undefined>;
+    [Symbol.asyncIterator](): AsyncIterableIterator<T, undefined>;
 
     /** {@link close}: `using channel = new Bun.Channel()` closes it at the end of the scope. */
     [Symbol.dispose](): void;

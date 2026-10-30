@@ -237,6 +237,8 @@ const calledFunctionsByPath: Readonly<Record<b.BuiltinPath, readonly b.CalledFun
   "Bun.build": bundlerPluginFunctions,
   "Bun.peek": [heldAs(b.functionIn("builtins/Peek", "peek"), "Bun.peek"), b.functionIn("builtins/Peek", "peekStatus")],
   "Bun.plugin": bundlerPluginFunctions,
+  // A pool thread starts each goroutine with it (BunGo.cpp).
+  "Bun.go": functionsIn("builtins/Goroutine", "runGoroutine"),
   "Bun.serve": pluginFunctionsOfServer,
   "WebAssembly.compileStreaming": streamedModuleFunctions,
   "WebAssembly.instantiateStreaming": streamedModuleFunctions,

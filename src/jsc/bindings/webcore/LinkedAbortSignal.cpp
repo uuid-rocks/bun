@@ -2,8 +2,9 @@
 //
 // A signal that has been sent has one Source, which knows a Link for each clone. Reading a clone
 // makes a signal on the reading thread and points the Link at it. When the original aborts, each
-// Link gets its own clone of the reason, posted to its thread; a Link not read yet keeps it for the
-// read. When the original is destroyed without aborting, the signals linked to it stop waiting, so
+// Link gets its own clone of the reason and a task to its thread; a Link not read yet keeps it for
+// the read. Until the task runs, script that reads the linked signal (`aborted`, `reason`,
+// `throwIfAborted()`) aborts it at once, so a loop that never yields still sees the abort. When the original is destroyed without aborting, the signals linked to it stop waiting, so
 // one with abort listeners can be collected. A linked signal that is collected, or a clone that is
 // dropped unread, leaves its Source. No lock is held while script runs or a task is posted.
 
@@ -85,6 +86,9 @@ public:
         Gone,
         // Read: a signal on `m_context` follows the original.
         Linked,
+        // Read, and the original aborted with `m_reason`: the signal aborts on its thread's next
+        // read of it, or the task posted there, whichever comes first.
+        AbortPending,
         // Nothing follows the original through this link any more.
         Done,
     };
@@ -104,6 +108,9 @@ public:
     void release();
     // The linked signal's thread: it aborted, or is being destroyed.
     void detach();
+    // The linked signal's thread: abort it if the original has aborted.
+    void deliver(ScriptExecutionContext&);
+    bool hasPendingAbort() const { return m_abortPending.load(std::memory_order_acquire); }
 
 private:
     Link(RefPtr<Source>&& source, State state, Reason&& reason)
@@ -127,6 +134,8 @@ private:
     State m_state WTF_GUARDED_BY_LOCK(m_lock);
     Reason m_reason WTF_GUARDED_BY_LOCK(m_lock);
     ScriptExecutionContextIdentifier m_context WTF_GUARDED_BY_LOCK(m_lock) {};
+    // m_state == AbortPending, read without the lock.
+    std::atomic<bool> m_abortPending { false };
     // m_context's thread only: the linked signal, and the algorithm it keeps this link alive with.
     AbortSignal* m_signal { nullptr };
     uint32_t m_algorithm { 0 };
@@ -178,6 +187,13 @@ Clones& clones()
 {
     static NeverDestroyed<Clones> instance;
     return instance;
+}
+
+// This thread's linked signals, and their links.
+HashMap<AbortSignal*, Link*>& linkedSignals()
+{
+    static thread_local NeverDestroyed<HashMap<AbortSignal*, Link*>> signals;
+    return signals;
 }
 
 LinkedSignalGuard::~LinkedSignalGuard()
@@ -304,12 +320,28 @@ void Link::abort(Reason&& reason)
         }
         if (m_state != State::Linked)
             return;
-        m_state = State::Done;
+        m_state = State::AbortPending;
+        m_reason = WTF::move(reason);
+        m_abortPending.store(true, std::memory_order_release);
         context = m_context;
     }
-    ScriptExecutionContext::postTaskTo(context, BunLoopKind::Regular, [link = Ref { *this }, reason = WTF::move(reason)](ScriptExecutionContext& context) mutable {
-        link->abortSignal(context, WTF::move(reason));
+    ScriptExecutionContext::postTaskTo(context, BunLoopKind::Regular, [link = Ref { *this }](ScriptExecutionContext& context) {
+        link->deliver(context);
     });
+}
+
+void Link::deliver(ScriptExecutionContext& context)
+{
+    Reason reason;
+    {
+        Locker locker { m_lock };
+        if (m_state != State::AbortPending)
+            return;
+        m_state = State::Done;
+        m_abortPending.store(false, std::memory_order_relaxed);
+        reason = WTF::move(m_reason);
+    }
+    abortSignal(context, WTF::move(reason));
 }
 
 void Link::gone()
@@ -363,10 +395,15 @@ void Link::unlink()
 
 void Link::detach()
 {
+    if (m_signal)
+        linkedSignals().remove(m_signal);
     m_signal = nullptr;
+    Reason reason;
     {
         Locker locker { m_lock };
         m_state = State::Done;
+        m_abortPending.store(false, std::memory_order_relaxed);
+        reason = WTF::move(m_reason);
     }
     if (m_source)
         m_source->remove(*this);
@@ -377,7 +414,7 @@ void Link::release()
     Reason reason;
     {
         Locker locker { m_lock };
-        if (m_state == State::Linked || m_state == State::Done)
+        if (m_state == State::Linked || m_state == State::AbortPending || m_state == State::Done)
             return;
         m_state = State::Done;
         reason = WTF::move(m_reason);
@@ -406,6 +443,8 @@ JSValue Link::read(Zig::GlobalObject* globalObject)
     case State::Waiting: {
         auto signal = AbortSignal::create(&context);
         m_signal = signal.ptr();
+        signal->markLinked();
+        linkedSignals().set(signal.ptr(), this);
         // While the original can abort, abort listeners keep the signal (JSAbortSignalOwner).
         signal->incrementPendingActivityCount();
         m_algorithm = signal->addAlgorithm([guard = LinkedSignalGuard(Ref { *this })](JSValue) {});
@@ -421,6 +460,7 @@ JSValue Link::read(Zig::GlobalObject* globalObject)
     case State::Gone:
         return toJSNewlyCreated(globalObject, globalObject, AbortSignal::create(&context));
     case State::Linked:
+    case State::AbortPending:
     case State::Done:
         break;
     }
@@ -497,6 +537,15 @@ JSValue fromStructuredClone(JSGlobalObject* globalObject, uint64_t id)
     if (!link)
         return {};
     return link->read(defaultGlobalObject(globalObject));
+}
+
+void observe(AbortSignal& signal)
+{
+    RefPtr<Link> link = linkedSignals().get(&signal);
+    if (!link || !link->hasPendingAbort())
+        return;
+    if (auto* context = static_cast<EventTarget&>(signal).scriptExecutionContext())
+        link->deliver(*context);
 }
 
 void releaseStructuredClone(uint64_t id)

@@ -4,16 +4,27 @@ use core::ptr::NonNull;
 use bun_jsc::{JSGlobalObject, JSValue, JsResult};
 
 unsafe extern "C" {
-    safe fn Bun__ChannelMessage__create(
+    safe fn Bun__ChannelMessage__createFor(
         global: &JSGlobalObject,
         value: JSValue,
         transfer: JSValue,
+        site: u8,
+        index: u32,
     ) -> *mut c_void;
     fn Bun__ChannelMessage__deserialize(
         global: &JSGlobalObject,
         message: NonNull<c_void>,
     ) -> JSValue;
     fn Bun__ChannelMessage__destroy(message: NonNull<c_void>);
+}
+
+/// The channel operation a value is cloned for, which its `DataCloneError` names.
+#[derive(Clone, Copy)]
+pub(crate) enum CloneSite {
+    /// `channel.send(value)`
+    Send,
+    /// The value of `Bun.select()`'s send case at this index
+    SelectSend(u32),
 }
 
 /// A structured clone made like `worker.postMessage()`'s: `SharedArrayBuffer`s, `WebAssembly.Memory`
@@ -28,14 +39,20 @@ unsafe impl Send for ChannelMessage {}
 
 impl ChannelMessage {
     /// Clones `value`, moving what `transfer` (`undefined` or an iterable) lists. Throws what
-    /// `postMessage()` throws: a `DataCloneError`, or the `TypeError` of a bad transfer list.
+    /// `postMessage()` throws: a `DataCloneError` (which says what in `value` can't be cloned, and
+    /// where), or the `TypeError` of a bad transfer list.
     pub(crate) fn create(
         global: &JSGlobalObject,
         value: JSValue,
         transfer: JSValue,
+        site: CloneSite,
     ) -> JsResult<Self> {
+        let (site, index) = match site {
+            CloneSite::Send => (0, 0),
+            CloneSite::SelectSend(index) => (1, index),
+        };
         let message = bun_jsc::call_check_slow(global, || {
-            Bun__ChannelMessage__create(global, value, transfer)
+            Bun__ChannelMessage__createFor(global, value, transfer, site, index)
         })?;
         Ok(Self(
             NonNull::new(message).expect("a message, or an exception"),

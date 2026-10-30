@@ -69,6 +69,8 @@ private:
         Aborted = 2,
         HasAbortEventListener = 4,
         IsFiringEventListeners = 8,
+        // A clone of a signal of another thread (LinkedAbortSignal.h)
+        Linked = 16,
     };
 
 public:
@@ -87,6 +89,16 @@ public:
     void signalAbort(JSC::JSValue reason);
 
     bool aborted() const { return m_flags & static_cast<uint8_t>(AbortSignalFlags::Aborted); }
+    // What script reads of a linked signal, or of a signal that follows one, shows that its original
+    // aborted at once, before the abort's task reaches this thread: a CPU-bound loop that polls
+    // `aborted` stops. May run abort listeners.
+    void observeLinkedAbort()
+    {
+        if (m_flags & (static_cast<uint8_t>(AbortSignalFlags::Linked) | static_cast<uint8_t>(AbortSignalFlags::Dependent)))
+            observeLinkedAbortSlow();
+    }
+    void markLinked() { m_flags |= static_cast<uint8_t>(AbortSignalFlags::Linked); }
+    bool isLinked() const { return m_flags & static_cast<uint8_t>(AbortSignalFlags::Linked); }
     void markAborted(JSC::JSValue reason);
     void runAbortSteps();
 
@@ -166,6 +178,7 @@ private:
     explicit AbortSignal(ScriptExecutionContext*, Aborted = Aborted::No, JSC::JSValue reason = JSC::jsUndefined());
 
     void markAsDependent() { setIsDependent(true); }
+    void observeLinkedAbortSlow();
     void addSourceSignal(AbortSignal&);
     void addDependentSignal(AbortSignal&);
     void releaseSourceObserverCounts();

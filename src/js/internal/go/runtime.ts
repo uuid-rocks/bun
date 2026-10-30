@@ -3,8 +3,13 @@
 // One goroutine is taken per turn of the event loop. A goroutine runs until it first awaits; then
 // the thread takes the next. A thread that finds nothing to take is idle until BunGo.cpp wakes it.
 
-const { take, settle, compile } = $cpp("BunGo.cpp", "createGoRuntimeBinding") as {
+const { take, settle, compile, describe, run, job } = $cpp("BunGo.cpp", "createGoRuntimeBinding") as {
   take(): Task | Failed | undefined;
+  // job(fn, args, settled) on a microtask with no frame of this module under it: fn(...args), then
+  // settled(true, result) or settled(false, what it threw).
+  run(job: Function, fn: Function, args: unknown[], settled: (ok: boolean, value: unknown) => void): void;
+  job: Function;
+  describe(value: unknown): [path: string, what: string] | undefined;
   settle(id: number, outcome: 0 | 1, value: unknown): void;
   compile(
     source: string,
@@ -48,6 +53,9 @@ const kMaxCompiled = 1024;
 
 const kMaxCauseDepth = 8;
 
+// Encoded apart from the other own properties of an error.
+const kEncoded = new Set(["name", "message", "stack", "cause"]);
+
 function errorRecord(error: Error, depth: number, withProps: boolean) {
   let name, message, stack;
   try {
@@ -68,11 +76,23 @@ function errorRecord(error: Error, depth: number, withProps: boolean) {
     message: string;
     stack: string | undefined;
     cause?: unknown;
+    errors?: unknown[];
+    domException?: true;
     props: object | undefined;
   } = { name, message, stack, props: undefined };
+  if (error instanceof DOMException) record.domException = true;
   if (withProps) {
     if ("cause" in error && depth < kMaxCauseDepth) record.cause = thrown(error.cause, depth + 1, true);
+    let errors;
+    if (error instanceof AggregateError && depth < kMaxCauseDepth) {
+      try {
+        errors = error.errors;
+      } catch {}
+    }
+    if ($isArray(errors)) record.errors = errors.map(inner => thrown(inner, depth + 1, true));
     const props: Record<string, unknown> = { ...error };
+    for (const key of kEncoded) delete props[key];
+    if (record.errors !== undefined) delete props.errors;
     // Node's error codes are not enumerable.
     let code;
     try {
@@ -133,23 +153,47 @@ function inline(source: string, module: string, line: number, column: number, st
   return fn;
 }
 
+// What in the result can't be cloned.
+function resultCloneError(error: unknown, value: unknown) {
+  if ((error as Error)?.name !== "DataCloneError") return error;
+  const found = describe(value);
+  if (found === undefined) return error;
+  const [path, what] = found;
+  return new DOMException(
+    path === ""
+      ? `Bun.go(): the goroutine returned ${what}, which can't be sent to another thread.`
+      : `Bun.go(): the goroutine returned ${what} at ${path}, which can't be sent to another thread.`,
+    "DataCloneError",
+  );
+}
+
 async function start(task: Task) {
   const id = task[0];
-  let value;
+  let fn;
   try {
-    const fn =
+    fn =
       task[2] === 0 ? await exported(task[3], task[4], task[5]) : inline(task[4], task[3], task[5], task[6], task[7]);
-    value = await fn.$apply(undefined, task[1]);
   } catch (error) {
     fail(id, error);
     return;
   }
-  try {
-    settle(id, 0, value);
-  } catch (error) {
-    // The result can't be cloned.
-    fail(id, error);
-  }
+  run(job, fn, task[1], (ok, value) => {
+    if (!ok) {
+      fail(id, value);
+      return;
+    }
+    // Not awaited by an async function of this module: its frames stay out of the goroutine's.
+    Promise.$resolve(value).then(
+      value => {
+        try {
+          settle(id, 0, value);
+        } catch (error) {
+          fail(id, resultCloneError(error, value));
+        }
+      },
+      error => fail(id, error),
+    );
+  });
 }
 
 // Also called by BunGo.cpp when this thread was idle and something is queued.
@@ -165,6 +209,7 @@ function pull() {
   start(task);
 }
 
+require("internal/go/spawn").enterPool();
 pull();
 
 export default {

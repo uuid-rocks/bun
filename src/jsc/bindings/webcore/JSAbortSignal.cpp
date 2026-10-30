@@ -196,6 +196,8 @@ static inline JSValue jsAbortSignal_abortedGetter(JSGlobalObject& lexicalGlobalO
     auto& vm = JSC::getVM(&lexicalGlobalObject);
     auto throwScope = DECLARE_THROW_SCOPE(vm);
     auto& impl = thisObject.wrapped();
+    impl.observeLinkedAbort();
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, (toJS<IDLBoolean>(lexicalGlobalObject, throwScope, impl.aborted())));
 }
 
@@ -209,6 +211,8 @@ static inline JSValue jsAbortSignal_reasonGetter(JSGlobalObject& lexicalGlobalOb
     auto& vm = JSC::getVM(&lexicalGlobalObject);
     auto throwScope = DECLARE_THROW_SCOPE(vm);
     auto& impl = thisObject.wrapped();
+    impl.observeLinkedAbort();
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, (toJS<IDLAny>(lexicalGlobalObject, throwScope, impl.jsReason(lexicalGlobalObject))));
 }
 
@@ -330,6 +334,8 @@ static inline JSC::EncodedJSValue jsAbortSignalPrototypeFunction_throwIfAbortedB
     UNUSED_PARAM(throwScope);
     UNUSED_PARAM(callFrame);
     auto& impl = castedThis->wrapped();
+    impl.observeLinkedAbort();
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLUndefined>(*lexicalGlobalObject, throwScope, [&]() -> decltype(auto) { return impl.throwIfAborted(*uncheckedDowncast<JSDOMGlobalObject>(lexicalGlobalObject)); })));
 }
 
