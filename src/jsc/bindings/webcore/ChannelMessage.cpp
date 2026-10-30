@@ -96,7 +96,6 @@ String withArticle(const String& noun)
     return makeString(vowel ? "an "_s : "a "_s, noun);
 }
 
-
 constexpr unsigned maxDepth = 64;
 
 std::optional<Bun::Uncloneable> find(JSGlobalObject* globalObject, JSValue value, const String& path, HashSet<JSObject*>& seen, unsigned depth)

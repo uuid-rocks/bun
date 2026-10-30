@@ -2692,7 +2692,7 @@ pub(crate) mod __gated_printer {
             self.add_source_mapping(original.loc);
             if keeps_value {
                 // internal/go/spawn's `bundledTask`
-                self.print(b"globalThis.Bun.go[Symbol.for(\"Bun.go.task\")](");
+                self.print(b"globalThis.Bun.go[globalThis.Symbol.for(\"Bun.go.task\")](");
                 self.print_expr(*original, Level::Comma, ExprFlag::none());
                 self.print(b",");
                 self.print_space();

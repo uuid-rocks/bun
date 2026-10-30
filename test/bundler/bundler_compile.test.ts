@@ -1665,7 +1665,7 @@ describe("Bun.go", () => {
         const main = readFileSync(join(root, "out", "main.js"), "utf8");
         // An imported binding keeps its value: Bun.go learns the URL of a function on the way.
         const task = (value: string, url: string) =>
-          `globalThis.Bun.go[Symbol.for("Bun.go.task")](${value}, new globalThis.URL("${url}", import.meta.url))`;
+          `globalThis.Bun.go[globalThis.Symbol.for("Bun.go.task")](${value}, new globalThis.URL("${url}", import.meta.url))`;
         expect(main).toContain(`Bun.go(${task("add", "./tasks/math.js#add")}, 2, 3)`);
         expect(main).toContain(`Bun.go(${task("negate", "./tasks/text.js#odd%20name")}, 5)`);
         expect(main).toContain(`Bun.go(${task("twice_default", "./tasks/twice.js")}, 21)`);

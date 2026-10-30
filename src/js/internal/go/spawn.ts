@@ -475,14 +475,15 @@ function start(api: string, goroutine: Goroutine<unknown>, task: unknown, target
 
 // What go() throws itself points at its caller, not at this module.
 function thrownBy(error: unknown, caller: Function) {
-  if (error instanceof Error && ((error as { code?: unknown }).code !== undefined || error.name === "DataCloneError")) {
-    Error.captureStackTrace(error, caller);
-    // A DOMException is not an ErrorInstance: the header of what captureStackTrace writes is "Error".
-    const stack = (error as { stack?: unknown }).stack;
-    if (error instanceof DOMException && typeof stack === "string") {
-      const end = stack.indexOf("\n");
-      (error as { stack?: unknown }).stack = `${error.name}: ${error.message}${end === -1 ? "" : stack.slice(end)}`;
-    }
+  if (!(error instanceof Error)) return error;
+  const { name } = error;
+  if ((error as { code?: unknown }).code === undefined && name !== "DataCloneError") return error;
+  Error.captureStackTrace(error, caller);
+  // A DOMException is not an ErrorInstance: the header of what captureStackTrace writes is "Error".
+  const { message, stack } = error;
+  if (error instanceof DOMException && typeof stack === "string") {
+    const end = stack.indexOf("\n");
+    error.stack = `${name}: ${message}${end === -1 ? "" : stack.slice(end)}`;
   }
   return error;
 }
