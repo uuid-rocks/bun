@@ -16,7 +16,7 @@ use bun_jsc::{ErrorCode, JSGlobalObject, JSPromise, JSValue, JsResult};
 
 use super::channel::{
     Channel, ChannelCore, Channels, OpKind, Options, Queued, ReceiveNow, SendNow, WakeResult,
-    closed_error, new_waiter, ops, select_result, wait,
+    closed_error, new_waiter, ops, select_result, shuffle, wait,
 };
 use super::message::ChannelMessage;
 use crate::node::util::validators;
@@ -90,9 +90,7 @@ pub(crate) fn select(
     }
 
     let mut order: SmallVec<[u32; 8]> = (0..len as u32).collect();
-    for i in (1..order.len()).rev() {
-        order.swap(i, (bun_core::fast_random() % (i as u64 + 1)) as usize);
-    }
+    shuffle(&mut order);
 
     let mut locks: SmallVec<[_; 2]> = channels
         .iter()

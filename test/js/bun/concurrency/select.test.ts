@@ -271,6 +271,24 @@ describe("Bun.select", () => {
     expect(sent[0]).toBeGreaterThan((N / 4) * 0.4);
     expect(sent[1]).toBeGreaterThan((N / 4) * 0.4);
 
+    // Closing makes a waiting receive and a waiting send on the channel ready together.
+    const closings = [0, 0];
+    for (let i = 0; i < N / 4; i++) {
+      const ch = new Bun.Channel<number>();
+      const selected = Bun.select([ch, [ch, 1]]);
+      ch.close();
+      const index = await selected.then(
+        r => r.index,
+        e => {
+          if (e.code !== "ERR_CHANNEL_CLOSED") throw e;
+          return 1;
+        },
+      );
+      closings[index]++;
+    }
+    expect(closings[0]).toBeGreaterThan((N / 4) * 0.4);
+    expect(closings[1]).toBeGreaterThan((N / 4) * 0.4);
+
     const sides = [0, 0];
     for (let i = 0; i < N; i++) sides[(await Bun.select([closedChannel(), closedChannel()])).index]++;
     expect(sides[0]).toBeGreaterThan(N * 0.4);

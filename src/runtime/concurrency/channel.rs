@@ -432,10 +432,13 @@ impl ChannelCore {
                 core::mem::take(&mut state.senders),
             )
         };
-        for queued in receivers
+        let mut waiting: Vec<Queued> = receivers
             .into_iter()
             .chain(senders.into_iter().map(|(queued, _)| queued))
-        {
+            .collect();
+        // A select that waits both to receive and to send here has both cases ready now.
+        shuffle(&mut waiting);
+        for queued in waiting {
             if queued.fire() {
                 queued.wake(WakeResult::Closed);
             }
@@ -593,6 +596,13 @@ impl Channel {
             }),
             Err(waiter) => Ok(wait(global, kind, waiter, self.channels(), options.signal)),
         }
+    }
+}
+
+/// Uniformly at random.
+pub(super) fn shuffle<T>(items: &mut [T]) {
+    for i in (1..items.len()).rev() {
+        items.swap(i, (bun_core::fast_random() % (i as u64 + 1)) as usize);
     }
 }
 
