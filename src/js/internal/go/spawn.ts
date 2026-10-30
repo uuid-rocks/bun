@@ -624,7 +624,10 @@ class WaitGroup {
   }
 
   // `console.log(group)` shows its state, as for a channel.
-  [Symbol.for("nodejs.util.inspect.custom")](depth: number, options: { stylize(text: string, style: string): string }) {
+  [Symbol.for("nodejs.util.inspect.custom")](
+    depth: number,
+    options: { stylize(text: string, style: string): string; depth?: number | null },
+  ) {
     if (depth < 0) return options.stylize("[WaitGroup]", "special");
     const { inspect } = require("node:util");
     const fields = {

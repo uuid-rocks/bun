@@ -13,7 +13,7 @@ export async function lock(this: Mutex, options?: { signal?: AbortSignal }) {
   const lock = { unlock, [Symbol.dispose]: unlock };
   // What a DataCloneError says to do instead (ChannelMessage.cpp).
   $putByIdDirectPrivate(
-    lock,
+    lock as typeof lock & { $isUncloneable: string },
     "isUncloneable",
     "a lock belongs to the goroutine that took it: pass the Mutex and lock it there",
   );
@@ -32,7 +32,7 @@ export function tryLock(this: Mutex) {
   const lock = { unlock, [Symbol.dispose]: unlock };
   // What a DataCloneError says to do instead (ChannelMessage.cpp).
   $putByIdDirectPrivate(
-    lock,
+    lock as typeof lock & { $isUncloneable: string },
     "isUncloneable",
     "a lock belongs to the goroutine that took it: pass the Mutex and lock it there",
   );
