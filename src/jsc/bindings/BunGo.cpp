@@ -848,6 +848,22 @@ JSC_DEFINE_HOST_FUNCTION(jsGoCheck, (JSGlobalObject * lexicalGlobalObject, CallF
     RELEASE_AND_RETURN(scope, JSValue::encode(constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), problems)));
 }
 
+// hasModuleRequire(fn, module): whether `require` in `fn` is the module's own, which the goroutine's
+// thread gives it. What check() found of the code that made `fn` holds for another closure of it,
+// except this: the binding may hold another value there, or since.
+JSC_DEFINE_HOST_FUNCTION(jsGoHasModuleRequire, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto& vm = lexicalGlobalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* function = dynamicDowncast<JSFunction>(callFrame->argument(0));
+    if (!function || function->isHostOrBuiltinFunction())
+        return JSValue::encode(jsBoolean(false));
+    String module = callFrame->argument(1).toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    auto found = bindingOf(lexicalGlobalObject, function, Identifier::fromString(vm, "require"_s));
+    return JSValue::encode(jsBoolean(isModuleRequire(defaultGlobalObject(lexicalGlobalObject), found.value, module)));
+}
+
 // evaluating(module): whether this thread has started to evaluate the ES module `module` (a module
 // key) and not finished, as when its top-level await is pending.
 JSC_DEFINE_HOST_FUNCTION(jsGoEvaluating, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
@@ -1068,7 +1084,7 @@ JSValue createGoSpawnBinding(Zig::GlobalObject* globalObject)
 {
     auto& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    JSObject* binding = constructEmptyObject(globalObject, globalObject->objectPrototype(), 10);
+    JSObject* binding = constructEmptyObject(globalObject, globalObject->objectPrototype(), 11);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "spawn"_s), 4, Bun::Go::jsGoSpawn, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "spawnInline"_s), 6, Bun::Go::jsGoSpawnInline, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "sourceOf"_s), 1, Bun::Go::jsGoSourceOf, ImplementationVisibility::Public, NoIntrinsic, 0);
@@ -1079,6 +1095,7 @@ JSValue createGoSpawnBinding(Zig::GlobalObject* globalObject)
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "resolveModule"_s), 1, Bun::Go::jsGoResolveModule, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "evaluating"_s), 1, Bun::Go::jsGoEvaluating, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "describe"_s), 1, Bun::Go::jsGoDescribe, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "hasModuleRequire"_s), 2, Bun::Go::jsGoHasModuleRequire, ImplementationVisibility::Public, NoIntrinsic, 0);
     RELEASE_AND_RETURN(scope, binding);
 }
 

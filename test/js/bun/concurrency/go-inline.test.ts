@@ -132,12 +132,43 @@ describe.concurrent("Bun.go with an inline function", () => {
         }
         console.log(await Bun.go(() => require("node:path").basename("/a/b")));
         console.log(await require("./common.cjs").basename("/c/d"));
+        // Another closure of code already sent, and a captured require assigned another value since.
+        const factory = (require: Function) => () => require("node:path").basename("/e/f");
+        console.log(await Bun.go(factory(import.meta.require)));
+        try {
+          await Bun.go(factory(() => ({ basename: () => "not node:path" })));
+        } catch (e) {
+          console.log(e.code);
+        }
+        function reassignable() {
+          let require: Function = import.meta.require;
+          const fn = () => require("node:path").basename("/g/h");
+          return [fn, (other: Function) => (require = other)] as const;
+        }
+        const [reassigned, reassign] = reassignable();
+        console.log(await Bun.go(reassigned));
+        reassign(() => ({ basename: () => "not node:path" }));
+        try {
+          await Bun.go(reassigned);
+        } catch (e) {
+          console.log(e.code);
+        }
       `,
       "common.cjs": `
         exports.basename = path => Bun.go(path => require("node:path").basename(path), path);
       `,
     });
-    expect(stdout).toBe(["ERR_GOROUTINE_NOT_SENDABLE true", "b", "d"].join("\n"));
+    expect(stdout).toBe(
+      [
+        "ERR_GOROUTINE_NOT_SENDABLE true",
+        "b",
+        "d",
+        "f",
+        "ERR_GOROUTINE_NOT_SENDABLE",
+        "h",
+        "ERR_GOROUTINE_NOT_SENDABLE",
+      ].join("\n"),
+    );
     expect(exitCode).toBe(0);
   });
 

@@ -11,6 +11,7 @@ const {
   codeGenerationAllowed,
   evaluating,
   describe,
+  hasModuleRequire,
 } = $cpp("BunGo.cpp", "createGoSpawnBinding") as {
   spawn(module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]): number;
   spawnInline(source: string, module: string, line: number, column: number, strict: boolean, args: unknown[]): number;
@@ -22,6 +23,7 @@ const {
   codeGenerationAllowed(): boolean;
   evaluating(module: string): boolean;
   describe(value: unknown): [path: string, what: string] | undefined;
+  hasModuleRequire(fn: Function, module: string): boolean;
 };
 
 // A function's text, and where it starts in its module (zero-based).
@@ -47,7 +49,8 @@ const enum TargetKind {
 }
 type Target =
   | [TargetKind.Export, module: string, exportName: string, fromCommonJSExports: boolean]
-  | [TargetKind.Inline, ...Source];
+  // `usesRequire`: the text names `require`, which must be its module's own each time it is sent.
+  | [TargetKind.Inline, ...Source, usesRequire: boolean];
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -240,7 +243,10 @@ function inlineOf(fn: Function, source: Source | undefined, bundled: boolean): T
       module,
       line,
       column,
-      target: problems === undefined ? [TargetKind.Inline, text, module, line, column, strict] : undefined,
+      target:
+        problems === undefined
+          ? [TargetKind.Inline, text, module, line, column, strict, /\brequire\b/.test(text)]
+          : undefined,
       problems,
     };
     verdicts.$set(text, verdict);
@@ -252,6 +258,17 @@ function inlineOf(fn: Function, source: Source | undefined, bundled: boolean): T
 }
 
 function targetOf(fn: Function): Target {
+  const target = cachedTargetOf(fn);
+  // What `require` is depends on the closure, and a variable can be assigned another: the verdict
+  // of the first function made by this code says nothing about it.
+  if (target[0] === TargetKind.Inline && target[6] && !hasModuleRequire(fn, target[2])) {
+    const problems = check(fn, target[1], target[2], target[3], target[4]);
+    if (problems !== undefined) throw notSendable(fn, target[2], problems);
+  }
+  return target;
+}
+
+function cachedTargetOf(fn: Function): Target {
   let target = targets.get(fn);
   if (target !== undefined) return target;
   const source = sourceOf(fn);
