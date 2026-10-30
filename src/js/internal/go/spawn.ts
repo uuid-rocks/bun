@@ -158,7 +158,7 @@ function keyOf(object: object, fn: Function): string | undefined {
 
 // bun build finds the module of a function only from the call itself.
 function inBundle(api: string) {
-  return ` In a bundle, bun build finds the module of a function passed to ${api}() as an imported binding, as in ${api}(task) or ${api}(tasks.task), or as the module's URL with the export as its fragment, as in ${api}(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build.`;
+  return ` In a bundle, bun build finds the module of a function passed to ${api}() as an imported binding, as in ${api}(task) or ${api}(tasks.task), or as the module's URL with the export as its fragment, as in ${api}(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build and build with --splitting, so that the function is that entry point's export.`;
 }
 
 function notSendable(api: string, fn: Function, url: string | undefined, problems?: Problem[], bundled = false) {
@@ -601,6 +601,8 @@ class WaitGroup {
     }
     // AbortSignal.any() holds what it makes weakly: a long-lived parent does not keep this alive.
     this.#signal = parent === undefined ? this.#controller.signal : AbortSignal.any([parent, this.#controller.signal]);
+    // What waits for a slot rejects once the signal aborts, not once a slot frees.
+    if (this.#limit !== Infinity) this.#signal.addEventListener("abort", () => this.#next(), { once: true });
     ownedByThisThread(this, kWaitGroupHint);
   }
 
@@ -622,6 +624,7 @@ class WaitGroup {
         const uncloneable = uncloneableArgument("WaitGroup.go", args);
         if (uncloneable !== undefined) throw uncloneable;
         this.#queue.push({ goroutine, task: fn, target, args });
+        if (this.#signal.aborted) this.#next();
       }
     } catch (error) {
       throw thrownBy(error, WaitGroup.prototype.go);

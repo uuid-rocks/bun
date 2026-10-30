@@ -423,10 +423,12 @@ bun build --compile ./main.ts --outfile resize
 
 So you can move the output and delete the sources. Each task module's output keeps its exports under their own names, with `--minify` too. An executable holds the task modules, so it runs from any directory.
 
-The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment, or list the module as an entry point of the build, as for a [Worker](/runtime/workers):
+The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment. Or list the module as an entry point of the build, as for a [Worker](/runtime/workers), and build with `--splitting`. Without `--splitting`, the bundle of `main.ts` holds its own copy of the module, and the function it passes is that copy's:
 
 ```sh terminal icon="terminal"
-bun build --compile ./main.ts ./tasks/*.ts --outfile app
+bun build --compile --splitting ./main.ts ./tasks/*.ts --outfile app
 ```
+
+A module named by a computed URL, as in ``Bun.go(new URL(`./tasks/${name}.ts`, import.meta.url))``, needs only the entry points.
 
 A function from a package that the build leaves external is passed as it is. The package's module is imported from `node_modules` at run time.

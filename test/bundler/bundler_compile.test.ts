@@ -1752,15 +1752,27 @@ describe("Bun.go", () => {
     const [code, message, groupCode, groupMessage] = stdout.split("\n");
     expect(code).toBe("ERR_GOROUTINE_NOT_SENDABLE");
     expect(message).toContain(
-      `In a bundle, bun build finds the module of a function passed to Bun.go() as an imported binding, as in Bun.go(task) or Bun.go(tasks.task), or as the module's URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build.`,
+      `In a bundle, bun build finds the module of a function passed to Bun.go() as an imported binding, as in Bun.go(task) or Bun.go(tasks.task), or as the module's URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build and build with --splitting, so that the function is that entry point's export.`,
     );
     expect(groupCode).toBe("ERR_GOROUTINE_NOT_SENDABLE");
     expect(groupMessage).toStartWith(`WaitGroup.go() can't run "work" on another thread`);
     expect(groupMessage).toContain(
-      `In a bundle, bun build finds the module of a function passed to WaitGroup.go() as an imported binding, as in WaitGroup.go(task) or WaitGroup.go(tasks.task), or as the module's URL with the export as its fragment, as in WaitGroup.go(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build.`,
+      `In a bundle, bun build finds the module of a function passed to WaitGroup.go() as an imported binding, as in WaitGroup.go(task) or WaitGroup.go(tasks.task), or as the module's URL with the export as its fragment, as in WaitGroup.go(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build and build with --splitting, so that the function is that entry point's export.`,
     );
     expect(groupMessage).not.toContain("Bun.go");
     expect(exitCode).toBe(0);
+
+    // What the message says: the module as an entry point, with --splitting.
+    const listed = await run(
+      [bunExe(), "build", "--compile", "--splitting", "main.ts", "tasks.ts", "--outfile", join("listed", "app")],
+      root,
+    );
+    expect(listed.stderr).toBe("");
+    expect(listed.exitCode).toBe(0);
+    const fixed = await run([join(root, "listed", "app")], join(root, "listed"));
+    expect(fixed.stderr).toBe("");
+    expect(fixed.stdout).toBe("30\n40\n");
+    expect(fixed.exitCode).toBe(0);
   });
 });
 

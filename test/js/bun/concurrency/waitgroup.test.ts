@@ -242,6 +242,22 @@ describe("Bun.WaitGroup", () => {
       expect(ran[0]).toBe(0);
     });
 
+    test("a goroutine that waits for a slot rejects as soon as the signal aborts, while the slot is still taken", async () => {
+      const parent = new AbortController();
+      const group = new Bun.WaitGroup({ limit: 1, signal: parent.signal });
+      const gate = new Bun.Channel<void>(1);
+      const running = group.go((gate: Bun.Channel<void>) => gate.receive(), gate);
+      const queued = group.go(() => 1).catch(e => e);
+      const reason = new Error("cancelled");
+      parent.abort(reason);
+      expect(await queued).toBe(reason);
+      // Queued after the abort: rejects at once too.
+      expect(await group.go(() => 2).catch(e => e)).toBe(reason);
+      await gate.send();
+      await running;
+      expect(await group.wait().catch(e => e)).toBe(reason);
+    });
+
     test("a goroutine that waits for a slot throws from go() at once if it can't start", () => {
       const group = new Bun.WaitGroup({ limit: 1 });
       const gate = new Bun.Channel<void>(1);

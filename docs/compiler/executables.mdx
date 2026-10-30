@@ -731,7 +731,7 @@ console.log(await Bun.go(new URL("./task.ts", import.meta.url)));
 bun build --compile ./index.ts --outfile myapp
 ```
 
-This works for an imported function and for a URL with a literal path. List a module that a goroutine gets any other way as an entrypoint, as for a worker. See [bundles and executables](/runtime/goroutines#bundles-and-executables).
+This works for an imported function and for a URL with a literal path. List a module that a goroutine gets any other way as an entrypoint, as for a worker, and add `--splitting` when the goroutine gets a function of it rather than its URL. See [bundles and executables](/runtime/goroutines#bundles-and-executables).
 
 ---
 
