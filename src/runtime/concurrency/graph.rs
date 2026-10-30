@@ -185,17 +185,20 @@ fn dropping(drop: impl FnOnce()) {
         Err(_) | Ok(true) => drop(),
         Ok(false) => {
             drop();
-            while let Some((next, candidate)) =
-                DEFERRED.with(|deferred| deferred.borrow_mut().pop())
-            {
-                core::mem::drop(next);
-                if let Some(candidate) = candidate {
-                    register(candidate);
-                }
-            }
-            DROPPING.with(|dropping| dropping.set(false));
+            drop_deferred();
         }
     }
+}
+
+/// The drops the outermost `dropping` deferred, and the candidates to register after them.
+fn drop_deferred() {
+    while let Some((next, candidate)) = DEFERRED.with(|deferred| deferred.borrow_mut().pop()) {
+        drop(next);
+        if let Some(candidate) = candidate {
+            register(candidate);
+        }
+    }
+    DROPPING.with(|dropping| dropping.set(false));
 }
 
 /// A channel is about to be made on a JS thread. Collects a batch first if many candidates wait.
