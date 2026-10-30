@@ -1,5 +1,6 @@
 import { mutexWaiters } from "bun:internal-for-testing";
 import { describe, expect, test } from "bun:test";
+import { bunEnv, bunExe } from "harness";
 
 /** Polls until `condition()` holds. */
 async function until(condition: () => boolean) {
@@ -249,6 +250,42 @@ describe("Bun.Mutex", () => {
     expect(mutexWaiters(mu)).toBe(0);
     using free = mu.tryLock();
     expect(free).toBeDefined();
+  });
+
+  test("an abort listener that ends a waiting lock() while it is woken to try again is safe", async () => {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+        // The abort lands between the wakeup of the lock() and its try for the lock in some rounds.
+        for (let i = 0; i < 300; i++) {
+          const ch = new Bun.Channel(1);
+          const controller = new AbortController();
+          // A signal linked to the controller's, as a goroutine gets.
+          await ch.send(controller.signal);
+          const signal = await ch.receive();
+          const graph = new Bun.ModuleGraph();
+          const mu = new Bun.Mutex();
+          const lock = await mu.lock();
+          // Disposing the graph ends the lock() that waits in it.
+          signal.addEventListener("abort", () => graph.dispose());
+          const waiting = graph.run(() => mu.lock({ signal }));
+          waiting.then(lock => lock.unlock(), () => {});
+          setTimeout(() => controller.abort(new Error("stop")), 0);
+          lock.unlock();
+          await Bun.sleep(2);
+          graph.dispose();
+        }
+        console.log("done");
+        `,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({ stdout: "done\n", stderr: "", exitCode: 0 });
   });
 
   test("Bun.inspect() shows whether it is locked and how many wait, not its methods", async () => {

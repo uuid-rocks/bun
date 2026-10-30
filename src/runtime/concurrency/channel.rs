@@ -107,6 +107,9 @@ pub(super) struct State {
     /// Values handed to receivers that have not read them yet ([`Delivery`]). Each may come back:
     /// a closed channel ends only once none is out.
     deliveries: u32,
+    /// Values of senders that gave up, to drop once the channel is unlocked
+    /// ([`take_discarded`](Self::take_discarded)).
+    discarded: Vec<ChannelMessage>,
 }
 
 /// A waiter in a channel's queue, for one case of its operation: `0` but in a select.
@@ -266,8 +269,15 @@ impl State {
             if sender.fire() {
                 return Some((sender, message));
             }
+            self.discarded.push(message);
         }
         None
+    }
+
+    /// What [`try_receive`](Self::try_receive) passed over, to drop once the channel is unlocked:
+    /// a value can hold the last reference to another channel.
+    pub(super) fn take_discarded(&mut self) -> Vec<ChannelMessage> {
+        core::mem::take(&mut self.discarded)
     }
 }
 
@@ -576,17 +586,26 @@ impl ChannelOp {
 
     /// A `lock()` woken to try for its mutex again.
     fn retry(op: NonNull<ChannelOp>, global: &JSGlobalObject, wakeup: Wakeup) -> JsResult<()> {
-        // SAFETY: in the table, so live; nothing below runs script until it leaves.
-        let this = unsafe { op.as_ref() };
-        let (mutex, signal) = this.mutex.as_ref().expect("only a lock is woken to retry");
-        let mutex = Arc::clone(mutex);
+        let (id, mutex, signal) = {
+            // SAFETY: in the table, so live.
+            let this = unsafe { op.as_ref() };
+            let (mutex, signal) = this.mutex.as_ref().expect("only a lock is woken to retry");
+            (this.id, Arc::clone(mutex), signal.clone())
+        };
+        // Can run abort listeners, which can end the operation (they can dispose the
+        // `Bun.ModuleGraph` whose context it is in): it is looked up again after.
         let aborted = signal
-            .as_ref()
             .filter(|signal| {
                 signal.observe_linked_abort();
                 signal.aborted()
             })
             .map(|signal| signal.js_reason(global));
+        let Some(op) = ops().get(id) else {
+            // Gone: the wakeup goes to the next waiter.
+            return Ok(());
+        };
+        // SAFETY: in the table, so live; nothing below runs script until it leaves.
+        let this = unsafe { op.as_ref() };
         match aborted {
             // The next waiter tries instead.
             Some(_) => drop(wakeup),
@@ -884,12 +903,16 @@ impl ChannelCore {
         waiter: impl FnOnce() -> Arc<Waiter>,
     ) -> Result<Option<ChannelMessage>, Arc<Waiter>> {
         let mut state = self.state.lock();
-        let Some(received) = state.try_receive(self.capacity) else {
+        let received = state.try_receive(self.capacity);
+        let discarded = state.take_discarded();
+        let Some(received) = received else {
             let waiter = waiter();
             state.receivers.push_back(Queued {
                 waiter: Arc::clone(&waiter),
                 case: 0,
             });
+            drop(state);
+            drop(discarded);
             return Err(waiter);
         };
         drop(state);

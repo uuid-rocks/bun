@@ -44,6 +44,18 @@ impl Drop for Case {
     }
 }
 
+/// The select's own reference to the channel of the case that won, [released](graph::release) on
+/// every way out.
+struct Released(Option<Arc<ChannelCore>>);
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        if let Some(channel) = self.0.take() {
+            graph::release(channel);
+        }
+    }
+}
+
 /// Releases the select's own references to its channels.
 fn release_all(channels: Channels) {
     for channel in channels {
@@ -187,6 +199,11 @@ pub(crate) fn select(
             break;
         }
     }
+    // Dropped once the channels are unlocked.
+    let discarded: Vec<_> = locks
+        .iter_mut()
+        .flat_map(|state| state.take_discarded())
+        .collect();
 
     let Some((index, won)) = won else {
         if default {
@@ -242,10 +259,14 @@ pub(crate) fn select(
     };
     drop(locks);
     release_all(channels);
+    drop(discarded);
     let (reason, channel) = match (&won, &read[index as usize]) {
-        (Won::Aborted, Read::Signal(signal)) => (signal.js_reason(global), None),
-        (_, Read::Channel(case)) => (JSValue::UNDEFINED, Some(Arc::clone(&case.channel))),
-        _ => (JSValue::UNDEFINED, None),
+        (Won::Aborted, Read::Signal(signal)) => (signal.js_reason(global), Released(None)),
+        (_, Read::Channel(case)) => (
+            JSValue::UNDEFINED,
+            Released(Some(Arc::clone(&case.channel))),
+        ),
+        _ => (JSValue::UNDEFINED, Released(None)),
     };
     // The values of the cases that lost, outside the locks.
     drop(read);
@@ -261,22 +282,16 @@ pub(crate) fn select(
         }
         Won::Received(ReceiveNow::Closed) => select_result(global, index, JSValue::UNDEFINED, true),
         Won::Sent(SendNow::Handed(receiver, message)) => {
-            let channel = channel.as_ref().expect("a send case is a channel's");
+            let channel = channel.0.as_ref().expect("a send case is a channel's");
             receiver.wake(WakeResult::Received(Delivery::new(message, channel)));
             select_result(global, index, JSValue::UNDEFINED, false)
         }
         Won::Sent(SendNow::Buffered) => select_result(global, index, JSValue::UNDEFINED, false),
         Won::Sent(SendNow::Closed(message)) => {
             drop(message);
-            if let Some(channel) = channel {
-                graph::release(channel);
-            }
             return Ok(JSPromise::rejected_promise(global, closed_error(global)).to_js());
         }
     };
-    if let Some(channel) = channel {
-        graph::release(channel);
-    }
     Ok(JSPromise::resolved_promise_value(global, value))
 }
 

@@ -310,9 +310,10 @@ fn note_large(batch: Vec<Weak<ChannelCore>>) {
         .candidates
         .sort_unstable_by_key(|candidate| candidate.as_ptr() as usize);
     large.candidates.dedup_by(|a, b| Weak::ptr_eq(a, b));
-    if large.due.is_none() {
-        large.due = Some(Instant::now() + large.backoff);
-    }
+    // New candidates: what backed off while in use may be garbage now.
+    large.backoff = LARGE_FIRST;
+    let due = Instant::now() + LARGE_FIRST;
+    large.due = Some(large.due.map_or(due, |current| current.min(due)));
 }
 
 /// `bun:internal-for-testing`: how many channels one collection locks at most.
