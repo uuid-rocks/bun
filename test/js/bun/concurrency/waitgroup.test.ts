@@ -118,6 +118,14 @@ describe("Bun.WaitGroup", () => {
       });
     })().catch(e => e);
     expect(late.message).toBe("failed during disposal");
+    // An AbortError of the goroutine's own is an error too.
+    const ownAbort = await (async () => {
+      await using group = new Bun.WaitGroup();
+      group.go(() => {
+        throw new DOMException("something else was aborted", "AbortError");
+      });
+    })().catch(e => e);
+    expect(ownAbort.message).toBe("something else was aborted");
 
     const waited = await (async () => {
       await using group = new Bun.WaitGroup();

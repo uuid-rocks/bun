@@ -442,6 +442,14 @@ function settle(id: number, outcome: Outcome, value: unknown) {
   else entry.reject(outcome === Outcome.Rejected ? fromThread(value as Thrown) : value);
 }
 
+// What disposal aborts a WaitGroup's goroutines with. A goroutine's signal is a clone of the group's, so what it
+// rejects with because of the abort is a clone of this: the same name and message.
+const kDisposed = "The WaitGroup was disposed";
+
+function isDisposal(error: unknown) {
+  return error instanceof Error && error.name === "AbortError" && error.message === kDisposed;
+}
+
 // Go's sync.WaitGroup with its Go method (Go 1.25), and errgroup's first-error cancellation.
 class WaitGroup {
   #controller = new AbortController();
@@ -449,7 +457,7 @@ class WaitGroup {
   #running = new Set<Promise<unknown>>();
   // The first goroutine that failed, and whether wait() has thrown it.
   #failure: { error: unknown; thrown: boolean } | undefined;
-  // Disposal aborted the goroutines: an AbortError they throw from then on is what it asked for.
+  // Disposal aborted the goroutines: the reason they throw from then on is what it asked for.
   #disposed = false;
 
   constructor(options?: { signal?: AbortSignal }) {
@@ -477,7 +485,7 @@ class WaitGroup {
       () => running.delete(goroutine),
       error => {
         running.delete(goroutine);
-        if (this.#failure !== undefined || (this.#disposed && (error as Error | null)?.name === "AbortError")) return;
+        if (this.#failure !== undefined || (this.#disposed && isDisposal(error))) return;
         this.#failure = { error, thrown: false };
         this.#controller.abort(error);
       },
@@ -498,8 +506,8 @@ class WaitGroup {
 
   async [Symbol.asyncDispose]() {
     this.#disposed = true;
-    // A DOMException keeps its name through the clone each goroutine's signal makes of it.
-    this.#controller.abort(new DOMException("The WaitGroup was disposed", "AbortError"));
+    // A DOMException keeps its name through the clone; an Error's custom name does not.
+    this.#controller.abort(new DOMException(kDisposed, "AbortError"));
     const running = this.#running;
     while (running.size > 0) await Promise.allSettled(running);
     const failure = this.#failure;
