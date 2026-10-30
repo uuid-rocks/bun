@@ -102,8 +102,8 @@ declare module "bun" {
   /**
    * Runs a function on another thread, like Go's `go` statement.
    *
-   * Goroutines run on a pool of threads that Bun starts as they are needed: as many as `GOMAXPROCS`, or as the
-   * machine has CPU cores. A goroutine runs on one thread until it settles. While it awaits, its thread runs other
+   * Goroutines run on a pool of threads that Bun starts as they are needed: as many as `GOMAXPROCS` (2 or more),
+   * or as the machine has CPU cores. A goroutine runs on one thread until it settles. While it awaits, its thread runs other
    * goroutines. Goroutines on different threads run in parallel.
    *
    * `fn` must be a function that a module exports (ES module or CommonJS). Each pool thread imports that module

@@ -253,29 +253,24 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(1);
   });
 
-  test("an uncaught error on a pool thread is the program's", async () => {
+  test("an uncaught error on a pool thread is the program's, and the thread goes on", async () => {
     const { stdout, exitCode } = await run({
       "task.ts": `
-        export function later() {
+        export async function throwLater() {
           setTimeout(() => {
             throw new Error("thrown later");
           });
-          return "returned";
+          await Bun.sleep(10);
+          return "survived";
         }
       `,
       "main.ts": `
-        import { later } from "./task.ts";
-        const { promise, resolve } = Promise.withResolvers();
-        process.on("uncaughtException", e => resolve(e.message));
-        console.log(await Bun.go(later));
-        console.log(await promise);
-        // The thread goes on running goroutines.
-        console.log(await Bun.go(later));
-        process.removeAllListeners("uncaughtException");
-        process.on("uncaughtException", () => {});
+        import { throwLater } from "./task.ts";
+        process.on("uncaughtException", e => console.log("uncaught:", e.message));
+        console.log(await Bun.go(throwLater));
       `,
     });
-    expect(stdout).toBe("returned\nthrown later\nreturned");
+    expect(stdout).toBe("uncaught: thrown later\nsurvived");
     expect(exitCode).toBe(0);
   });
 

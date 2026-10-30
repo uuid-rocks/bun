@@ -1749,6 +1749,9 @@ fn on_goroutine_thread_unhandled_rejection(
     if !vm.script_allowed() || error_instance_or_exception.is_termination_exception() {
         return;
     }
+    // The caller counted the error as this VM's, which would end the loop; it is the main thread's.
+    vm.unhandled_error_counter = vm.unhandled_error_counter.saturating_sub(1);
+    vm.exit_handler.exit_code = 0;
     let global = vm.global();
     let error = error_instance_or_exception
         .to_error()
