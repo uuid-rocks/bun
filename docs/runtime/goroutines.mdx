@@ -372,26 +372,26 @@ Set `BUN_GO_DEADLOCK=0` to turn this off. Windows doesn't detect deadlocks yet.
 
 ## Coming from Go
 
-| Go                                                           | Bun                                                                                    |
-| ------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `go f(x)`                                                    | `Bun.go(f, x)`                                                                         |
-| `ch := make(chan T, n)`                                      | `const ch = new Bun.Channel<T>(n)`                                                     |
-| `ch <- v`                                                    | `await ch.send(v)`                                                                     |
-| `v := <-ch`                                                  | `const v = await ch.receive()`                                                         |
-| `for v := range ch`                                          | `for await (const v of ch)`                                                            |
-| `close(ch)`, `defer close(ch)`                               | `ch.close()`, `using ch = new Bun.Channel()`                                           |
-| `select { case v := <-a: ... case b <- x: ... }`             | `await Bun.select([a, [b, x]])`, then switch on `index`                                |
-| `default:` in a `select`                                     | `Bun.select(cases, { default: true })` resolves `index: -1`                            |
-| `case <-time.After(d):`                                      | an `AbortSignal.timeout(ms)` case                                                      |
-| `ctx, cancel := context.WithCancel(ctx)`                     | `const controller = new AbortController()`                                             |
-| `case <-ctx.Done():`                                         | a `signal` case                                                                        |
-| `var wg sync.WaitGroup; wg.Go(f); wg.Wait()`                 | `const wg = new Bun.WaitGroup(); wg.go(f); await wg.wait()`                            |
-| `g, ctx := errgroup.WithContext(ctx); g.Go(f); g.Wait()`     | `await using g = new Bun.WaitGroup({ signal }); g.go(f, g.signal); await g.wait()`     |
-| `var mu sync.Mutex; mu.Lock(); defer mu.Unlock()`            | `const mu = new Bun.Mutex(); using _ = await mu.lock()`                                |
-| `mu.TryLock()`                                               | `using lock = mu.tryLock()`, `undefined` if it is held                                 |
-| `atomic.AddInt32(&n, 1)`                                     | `Atomics.add(counter, 0, 1)` on a `SharedArrayBuffer`                                  |
-| `runtime.GOMAXPROCS(n)`                                      | the `GOMAXPROCS` environment variable                                                  |
-| `fatal error: all goroutines are asleep - deadlock!`         | the same, with each waiting operation's call site                                      |
+| Go                                                       | Bun                                                                                |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `go f(x)`                                                | `Bun.go(f, x)`                                                                     |
+| `ch := make(chan T, n)`                                  | `const ch = new Bun.Channel<T>(n)`                                                 |
+| `ch <- v`                                                | `await ch.send(v)`                                                                 |
+| `v := <-ch`                                              | `const v = await ch.receive()`                                                     |
+| `for v := range ch`                                      | `for await (const v of ch)`                                                        |
+| `close(ch)`, `defer close(ch)`                           | `ch.close()`, `using ch = new Bun.Channel()`                                       |
+| `select { case v := <-a: ... case b <- x: ... }`         | `await Bun.select([a, [b, x]])`, then switch on `index`                            |
+| `default:` in a `select`                                 | `Bun.select(cases, { default: true })` resolves `index: -1`                        |
+| `case <-time.After(d):`                                  | an `AbortSignal.timeout(ms)` case                                                  |
+| `ctx, cancel := context.WithCancel(ctx)`                 | `const controller = new AbortController()`                                         |
+| `case <-ctx.Done():`                                     | a `signal` case                                                                    |
+| `var wg sync.WaitGroup; wg.Go(f); wg.Wait()`             | `const wg = new Bun.WaitGroup(); wg.go(f); await wg.wait()`                        |
+| `g, ctx := errgroup.WithContext(ctx); g.Go(f); g.Wait()` | `await using g = new Bun.WaitGroup({ signal }); g.go(f, g.signal); await g.wait()` |
+| `var mu sync.Mutex; mu.Lock(); defer mu.Unlock()`        | `const mu = new Bun.Mutex(); using _ = await mu.lock()`                            |
+| `mu.TryLock()`                                           | `using lock = mu.tryLock()`, `undefined` if it is held                             |
+| `atomic.AddInt32(&n, 1)`                                 | `Atomics.add(counter, 0, 1)` on a `SharedArrayBuffer`                              |
+| `runtime.GOMAXPROCS(n)`                                  | the `GOMAXPROCS` environment variable                                              |
+| `fatal error: all goroutines are asleep - deadlock!`     | the same, with each waiting operation's call site                                  |
 
 ---
 

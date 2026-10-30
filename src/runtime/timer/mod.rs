@@ -548,7 +548,8 @@ impl All {
     /// The garbage collector's timers (`GcRepeating`, and JSC's own, which are the WTF timers) are
     /// not such timers; script's async work in JSC is the VM's to check.
     pub(crate) fn quiet(&self) -> bool {
-        self.timers.all_tags(|tag| tag == EventLoopTimerTag::GcRepeating)
+        self.timers
+            .all_tags(|tag| tag == EventLoopTimerTag::GcRepeating)
             && self.immediate_ref_count == 0
     }
 

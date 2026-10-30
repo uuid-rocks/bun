@@ -1079,8 +1079,8 @@ unsafe fn auto_tick(vm: *mut VirtualMachine) {
         let quic_next_tick_us = loop_.internal_loop_data.quic_next_tick_us();
         let mut timespec = bun_core::Timespec { sec: 0, nsec: 0 };
         // SAFETY: `state` is the live per-thread `RuntimeState`; `vm` per fn contract.
-        let asleep = !uv_idle_started
-            && unsafe { crate::concurrency::deadlock::before_poll(vm, state) };
+        let asleep =
+            !uv_idle_started && unsafe { crate::concurrency::deadlock::before_poll(vm, state) };
         if loop_.is_active() {
             // Before `get_timeout`: the first call arms the idle GC timer, and a
             // timer armed after the poll deadline is computed is not in that deadline.
@@ -1214,8 +1214,8 @@ unsafe fn auto_tick_active(vm: *mut VirtualMachine) {
         let quic_next_tick_us = loop_.internal_loop_data.quic_next_tick_us();
         let mut timespec = bun_core::Timespec { sec: 0, nsec: 0 };
         // SAFETY: `state` is the live per-thread `RuntimeState`; `vm` per fn contract.
-        let asleep = !uv_idle_started
-            && unsafe { crate::concurrency::deadlock::before_poll(vm, state) };
+        let asleep =
+            !uv_idle_started && unsafe { crate::concurrency::deadlock::before_poll(vm, state) };
         if loop_.is_active() {
             // Before `get_timeout` — see the matching call in `auto_tick`.
             // SAFETY: `el` is the live per-thread event loop.

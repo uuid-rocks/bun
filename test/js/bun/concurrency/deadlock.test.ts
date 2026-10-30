@@ -12,7 +12,12 @@ async function run(files: Record<string, string>, env: Record<string, string> = 
   });
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   // Frames keep their positions: normalizeBunSnapshot would hide them.
-  return { stdout, stderr: normalizeBunSnapshot(stderr, dir), frames: stderr.replaceAll(String(dir), "<dir>"), exitCode };
+  return {
+    stdout,
+    stderr: normalizeBunSnapshot(stderr, dir),
+    frames: stderr.replaceAll(String(dir), "<dir>"),
+    exitCode,
+  };
 }
 
 describe.concurrent.skipIf(isWindows)("deadlock detection", () => {

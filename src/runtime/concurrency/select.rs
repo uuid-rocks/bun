@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 use bun_collections::smallvec::SmallVec;
 use bun_jsc::bindgen::{JsLocal, JsScope};
-use bun_jsc::{AbortSignal, AbortSignalRef, ErrorCode, JSGlobalObject, JSPromise, JSValue, JsResult};
+use bun_jsc::{
+    AbortSignal, AbortSignalRef, ErrorCode, JSGlobalObject, JSPromise, JSValue, JsResult,
+};
 
 use super::channel::{
     Channel, ChannelCore, Channels, OpKind, Options, Queued, ReceiveNow, SendNow, WakeResult,

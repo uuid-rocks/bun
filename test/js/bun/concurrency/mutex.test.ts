@@ -50,7 +50,7 @@ describe("Bun.Mutex", () => {
             // Each one blocks its thread until all have started, so they run on as many threads.
             Atomics.add(state, 3, 1);
             Atomics.notify(state, 3);
-            for (let started; (started = Atomics.load(state, 3)) < goroutines; ) Atomics.wait(state, 3, started);
+            for (let started; (started = Atomics.load(state, 3)) < goroutines;) Atomics.wait(state, 3, started);
             for (let i = 0; i < rounds; i++) {
               using _ = await mu.lock();
               if (Atomics.add(state, 1, 1) !== 0) Atomics.add(state, 2, 1);

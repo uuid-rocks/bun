@@ -17,7 +17,7 @@ use bun_jsc::bindgen::{JsLocal, JsPayload as _, JsScope};
 use bun_jsc::{JSGlobalObject, JSPromise, JSValue, JsResult};
 use bun_threading::Guarded;
 
-use super::channel::{OpKind, Options, WakeResult, Waiter, new_waiter, ops, wait_for};
+use super::channel::{OpKind, Options, Waiter, WakeResult, new_waiter, ops, wait_for};
 
 pub(crate) struct MutexCore {
     state: Guarded<State>,
@@ -37,7 +37,9 @@ pub(super) struct Handoff(Option<Arc<MutexCore>>);
 impl Handoff {
     /// The waiter's VM holds the lock now.
     pub(super) fn keep(mut self) {
-        held().0.push(self.0.take().expect("a handoff is kept once"));
+        held()
+            .0
+            .push(self.0.take().expect("a handoff is kept once"));
     }
 }
 
@@ -186,7 +188,7 @@ pub(crate) fn waiters_for_testing(cx: &mut JsScope<'_>, mutex: JsLocal<'_>) -> J
         ));
     };
     Ok(JSValue::js_number(
-        mutex.core.state.lock().waiters.len() as f64,
+        mutex.core.state.lock().waiters.len() as f64
     ))
 }
 

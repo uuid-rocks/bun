@@ -116,8 +116,11 @@ pub(crate) unsafe fn before_poll(vm: *const VirtualMachine, state: *const Runtim
     // SAFETY: fn contract.
     let (vm_ref, state_ref) = unsafe { (&*vm, &*state) };
     // A change to a file starts the program again.
-    if !matches!(vm_ref.hot_reload, bun_options_types::context::HotReload::None)
-        || !state_ref.timer.quiet() || !vm_ref.deadlock_quiet(state_ref.deadlock.goroutine_refs.get())
+    if !matches!(
+        vm_ref.hot_reload,
+        bun_options_types::context::HotReload::None
+    ) || !state_ref.timer.quiet()
+        || !vm_ref.deadlock_quiet(state_ref.deadlock.goroutine_refs.get())
     {
         return false;
     }
