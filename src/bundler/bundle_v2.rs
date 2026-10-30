@@ -4653,7 +4653,13 @@ pub mod bv2_impl {
                         record.range,
                         format_args!(
                             "{} makes {} an entry point of the build, which then writes more than one file: build with --outdir or --compile",
-                            bstr::BStr::new(ImportKind::BunGo.error_label()),
+                            if record.flags.contains(bun_ast::ImportRecordFlags::BUN_GO_WAIT_GROUP) {
+                                "A WaitGroup's .go()"
+                            } else if record.flags.contains(bun_ast::ImportRecordFlags::BUN_GO_IMPORTED) {
+                                "go()"
+                            } else {
+                                "Bun.go()"
+                            },
                             bun_core::fmt::quote(sources[task as usize].path.pretty),
                         ),
                     );

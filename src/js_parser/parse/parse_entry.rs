@@ -171,8 +171,9 @@ pub fn function_free_names(text: &[u8]) -> Option<FunctionFreeNames> {
 }
 
 /// Whether module `text` reads whether it runs as the entry point, or on the main thread:
-/// `import.meta.main`, `require.main`, `Bun.main`, `Bun.isMainThread`, or `isMainThread` (of
-/// `node:worker_threads`). Strings, comments, templates and regular expressions don't count.
+/// `import.meta.main`, `require.main`, `Bun.main`, or `isMainThread` (of `node:worker_threads`,
+/// imported or read as a property, or `Bun.isMainThread`). Strings, comments, templates and regular
+/// expressions don't count.
 /// Returns `None` if the text can't be scanned.
 pub fn reads_whether_main(text: &[u8]) -> Option<bool> {
     use js_lexer::T;
@@ -208,7 +209,7 @@ pub fn reads_whether_main(text: &[u8]) -> Option<bool> {
                         || member_of(b"Bun")
                         || (member_of(b"meta") && before[2] == b"." && before[3] == b"import")
                 }
-                b"isMainThread" => before[0] != b"." || member_of(b"Bun"),
+                b"isMainThread" => true,
                 _ => false,
             };
             if reads {

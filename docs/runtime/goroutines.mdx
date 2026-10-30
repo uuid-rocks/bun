@@ -121,7 +121,7 @@ const count = await Bun.go(new URL("./primes.ts#countPrimes", import.meta.url), 
 
 A module that a goroutine imports runs once on each pool thread. Its top-level variables belong to that thread, like thread-local storage. In a pool thread, `Bun.isMainThread` and `import.meta.main` are `false`.
 
-A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine, so put its top-level work inside `if (import.meta.main)`. An entry point that never checks `import.meta.main`, `Bun.isMainThread` or `isMainThread` of `node:worker_threads` would run its top-level code again on each pool thread, and call `Bun.go(double)` there again. So `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` on the main thread instead, before any pool thread imports it:
+A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine, so put its top-level work inside `if (import.meta.main)`. An entry point that never reads `import.meta.main`, `require.main`, `Bun.main`, `Bun.isMainThread` or `isMainThread` of `node:worker_threads` (imported, or as in `require("node:worker_threads").isMainThread`) would run its top-level code again on each pool thread, and call `Bun.go(double)` there again. So `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` on the main thread instead, before any pool thread imports it:
 
 ```ts main.ts icon="/icons/typescript.svg"
 export function double(n: number) {
@@ -150,7 +150,7 @@ Arguments that can't be cloned, such as functions, throw a `DataCloneError` from
 
 ## Errors
 
-If the function throws, the goroutine rejects with a copy of the error. The copy has the error's name, message, stack, `cause` and own properties such as `code`. An `AggregateError` arrives as an `AggregateError`, with copies of its `errors`, and a `DOMException` as a `DOMException` with its `name` and `code`. Stack traces of a function written in place name the lines and columns of your source, and leave out the frames of the pool itself.
+If the function throws, the goroutine rejects with a copy of the error. The copy has the error's name, message, stack, `cause` and own properties such as `code`. An `AggregateError` arrives as an `AggregateError`, with copies of its `errors`, and a `DOMException` as a `DOMException` with its `name` and `code`. Stack traces of a function written in place name the lines and columns of your source, and leave out the frames of the pool itself. In a bundle you run with `bun`, they name the bundle's lines instead; an exported function's stack, an executable built with `--compile --sourcemap`, and a program run from source map to your source.
 
 ```ts
 try {
@@ -159,6 +159,8 @@ try {
   console.log(error instanceof SyntaxError); // => true
 }
 ```
+
+An error that `Bun.go()` or `group.go()` throws itself, such as `ERR_GOROUTINE_NOT_SENDABLE`, points at the call. When the call is the result of a concise arrow, as in `xs.map(x => group.go(f, x))`, or of `return Bun.go(...)`, JavaScriptCore makes it a tail call and drops that function's frame, so the stack shows the line of the function's caller.
 
 A rejected goroutine that nothing handles is an unhandled rejection on the thread that started it, so by default the process exits, as a panic does in Go. An error that a goroutine's code throws outside of the goroutine, for example in a `setTimeout()` callback, goes to `process.on("uncaughtException")` on the main thread.
 
@@ -258,7 +260,7 @@ console.log(balance[0]); // => 4000
 - `await mu.lock()` resolves with a lock once this thread holds the mutex. `using` unlocks it at the end of the scope, even when the scope throws; `lock.unlock()` unlocks it sooner. Only the first unlock does anything: a second is not an error, as it is in Go.
 - Waiting for a lock does not block the thread: the thread runs other goroutines meanwhile. Waiters get the lock in the order they asked for it.
 - `mu.tryLock()` returns the lock if the mutex is free, or `undefined`. `using lock = mu.tryLock()` works either way.
-- `mu.lock({ signal })` stops waiting when the signal aborts, and rejects with its reason.
+- `mu.lock({ signal })` stops waiting when the signal aborts, and rejects with its reason. A loop such as `for (;;) { using _ = await mu.lock({ signal }); }` on a mutex no other thread holds never gives the event loop a turn, so a `setTimeout()` that would abort the signal never runs. That is ordinary microtask starvation: make the loop yield, as with `await Bun.sleep(0)`, or abort from another thread.
 - A mutex is shared, not copied: pass it to `Bun.go()`, send it through a channel or post it to a `Worker`, and every thread locks the same mutex.
 - A thread that ends while it holds a lock, such as a terminated `Worker`, unlocks it.
 

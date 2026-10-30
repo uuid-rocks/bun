@@ -1867,18 +1867,76 @@ describe("Bun.go", () => {
         import { work } from "./work.ts";
         console.log(await Bun.go(work, 21));
       `,
+      "imported.ts": `
+        import { go } from "bun";
+        import { work } from "./work.ts";
+        console.log(await go(work, 21));
+      `,
+      "group.ts": `
+        import { work } from "./work.ts";
+        await using group = new Bun.WaitGroup();
+        console.log(await group.go(work, 21));
+      `,
       "work.ts": `export function work(n: number) { return n * 2; }`,
     });
-    const { stderr, exitCode } = await run(
-      [bunExe(), "build", "--target=bun", "app.ts", "--outfile", "app.js"],
-      String(dir),
+    // The error names the API the call is to.
+    for (const [file, api, line] of [
+      ["app.ts", "Bun.go()", 3],
+      ["imported.ts", "go()", 4],
+      ["group.ts", "A WaitGroup's .go()", 4],
+    ] as const) {
+      const { stderr, exitCode } = await run(
+        [bunExe(), "build", "--target=bun", file, "--outfile", "out.js"],
+        String(dir),
+      );
+      expect(stderr).toContain(
+        `error: ${api} makes "work.ts" an entry point of the build, which then writes more than one file: build with --outdir or --compile`,
+      );
+      expect(stderr).toContain(`${file}:${line}:`);
+      expect(stderr).not.toContain("[hash]");
+      expect(exitCode).toBe(1);
+    }
+  });
+
+  test("bun build: the error for a WaitGroup the build can't see, given an imported function, says how to make it one", async () => {
+    using dir = tempDir("bun-go-parameter-group", {
+      "app.ts": `
+        import { scale } from "./scale.ts";
+        async function runAll(group: Bun.WaitGroup, xs: number[]) {
+          return await Promise.all(xs.map(x => group.go(scale, x)));
+        }
+        await using group = new Bun.WaitGroup();
+        try {
+          console.log(await runAll(group, [1, 2]));
+        } catch (error) {
+          console.log(error.message);
+        }
+      `,
+      "scale.ts": `import { factor } from "./factor.ts"; export function scale(n: number) { return n * factor; }`,
+      "factor.ts": `export const factor = 10;`,
+    });
+    const root = String(dir);
+    const source = await run([bunExe(), "app.ts"], root);
+    expect(source.stdout).toBe("[ 10, 20 ]\n");
+    const build = await run([bunExe(), "build", "--target=bun", "app.ts", "--outdir", "out"], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    const { stdout, exitCode } = await run([bunExe(), join("out", "app.js")], root);
+    expect(stdout).toStartWith(`WaitGroup.go() can't run "scale" on another thread`);
+    expect(stdout).toEndWith(
+      "In a bundle, bun build makes the module of an imported function an entry point when the function is passed as it is, as in group.go(task), to a group this module declares with `new Bun.WaitGroup()`. Otherwise list the task's module as an entry point and build with --splitting.\n",
     );
-    expect(stderr).toContain(
-      `error: Bun.go() makes "work.ts" an entry point of the build, which then writes more than one file: build with --outdir or --compile`,
+    expect(exitCode).toBe(0);
+    // What the message says: the module as an entry point, with --splitting.
+    const listed = await run(
+      [bunExe(), "build", "--target=bun", "--splitting", "app.ts", "scale.ts", "--outdir", "listed"],
+      root,
     );
-    expect(stderr).toContain("app.ts:3:");
-    expect(stderr).not.toContain("[hash]");
-    expect(exitCode).toBe(1);
+    expect(listed.stderr).toBe("");
+    expect(listed.exitCode).toBe(0);
+    const fixed = await run([bunExe(), join("listed", "app.js")], root);
+    expect(fixed.stdout).toBe(source.stdout);
+    expect(fixed.exitCode).toBe(0);
   });
 
   test("bun build --sourcemap: a function that is not sendable is named where its source is", async () => {
@@ -1947,7 +2005,7 @@ describe("Bun.go", () => {
     expect(groupCode).toBe("ERR_GOROUTINE_NOT_SENDABLE");
     expect(groupMessage).toStartWith(`WaitGroup.go() can't run "work" on another thread`);
     expect(groupMessage).toEndWith(
-      `In a bundle, pass WaitGroup.go() the function as an import, as in WaitGroup.go(task): bun build makes its module an entry point.`,
+      "In a bundle, bun build makes the module of an imported function an entry point when the function is passed as it is, as in group.go(task), to a group this module declares with `new Bun.WaitGroup()`. Otherwise list the task's module as an entry point and build with --splitting.",
     );
     expect(groupMessage).not.toContain("Bun.go");
     expect(exitCode).toBe(0);

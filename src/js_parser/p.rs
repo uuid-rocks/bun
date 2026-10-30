@@ -1369,6 +1369,13 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             };
             let import_record_index =
                 self.add_import_record_by_range(ImportKind::BunGo, range, specifier);
+            self.import_records.items_mut()[import_record_index as usize]
+                .flags
+                .insert(match callee {
+                    BunGoCallee::Bun => bun_ast::ImportRecordFlags::empty(),
+                    BunGoCallee::Import(_) => bun_ast::ImportRecordFlags::BUN_GO_IMPORTED,
+                    BunGoCallee::Local(_) => bun_ast::ImportRecordFlags::BUN_GO_WAIT_GROUP,
+                });
             let original = call.args.slice()[0];
             let fragment_expr = self.new_expr(E::String::init(fragment), original.loc);
             // A third argument: `print_bun_go_task` keeps the value.

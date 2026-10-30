@@ -428,6 +428,16 @@ describe.concurrent("Bun.go", () => {
     });
     expect(guarded.stdout).toBe("8");
     expect(guarded.exitCode).toBe(0);
+    const required = await run({
+      "main.ts": `
+        export function work(x: number) {
+          return x * 2;
+        }
+        if (require("node:worker_threads").isMainThread) console.log(await Bun.go(work, 5));
+      `,
+    });
+    expect(required.stdout).toBe("10");
+    expect(required.exitCode).toBe(0);
     const unguarded = await run({
       "main.ts": `
         // import.meta.main

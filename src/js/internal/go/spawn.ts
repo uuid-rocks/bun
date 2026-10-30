@@ -157,10 +157,17 @@ function keyOf(object: object, fn: Function): string | undefined {
   }
 }
 
+// How a call to `api` is written in an example.
+function callOf(api: string) {
+  return api === "WaitGroup.go" ? "group.go" : api;
+}
+
 // bun build finds the module of a function only from the call itself, and a bundle has no module to
-// import() inside the function.
+// import() inside the function. A WaitGroup's go() is Bun's only if the module declares the group.
 function inBundle(api: string) {
-  return ` In a bundle, pass ${api}() the function as an import, as in ${api}(task): bun build makes its module an entry point.`;
+  return api === "WaitGroup.go"
+    ? " In a bundle, bun build makes the module of an imported function an entry point when the function is passed as it is, as in group.go(task), to a group this module declares with `new Bun.WaitGroup()`. Otherwise list the task's module as an entry point and build with --splitting."
+    : ` In a bundle, pass ${api}() the function as an import, as in ${api}(task): bun build makes its module an entry point.`;
 }
 
 function notSendable(api: string, fn: Function, url: string | undefined, problems?: Problem[], bundled = false) {
@@ -259,7 +266,7 @@ function notSendableIn(
         } else if (valueKind === "function") {
           say(
             kind,
-            `${imports}: pass it to ${api}() itself, as in ${api}(${name}, ...args)${bundled ? "" : `, or import it inside this function with ${importInside}`}`,
+            `${imports}: pass it to ${api}() itself, as in ${callOf(api)}(${name}, ...args)${bundled ? "" : `, or import it inside this function with ${importInside}`}`,
           );
         } else if (valueKind === "class" || valueKind === "native") {
           // Neither has a source of its own to send, nor can it be an argument.
