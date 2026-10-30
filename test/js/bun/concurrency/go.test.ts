@@ -79,6 +79,43 @@ describe.concurrent("Bun.go", () => {
     expect(exitCode).toBe(0);
   });
 
+  // A started goroutine never moves, so while the pool can grow, a goroutine does not go to a thread
+  // that already runs one, even one that waits (it may compute next), nor to a thread that took one
+  // and runs a turn while the others start.
+  test("goroutines get threads of their own while the pool can grow", async () => {
+    const { stdout, exitCode } = await run(
+      {
+        "main.ts": `
+          const started = new Bun.Channel<number>();
+          const release = new Bun.Channel<void>();
+          const waiting = Bun.go(
+            async (started: Bun.Channel<number>, release: Bun.Channel<void>) => {
+              await started.send(require("node:worker_threads").threadId);
+              await release.receive();
+            },
+            started,
+            release,
+          );
+          const first = await started.receive();
+          const others = await Promise.all(
+            Array.from({ length: 3 }, () =>
+              Bun.go(async () => {
+                await Bun.sleep(1);
+                return require("node:worker_threads").threadId;
+              }),
+            ),
+          );
+          await release.send();
+          await waiting;
+          console.log(new Set([first, ...others]).size);
+        `,
+      },
+      { threads: 4 },
+    );
+    expect(stdout).toBe("4");
+    expect(exitCode).toBe(0);
+  });
+
   test("10,000 goroutines settle on a small pool, and each pool thread evaluates the module once", async () => {
     const { stdout, exitCode } = await run(
       {

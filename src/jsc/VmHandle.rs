@@ -413,6 +413,15 @@ impl VmHandle {
         self.0.state() == State::Open
     }
 
+    /// Whether this is the handle of the calling thread's VM. Any thread.
+    #[inline]
+    pub fn is_current(&self) -> bool {
+        VirtualMachine::get_or_null().is_some_and(|vm| {
+            // SAFETY: the calling thread's live VM.
+            Arc::ptr_eq(&unsafe { &*vm }.handle_ref().0, &self.0)
+        })
+    }
+
     /// Returns true once teardown has finished waiting. Nothing waits for a ticket issued after that.
     #[inline]
     pub fn closed(&self) -> bool {
