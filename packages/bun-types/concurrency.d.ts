@@ -26,7 +26,7 @@ declare module "bun" {
    *
    * @category Concurrency
    */
-  class Channel<T = unknown> implements AsyncIterable<T>, Disposable {
+  class Channel<in out T = unknown> implements AsyncIterable<T>, Disposable {
     /**
      * @param capacity How many values the channel holds while no receiver waits. `0` (the default) makes every
      * `send()` wait for a `receive()`. An integer from `0` to `2 ** 32 - 1`; anything else throws a `RangeError`
@@ -129,15 +129,17 @@ declare module "bun" {
    *   what it uses and where. Pass such values as arguments instead.
    * - a function that a module exports (ES module or CommonJS). Each pool thread imports that module once, and calls
    *   the export. Module state is per thread, and `import.meta.main` is `false` there. Bun prefers this when the
-   *   function is exported, and it is the way for code that uses its module's imports.
+   *   function is exported, and it is the way for code that uses its module's imports. An entry point that exports
+   *   it must keep its top-level code inside `if (import.meta.main)`, or `go()` throws `ERR_GOROUTINE_NOT_SENDABLE`.
+   * - a module ({@link GoModule}), whose default export, or the export its URL's fragment names, runs.
    *
    * A bound or native function throws `ERR_GOROUTINE_NOT_SENDABLE`. So does a function no module exports while
    * code generation from strings is disallowed (`--disallow-code-generation-from-strings`).
    *
    * The arguments and the result are structured clones, as with `postMessage()`: a `SharedArrayBuffer` or a
    * {@link Channel} is shared, everything else is copied. An `AbortSignal` arrives as a signal that aborts when the
-   * original does, with a clone of its reason (an `AbortError` if the reason can't be cloned). Arguments that can't be
-   * cloned throw a `DataCloneError`. If the function throws, the goroutine rejects with a copy of the error (its name,
+   * original does, with a clone of its reason (an `AbortError` if the reason can't be cloned); a goroutine that
+   * rejects with that reason rejects with the original. Arguments that can't be cloned throw a `DataCloneError`. If the function throws, the goroutine rejects with a copy of the error (its name,
    * message, stack, `cause` and own properties). A rejection that nothing handles is an unhandled rejection on the
    * thread that called `go()`.
    *
@@ -164,19 +166,26 @@ declare module "bun" {
    *
    * @category Concurrency
    */
-  function go<A extends unknown[], R>(fn: (...args: A) => R, ...args: A): Goroutine<Awaited<R>>;
+  function go<
+    F extends (...args: any[]) => any = never,
+    A extends unknown[] = [F] extends [never] ? unknown[] : Parameters<F>,
+    R = [F] extends [never] ? unknown : ReturnType<F>,
+  >(fn: ((...args: A) => R) | GoModule, ...args: A): Goroutine<Awaited<R>>;
+
   /**
-   * Runs the default export of a module on another thread, like {@link go} with a function. `module` is resolved
-   * the way `new Worker(module)` resolves its entry point: a relative path against the current directory, so prefer
+   * A module for {@link go} to run the default export of: `fn` can be one instead of a function. It is resolved the
+   * way `new Worker(module)` resolves its entry point: a relative path against the current directory, so prefer
    * `new URL("./task.ts", import.meta.url)`. The fragment of a URL names another export:
-   * `new URL("./task.ts#countPrimes", import.meta.url)`.
+   * `new URL("./task.ts#countPrimes", import.meta.url)`. Name the function's type to type the arguments and the
+   * result: `Bun.go<typeof countPrimes>(new URL("./task.ts#countPrimes", import.meta.url), 0, 100)`.
    *
-   * `bun build` finds `Bun.go(new URL("./task.ts", import.meta.url))` with a literal path, and `Bun.go(fn)` with an
-   * imported `fn`, and makes each module an entry point of the build. List any other module as an entry point.
+   * `bun build` finds `go(new URL("./task.ts", import.meta.url))` with a literal path, and `go(fn)` with an imported
+   * `fn` (of `Bun.go`, `go` imported from `"bun"`, or a `WaitGroup`), and makes each module an entry point of the
+   * build. List any other module as an entry point.
    *
    * @category Concurrency
    */
-  function go<R = unknown>(module: string | URL, ...args: unknown[]): Goroutine<R>;
+  type GoModule = string | URL;
 
   /**
    * A case of {@link select}: a channel to receive from, `[channel, value]` to send `value` on it, or an
@@ -229,7 +238,7 @@ declare module "bun" {
 
   /** The value of each send case is a `T` of its channel. */
   type SelectCases<C extends readonly SelectCase[]> = {
-    [K in keyof C]: C[K] extends readonly [Channel<infer T>, unknown] ? readonly [Channel<T>, T] : C[K];
+    [K in keyof C]: C[K] extends readonly [Channel<infer T>, unknown] ? readonly [Channel<T>, NoInfer<T>] : C[K];
   };
 
   /**
@@ -271,18 +280,14 @@ declare module "bun" {
    *
    * @category Concurrency
    */
-  function select<const C extends readonly SelectCase[]>(
-    cases: C & SelectCases<C>,
-    options: SelectOptions & { default: true },
-  ): Promise<SelectResult<C> | SelectDefault>;
-  function select<const C extends readonly SelectCase[]>(
-    cases: C & SelectCases<C>,
-    options?: SelectOptions & { default?: false },
-  ): Promise<SelectResult<C>>;
-  function select<const C extends readonly SelectCase[]>(
-    cases: C & SelectCases<C>,
-    options?: SelectOptions,
-  ): Promise<SelectResult<C> | SelectDefault>;
+  function select<const C extends readonly SelectCase[], O extends SelectOptions = {}>(
+    cases: SelectCases<C>,
+    options?: O,
+  ): Promise<
+    true extends ("default" extends keyof O ? O["default" & keyof O] : undefined)
+      ? SelectResult<C> | SelectDefault
+      : SelectResult<C>
+  >;
 
   /**
    * Starts goroutines and waits for them, like Go's `sync.WaitGroup` with its `Go` method, and cancels them on the
@@ -297,9 +302,12 @@ declare module "bun" {
    * - `await using` aborts the signal and waits for every goroutine when the scope ends, so none outlives it. An
    *   error that `wait()` did not throw is thrown then.
    *
-   * A goroutine that a `WaitGroup` started never causes an unhandled rejection; its error is the group's.
+   * A goroutine that a `WaitGroup` started never causes an unhandled rejection; its error is the group's. A goroutine
+   * that rejects with the reason of the group's signal (or of any `AbortSignal` passed to it as an argument) rejects
+   * with that reason itself, not a copy: `error === group.signal.reason` tells a cancellation from a failure.
    *
-   * A `WaitGroup` belongs to the thread that made it. It is not shared with other threads.
+   * A `WaitGroup` belongs to the thread that made it: passing it to {@link go} or sending it on a channel throws a
+   * `DataCloneError`. Send results on a channel instead.
    *
    * @example
    * ```ts
@@ -315,8 +323,12 @@ declare module "bun" {
   class WaitGroup implements AsyncDisposable {
     /**
      * @param options.signal Aborts {@link signal} too: the goroutines are cancelled when the caller is.
+     * @param options.limit How many of its goroutines run at once, like errgroup's `SetLimit`: an integer from `1`,
+     * or `Infinity` (the default). {@link go} still returns at once; a goroutine past the limit waits for one to
+     * settle before it starts. Its arguments are cloned when it starts. Once {@link signal} has aborted, a goroutine
+     * that waits rejects with `signal.reason` and never starts.
      */
-    constructor(options?: { signal?: AbortSignal });
+    constructor(options?: { signal?: AbortSignal; limit?: number });
 
     /**
      * Aborts when the first goroutine fails (`signal.reason` is its error), when `options.signal` aborts (with its
@@ -324,10 +336,15 @@ declare module "bun" {
      */
     readonly signal: AbortSignal;
 
-    /** Runs `fn(...args)` on another thread, like {@link go}, and counts it. Returns the goroutine. */
-    go<A extends unknown[], R>(fn: (...args: A) => R, ...args: A): Goroutine<Awaited<R>>;
-    /** Runs the default export of a module on another thread, like {@link go}, and counts it. */
-    go<R = unknown>(module: string | URL, ...args: unknown[]): Goroutine<R>;
+    /**
+     * Runs `fn(...args)` on another thread, like {@link go}, and counts it. Returns the goroutine at once, even when
+     * it waits for a slot of `options.limit`. `fn` can be a module, as for {@link go}.
+     */
+    go<
+      F extends (...args: any[]) => any = never,
+      A extends unknown[] = [F] extends [never] ? unknown[] : Parameters<F>,
+      R = [F] extends [never] ? unknown : ReturnType<F>,
+    >(fn: ((...args: A) => R) | GoModule, ...args: A): Goroutine<Awaited<R>>;
 
     /**
      * Resolves once every goroutine has settled, including those started while it waits. Rejects with the error of

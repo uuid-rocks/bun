@@ -56,7 +56,7 @@ const kMaxCauseDepth = 8;
 // Encoded apart from the other own properties of an error.
 const kEncoded = new Set(["name", "message", "stack", "cause"]);
 
-function errorRecord(error: Error, depth: number, withProps: boolean) {
+function errorRecord(error: Error, depth: number, withProps: boolean, args: unknown[]) {
   let name, message, stack;
   try {
     name = String(error.name);
@@ -82,14 +82,14 @@ function errorRecord(error: Error, depth: number, withProps: boolean) {
   } = { name, message, stack, props: undefined };
   if (error instanceof DOMException) record.domException = true;
   if (withProps) {
-    if ("cause" in error && depth < kMaxCauseDepth) record.cause = thrown(error.cause, depth + 1, true);
+    if ("cause" in error && depth < kMaxCauseDepth) record.cause = thrown(error.cause, depth + 1, true, args);
     let errors;
     if (error instanceof AggregateError && depth < kMaxCauseDepth) {
       try {
         errors = error.errors;
       } catch {}
     }
-    if ($isArray(errors)) record.errors = errors.map(inner => thrown(inner, depth + 1, true));
+    if ($isArray(errors)) record.errors = errors.map(inner => thrown(inner, depth + 1, true, args));
     const props: Record<string, unknown> = { ...error };
     for (const key of kEncoded) delete props[key];
     if (record.errors !== undefined) delete props.errors;
@@ -104,18 +104,26 @@ function errorRecord(error: Error, depth: number, withProps: boolean) {
   return record;
 }
 
-function thrown(value: unknown, depth: number, withProps: boolean) {
-  return value instanceof Error ? ["error", errorRecord(value, depth, withProps)] : ["value", value];
+// The reason of an AbortSignal among the arguments is sent as which argument it is: the goroutine rejects with
+// the original reason, which its caller can tell apart from another error by identity.
+function thrown(value: unknown, depth: number, withProps: boolean, args: unknown[]) {
+  if ($isObject(value)) {
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      if (arg instanceof AbortSignal && arg.aborted && arg.reason === value) return ["signal", i];
+    }
+  }
+  return value instanceof Error ? ["error", errorRecord(value, depth, withProps, args)] : ["value", value];
 }
 
-function fail(id: number, error: unknown) {
+function fail(id: number, error: unknown, args: unknown[] = []) {
   try {
-    settle(id, 1, thrown(error, 0, true));
+    settle(id, 1, thrown(error, 0, true, args));
     return;
   } catch {}
   // Something it carries can't be cloned: its name, message and stack still can.
   try {
-    settle(id, 1, thrown(error instanceof Error ? error : new Error(String(error)), 0, false));
+    settle(id, 1, thrown(error instanceof Error ? error : new Error(String(error)), 0, false, args));
     return;
   } catch {}
   settle(id, 1, [
@@ -177,9 +185,10 @@ async function start(task: Task) {
     fail(id, error);
     return;
   }
-  run(job, fn, task[1], (ok, value) => {
+  const args = task[1];
+  run(job, fn, args, (ok, value) => {
     if (!ok) {
-      fail(id, value);
+      fail(id, value, args);
       return;
     }
     // Not awaited by an async function of this module: its frames stay out of the goroutine's.
@@ -191,7 +200,7 @@ async function start(task: Task) {
           fail(id, resultCloneError(error, value));
         }
       },
-      error => fail(id, error),
+      error => fail(id, error, args),
     );
   });
 }

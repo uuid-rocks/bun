@@ -176,6 +176,18 @@ impl Mutex {
     }
 }
 
+impl Mutex {
+    /// `console.log(mutex)` shows its state, as for a channel, not its methods.
+    pub(crate) fn inspect(&self) -> String {
+        let state = self.core.state.lock();
+        format!(
+            "Mutex {{ locked: {}, waiters: {} }}",
+            state.locked,
+            state.waiters.len()
+        )
+    }
+}
+
 /// `bun:internal-for-testing`: how many entries the mutex's queue of waiters holds, live or not.
 pub(crate) fn waiters_for_testing(cx: &mut JsScope<'_>, mutex: JsLocal<'_>) -> JsResult<JSValue> {
     let global = cx.global();

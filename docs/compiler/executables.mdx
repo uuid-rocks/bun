@@ -718,7 +718,7 @@ If you use a relative path to a file not included in the standalone executable, 
 
 ## Goroutines
 
-The build finds the modules that [`Bun.go()`](/runtime/goroutines) runs, and embeds each one as an entry point. Nothing needs to be listed:
+The build finds the modules that [`Bun.go()`](/runtime/goroutines), `group.go()` of a [`Bun.WaitGroup`](/runtime/goroutines#waitgroup) and `go()` imported from `"bun"` run, and embeds each one as an entry point. Nothing needs to be listed:
 
 ```ts index.ts icon="/icons/typescript.svg"
 import { countPrimes } from "./primes.ts";
@@ -731,7 +731,7 @@ console.log(await Bun.go(new URL("./task.ts", import.meta.url)));
 bun build --compile ./index.ts --outfile myapp
 ```
 
-This works for an imported function and for a URL with a literal path. List a module that `Bun.go()` gets any other way as an entrypoint, as for a worker. See [bundles and executables](/runtime/goroutines#bundles-and-executables).
+This works for an imported function and for a URL with a literal path. List a module that a goroutine gets any other way as an entrypoint, as for a worker. See [bundles and executables](/runtime/goroutines#bundles-and-executables).
 
 ---
 

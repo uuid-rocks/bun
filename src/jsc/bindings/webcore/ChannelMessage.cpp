@@ -16,6 +16,7 @@
 #include "ScriptExecutionContext.h"
 #include "SerializedScriptValue.h"
 #include "ZigGlobalObject.h"
+#include "BunClientData.h"
 #include <JavaScriptCore/ErrorInstance.h>
 #include <JavaScriptCore/IteratorOperations.h>
 #include <JavaScriptCore/JSMap.h>
@@ -95,6 +96,14 @@ String withArticle(const String& noun)
     return makeString(vowel ? "an "_s : "a "_s, noun);
 }
 
+// " A WaitGroup belongs to ...", or nothing.
+String hintSentence(const String& hint)
+{
+    if (hint.isEmpty())
+        return emptyString();
+    return makeString(' ', toASCIIUpper(hint[0]), StringView(hint).substring(1), '.');
+}
+
 constexpr unsigned maxDepth = 64;
 
 std::optional<Bun::Uncloneable> find(JSGlobalObject* globalObject, JSValue value, const String& path, HashSet<JSObject*>& seen, unsigned depth)
@@ -105,6 +114,11 @@ std::optional<Bun::Uncloneable> find(JSGlobalObject* globalObject, JSValue value
     if (!value.isObject())
         return std::nullopt;
     JSObject* object = asObject(value);
+    // What internal/go/spawn marks as its thread's own holds what to do instead.
+    if (JSValue hint = object->getDirect(vm, WebCore::builtinNames(vm).isUncloneablePrivateName()); hint && hint.isString()) {
+        String className = JSObject::calculatedClassName(object);
+        return Bun::Uncloneable { path, className.isEmpty() || className == "Object"_s ? "an object"_str : withArticle(className), asString(hint)->tryGetValue() };
+    }
     if (object->isCallable()) {
         String name;
         if (auto* function = dynamicDowncast<JSFunction>(object))
@@ -197,7 +211,7 @@ extern "C" MessageWithMessagePorts* Bun__ChannelMessage__createFor(JSGlobalObjec
     String where = site ? "Bun.select()"_s : "channel.send()"_s;
     String root = site ? makeString("cases["_s, index, "][1]"_s) : "value"_str;
     String text = found
-        ? makeString(where, ": "_s, root, found->path, " is "_s, found->what, ", which can't be sent to another thread."_s)
+        ? makeString(where, ": "_s, root, found->path, " is "_s, found->what, ", which can't be sent to another thread."_s, hintSentence(found->hint))
         : makeString(where, ": "_s, root, " can't be sent to another thread: "_s, original);
     throwException(globalObject, scope, createDOMException(globalObject, ExceptionCode::DataCloneError, text));
     return nullptr;

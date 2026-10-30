@@ -82,8 +82,31 @@ await Promise.all([holder, waiter]);
 await Bun.go(wait, new Bun.Channel<number>(), new Bun.Channel<string>());
 `,
     });
-    expect(frames).toContain("Bun.go thread 1:\n  Bun.select()\n    at async wait (<dir>/tasks.ts:2:");
+    expect(frames).toContain("goroutines:\n  Bun.select()\n    at async wait (<dir>/tasks.ts:2:");
     expect(stderr).not.toContain("internal:");
+    expect(exitCode).toBe(1);
+  });
+
+  test("identical waits are listed once, with how many there are", async () => {
+    const { stderr, exitCode } = await run({
+      "tasks.ts": `export async function drain(ch: Bun.Channel<number>) {
+  for await (const _ of ch) {}
+}
+`,
+      "main.ts": `import { drain } from "./tasks.ts";
+const ch = new Bun.Channel<number>();
+await Promise.all(Array.from({ length: 40 }, () => Bun.go(drain, ch)));
+`,
+    });
+    expect(stderr).toMatchInlineSnapshot(`
+      "error: all goroutines are asleep - deadlock!
+
+      goroutines:
+        for await on a Channel × 40
+          at async drain (file:NN:NN)
+
+      No thread is left that can send, receive, close or unlock for these. Set BUN_GO_DEADLOCK=0 to wait anyway."
+    `);
     expect(exitCode).toBe(1);
   });
 

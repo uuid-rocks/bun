@@ -14,6 +14,7 @@
 #include "root.h"
 #include "BunGo.h"
 
+#include "BunClientData.h"
 #include "BunProcess.h"
 #include "ChannelMessage.h"
 #include "CodeGenerationFromStrings.h"
@@ -736,8 +737,9 @@ static bool isModuleRequire(Zig::GlobalObject* globalObject, JSValue value, cons
     return filename.isString() && filename.getString(globalObject) == module;
 }
 
-// What a captured or imported value is, for the advice of the error: "function", "class",
-// "namespace" (of a module), "data", or "bun" for what the Bun global has under the same name
+// What a captured or imported value is, for the advice of the error: "function" (with source of
+// its own), "native" (another function: native, built in or bound), "class", "namespace" (of a
+// module), "data", or "bun" for what the Bun global has under the same name
 // (`import { sleep } from "bun"`).
 static ASCIILiteral valueKindOf(JSGlobalObject* globalObject, const String& name, JSValue value)
 {
@@ -753,12 +755,15 @@ static ASCIILiteral valueKindOf(JSGlobalObject* globalObject, const String& name
         else if (same == value)
             return "bun"_s;
     }
-    if (auto* function = dynamicDowncast<JSFunction>(value); function && !function->isHostOrBuiltinFunction() && function->jsExecutable()->isClassConstructorFunction())
-        return "class"_s;
+    if (auto* function = dynamicDowncast<JSFunction>(value); function && !function->isHostFunction()) {
+        if (function->jsExecutable()->isClassConstructorFunction())
+            return "class"_s;
+        return function->isBuiltinFunction() ? "native"_s : "function"_s;
+    }
     if (value.inherits<JSModuleNamespaceObject>())
         return "namespace"_s;
     if (value.isCallable())
-        return "function"_s;
+        return "native"_s;
     return "data"_s;
 }
 
@@ -877,6 +882,34 @@ JSC_DEFINE_HOST_FUNCTION(jsGoHasModuleRequire, (JSGlobalObject * lexicalGlobalOb
     return JSValue::encode(jsBoolean(isModuleRequire(defaultGlobalObject(lexicalGlobalObject), found.value, module)));
 }
 
+// ownedByThisThread(object, hint): a structured clone of `object` throws a DataCloneError, and
+// Bun::findUncloneable gives `hint`, what to do instead (a WaitGroup, a goroutine).
+JSC_DEFINE_HOST_FUNCTION(jsGoOwnedByThisThread, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto& vm = lexicalGlobalObject->vm();
+    JSValue object = callFrame->argument(0);
+    JSValue hint = callFrame->argument(1);
+    if (object.isObject() && hint.isString())
+        asObject(object)->putDirect(vm, WebCore::builtinNames(vm).isUncloneablePrivateName(), hint, PropertyAttribute::ReadOnly | PropertyAttribute::DontEnum | PropertyAttribute::DontDelete);
+    return JSValue::encode(jsUndefined());
+}
+
+// readsMain(fn): whether the source of the module that defines `fn` reads whether it is the entry
+// point (`import.meta.main`, `require.main`, `Bun.main`), as the top-level code of an entry point
+// that exports a goroutine's function has to, to run only on the main thread.
+JSC_DEFINE_HOST_FUNCTION(jsGoReadsMain, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto* function = dynamicDowncast<JSFunction>(callFrame->argument(0));
+    if (!function || function->isHostOrBuiltinFunction())
+        return JSValue::encode(jsBoolean(false));
+    auto* provider = function->jsExecutable()->source().provider();
+    if (!provider)
+        return JSValue::encode(jsBoolean(false));
+    StringView source = provider->source();
+    bool reads = source.contains("import.meta.main"_s) || source.contains("require.main"_s) || source.contains("Bun.main"_s);
+    return JSValue::encode(jsBoolean(reads));
+}
+
 // evaluating(module): whether this thread has started to evaluate the ES module `module` (a module
 // key) and not finished, as when its top-level await is pending.
 JSC_DEFINE_HOST_FUNCTION(jsGoEvaluating, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
@@ -892,7 +925,7 @@ JSC_DEFINE_HOST_FUNCTION(jsGoEvaluating, (JSGlobalObject * lexicalGlobalObject, 
     return JSValue::encode(jsBoolean(evaluating));
 }
 
-// describe(value): [path, what] of what in `value` can't be cloned (Bun::findUncloneable), or
+// describe(value): [path, what, hint] of what in `value` can't be cloned (Bun::findUncloneable), or
 // undefined: for the DataCloneError of an argument or a result.
 JSC_DEFINE_HOST_FUNCTION(jsGoDescribe, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
@@ -905,6 +938,7 @@ JSC_DEFINE_HOST_FUNCTION(jsGoDescribe, (JSGlobalObject * lexicalGlobalObject, Ca
     MarkedArgumentBuffer values;
     values.append(jsString(vm, found->path));
     values.append(jsString(vm, found->what));
+    values.append(found->hint.isEmpty() ? jsUndefined() : jsString(vm, found->hint));
     RELEASE_AND_RETURN(scope, JSValue::encode(constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), values)));
 }
 
@@ -1112,6 +1146,8 @@ JSValue createGoSpawnBinding(Zig::GlobalObject* globalObject)
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "evaluating"_s), 1, Bun::Go::jsGoEvaluating, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "describe"_s), 1, Bun::Go::jsGoDescribe, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "hasModuleRequire"_s), 2, Bun::Go::jsGoHasModuleRequire, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "readsMain"_s), 1, Bun::Go::jsGoReadsMain, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "ownedByThisThread"_s), 2, Bun::Go::jsGoOwnedByThisThread, ImplementationVisibility::Public, NoIntrinsic, 0);
     RELEASE_AND_RETURN(scope, binding);
 }
 

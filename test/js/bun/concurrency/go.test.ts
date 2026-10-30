@@ -375,25 +375,45 @@ describe.concurrent("Bun.go", () => {
   });
 
   // Each pool thread evaluates the entry point to run its export, and there it would wait for its own goroutines.
-  test("an entry point that waits on goroutines of its own exports fails at once instead of hanging", async () => {
+  test("an entry point whose top-level code is not guarded can't run its own exports, and its code runs once", async () => {
     const { stdout, exitCode } = await run({
       "main.ts": `
+        console.log("top-level code");
         function helper(x: number) {
           return x * 2;
         }
         export function work(x: number) {
           return helper(x);
         }
-        // On a pool thread, Bun.go() throws here, and so the module does.
-        const results = await Promise.all([1, 2, 3, 4].map(x => Bun.go(work, x))).catch(e => e);
-        console.log(results.code);
-        console.log(results.message);
+        try {
+          await Promise.all([1, 2, 3, 4].map(x => Bun.go(work, x)));
+        } catch (error) {
+          console.log(error.code);
+          console.log(error.message);
+        }
       `,
     });
     expect(stdout).toMatchInlineSnapshot(`
-      "ERR_GOROUTINE_NOT_SENDABLE
-      Bun.go() can't run "work" here: it is exported by <dir>/main.ts, which this pool thread is still evaluating (a pool thread evaluates the module of each export it runs). The goroutine would wait for the module, and the module for the goroutine. Run that module's top-level code only on the main thread, inside if (import.meta.main) { ... }, or move "work" to a module of its own."
+      "top-level code
+      ERR_GOROUTINE_NOT_SENDABLE
+      Bun.go() can't run "work" on another thread: it is exported by the entry point, <dir>/main.ts, which each pool thread would import to run it, and the entry point's top-level code would run there again. Put that code inside if (import.meta.main) { ... }, which is false on a pool thread, or move "work" to a module of its own."
     `);
+    expect(exitCode).toBe(0);
+  });
+
+  test("an entry point that guards its top-level code with import.meta.main runs its own exports", async () => {
+    const { stdout, exitCode } = await run({
+      "main.ts": `
+        export function work(x: number) {
+          return x * 2;
+        }
+        if (import.meta.main) {
+          await using group = new Bun.WaitGroup();
+          console.log(await Promise.all([Bun.go(work, 1), group.go(work, 2)]));
+        }
+      `,
+    });
+    expect(stdout).toBe("[ 2, 4 ]");
     expect(exitCode).toBe(0);
   });
 
@@ -462,6 +482,53 @@ describe.concurrent("Bun.go", () => {
       ].join("\n"),
     );
     expect(exitCode).toBe(0);
+  });
+
+  test("the advice for an imported class or native function, and for a bound function", async () => {
+    const { stdout, exitCode } = await run({
+      "main.ts": `
+        import { Database } from "bun:sqlite";
+        import { readFileSync } from "node:fs";
+        const attempts = [
+          () => Bun.go(() => new Database(":memory:")),
+          () => new Bun.WaitGroup().go(() => readFileSync("x")),
+          () => Bun.go((() => 1).bind(null)),
+        ];
+        for (const attempt of attempts) {
+          try {
+            attempt();
+          } catch (e) {
+            console.log(e.message);
+          }
+        }
+      `,
+    });
+    expect(stdout).toMatchInlineSnapshot(`
+      "Bun.go() can't run this function on another thread: it uses "Database" (<dir>/main.ts:5), which its module imports from "bun:sqlite": import it inside this function with \`const { Database } = await import("bun:sqlite")\`, or export a function that uses it from a module of your own and pass that function to Bun.go().
+      WaitGroup.go() can't run this function on another thread: it uses "readFileSync" (<dir>/main.ts:6), which its module imports from "node:fs": import it inside this function with \`const { readFileSync } = await import("node:fs")\`, or export a function that uses it from a module of your own and pass that function to WaitGroup.go().
+      Bun.go() can't run a bound function on another thread: it has no source of its own. Pass the function itself, and what it was bound to as arguments."
+    `);
+    expect(exitCode).toBe(0);
+  });
+
+  test("an uncaught error of go() points at the call, not at Bun's own code", async () => {
+    const { stdout, stderr, exitCode, dir } = await run({
+      "main.ts": `
+        let captured = 1;
+        try {
+          new Bun.WaitGroup().go(() => captured);
+        } catch (e) {
+          console.log(e.stack.split("\\n")[1].trim());
+        }
+        Bun.go(() => captured);
+      `,
+    });
+    expect(stdout).toMatchInlineSnapshot(`"at <dir>/main.ts:4:31"`);
+    // The code frame is the call's line, and the only frame the call.
+    const frames = stderr.replaceAll(dir, "<dir>");
+    expect(frames).toMatch(/\| +Bun\.go\(\(\) => captured\);\n +\^/);
+    expect(frames.split("\n").filter(line => line.trim().startsWith("at "))).toEqual(["      at <dir>/main.ts:8:13"]);
+    expect(exitCode).toBe(1);
   });
 
   test("an unhandled goroutine rejection is an unhandled rejection in the spawner", async () => {

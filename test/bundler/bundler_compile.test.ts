@@ -1569,7 +1569,7 @@ const server = serve({
 describe("Bun.go", () => {
   const goFiles = {
     "src/main.ts": `
-      import { add, label } from "./tasks/math.ts";
+      import { add, label, mul } from "./tasks/math.ts";
       import { add as plus } from "./tasks/math.ts";
       import * as text from "./tasks/text.ts";
       import twice from "./tasks/twice.ts";
@@ -1577,7 +1577,26 @@ describe("Bun.go", () => {
       import { which as packageWhich } from "dualpkg/dual";
       import { work } from "./tasks/cjs.cjs";
       import { urlLabel } from "./label.ts";
+      import { go, go as spawn, WaitGroup } from "bun";
+      // A WaitGroup's go() is a method of any name: the build keeps the function, and tells Bun.go its URL.
+      async function inGroup(group: Bun.WaitGroup) {
+        return [await group.go(mul, 2, 5), await group.go(new URL("./tasks/url-task.ts", import.meta.url), 9)];
+      }
+      async function grouped() {
+        await using group = new Bun.WaitGroup({ limit: 1 });
+        const results = [await group.go(add, 1, 2), await group.go(text.shout, "wg"), ...(await inGroup(group))];
+        let named = new WaitGroup();
+        results.push(await named.go(twice, 4));
+        await named.wait();
+        return results;
+      }
+      // A go() method that is not Bun's gets the function itself.
+      const router = { go: (fn: Function) => fn === text.shout };
       Promise.all([
+        go(add, 1, 0),
+        spawn(text.shout, "go"),
+        grouped(),
+        router.go(text.shout),
         Bun.go(add, 2, 3),
         Bun.go(plus, 1, 1),
         Bun.go(text.shout, "hi"),
@@ -1614,7 +1633,7 @@ describe("Bun.go", () => {
     // Shares the bundle's top-level scope with the calls the build writes.
     "src/label.ts": `const URL = "shadowed"; export const urlLabel = URL;`,
   };
-  const goStdout = `[{"sum":5,"isMainThread":false},{"sum":2,"isMainThread":false},"HI!",-5,42,5,42,"mjs","package mjs",77,{"inline":15}] math shadowed\n`;
+  const goStdout = `[{"sum":1,"isMainThread":false},"GO!",[{"sum":3,"isMainThread":false},"WG!",10,10,8],true,{"sum":5,"isMainThread":false},{"sum":2,"isMainThread":false},"HI!",-5,42,5,42,"mjs","package mjs",77,{"inline":15}] math shadowed\n`;
 
   async function run(cmd: string[], cwd: string) {
     await using proc = Bun.spawn({ cmd, env: bunEnv, cwd, stdout: "pipe", stderr: "pipe" });
@@ -1674,6 +1693,32 @@ describe("Bun.go", () => {
     });
   }
 
+  test("bun build --compile: an entry point that exports its goroutine's function and guards its top-level code", async () => {
+    using dir = tempDir("bun-go-compile-single-file", {
+      "main.ts": `
+        import { helper } from "./helper.ts";
+        export function work(n: number) {
+          return helper(n);
+        }
+        if (import.meta.main) {
+          await using group = new Bun.WaitGroup();
+          console.log(await Promise.all([Bun.go(work, 1), group.go(work, 2)]));
+        }
+      `,
+      "helper.ts": `export const helper = (n: number) => n * 10;`,
+    });
+    const root = String(dir);
+    const build = await run([bunExe(), "build", "--compile", "main.ts", "--outfile", join("out", "app")], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    rmSync(join(root, "main.ts"));
+    rmSync(join(root, "helper.ts"));
+    const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
+    expect(stderr).toBe("");
+    expect(stdout).toBe("[ 10, 20 ]\n");
+    expect(exitCode).toBe(0);
+  });
+
   test("bun build --compile: a function the build can't trace to its module, and that is not self-contained, throws, naming the fix", async () => {
     using dir = tempDir("bun-go-compile-computed", {
       "main.ts": `
@@ -1685,23 +1730,36 @@ describe("Bun.go", () => {
           console.log(error.code);
           console.log(error.message);
         }
+        try {
+          await using group = new Bun.WaitGroup();
+          console.log(await group.go(tasks[name], 4));
+        } catch (error) {
+          console.log(error.code);
+          console.log(error.message);
+        }
       `,
       "tasks.ts": `import { factor } from "./factor.ts"; export function work(n: number) { return n * factor; }`,
       "factor.ts": `export const factor = 10;`,
     });
     const root = String(dir);
     const source = await run([bunExe(), "main.ts"], root);
-    expect(source.stdout).toBe("30\n");
+    expect(source.stdout).toBe("30\n40\n");
     const build = await run([bunExe(), "build", "--compile", "main.ts", "--outfile", join("out", "app")], root);
     expect(build.stderr).toBe("");
     expect(build.exitCode).toBe(0);
     const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
     expect(stderr).toBe("");
-    const [code, message] = stdout.split("\n");
+    const [code, message, groupCode, groupMessage] = stdout.split("\n");
     expect(code).toBe("ERR_GOROUTINE_NOT_SENDABLE");
     expect(message).toContain(
-      `In a bundle, pass Bun.go() the imported binding itself, as in Bun.go(task) or Bun.go(tasks.task), or the module's URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)): bun build makes that module an entry point. List a module named any other way as an entry point of the build.`,
+      `In a bundle, bun build finds the module of a function passed to Bun.go() as an imported binding, as in Bun.go(task) or Bun.go(tasks.task), or as the module's URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build.`,
     );
+    expect(groupCode).toBe("ERR_GOROUTINE_NOT_SENDABLE");
+    expect(groupMessage).toStartWith(`WaitGroup.go() can't run "work" on another thread`);
+    expect(groupMessage).toContain(
+      `In a bundle, bun build finds the module of a function passed to WaitGroup.go() as an imported binding, as in WaitGroup.go(task) or WaitGroup.go(tasks.task), or as the module's URL with the export as its fragment, as in WaitGroup.go(new URL("./tasks.ts#task", import.meta.url)), and makes that module an entry point. Pass it one of those ways, or list the module that exports it as an entry point of the build.`,
+    );
+    expect(groupMessage).not.toContain("Bun.go");
     expect(exitCode).toBe(0);
   });
 });

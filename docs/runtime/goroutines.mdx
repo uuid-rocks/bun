@@ -71,7 +71,7 @@ Bun.go(() => config.limit * 2);
 // a variable of the code around it: pass it as an argument.
 ```
 
-The advice depends on what the variable holds. For a function imported from a module, the message suggests passing that function to `Bun.go()` itself (`Bun.go(triple, x)`), for a named import from `"bun"` it suggests the `Bun` global (`Bun.sleep`), and for a helper function of the code around it, it suggests moving the helper into the function or into a module other than the entry point.
+The advice depends on what the variable holds. For a function imported from a module, the message suggests passing that function to `Bun.go()` itself (`Bun.go(triple, x)`). For an imported class or built-in function, such as `Database` of `bun:sqlite`, it suggests importing it inside the function with `await import()`, or exporting a function that uses it from a module of your own. For a named import from `"bun"` it suggests the `Bun` global (`Bun.sleep`), and for a helper function of the code around it, it suggests moving the helper into the function or into a module other than the entry point.
 
 Pass values as arguments instead:
 
@@ -82,11 +82,7 @@ await Bun.go(config => config.limit * 2, config); // => 20
 
 The same goes for an arrow function that uses the `this` or `arguments` of the code around it, and a function that uses `import.meta`. A method, a class, and a bound or native function throw `ERR_GOROUTINE_NOT_SENDABLE` too.
 
-<Note>
-  Bun checks the function as it transpiled it. The transpiler replaces a `const` that holds a literal, such as `const
-  limit = 10`, with its value, so a function that uses one runs. A `const` that holds an object, or a `let`, is still a
-  variable of the code around it. Pass values as arguments rather than rely on this.
-</Note>
+<Note>Pass the values a function needs as arguments, even constants of the code around it.</Note>
 
 To use a module, import it inside the function. `await import()` and `require()` resolve from the file the function is written in, as they would there. Only the module's own `require` is given to the function: a parameter or variable named `require` of the code around it is a variable like any other.
 
@@ -125,7 +121,7 @@ const count = await Bun.go(new URL("./primes.ts#countPrimes", import.meta.url), 
 
 A module that a goroutine imports runs once on each pool thread. Its top-level variables belong to that thread, like thread-local storage. In a pool thread, `Bun.isMainThread` and `import.meta.main` are `false`.
 
-A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine. Guard its top-level work with `import.meta.main`. Without the guard, a pool thread evaluating the entry point would call `Bun.go(double)` again, and that goroutine would wait for the entry point, which waits for it. `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` there rather than wait forever, and the goroutine on the main thread rejects with that error:
+A goroutine's exported function can be exported by the program's entry point. Then the entry point also runs on each pool thread that runs such a goroutine, so put its top-level work inside `if (import.meta.main)`. An entry point that never reads `import.meta.main` would run its top-level code again on each pool thread, and call `Bun.go(double)` there again. So `Bun.go()` throws `ERR_GOROUTINE_NOT_SENDABLE` on the main thread instead, before any pool thread imports it:
 
 ```ts main.ts icon="/icons/typescript.svg"
 export function double(n: number) {
@@ -200,6 +196,20 @@ await group.wait(); // the first error, once the other fetches were aborted and 
 - `await using` aborts `group.signal` and waits for every goroutine at the end of the scope, so none outlives it, even when the code in the scope throws. An error that `wait()` did not throw is thrown then.
 - A goroutine the group started never causes an unhandled rejection: its error is the group's. `group.go()` returns the goroutine, which you can still await for its result.
 - There is no `add()` or `done()`: `group.go()` counts a goroutine when it starts it, so the count can't go wrong.
+- A goroutine that rejects with the reason of `group.signal`, or of any `AbortSignal` among its arguments, rejects with that reason itself, not a copy. So `error === group.signal.reason` tells a cancellation from a failure, and `wait()` rejects with the caller's own reason when `options.signal` cancelled the group.
+- A `WaitGroup` belongs to the thread that made it. `Bun.go(fn, group)` and `channel.send(group)` throw a `DataCloneError`: send results on a channel instead.
+
+#### Limiting how many run at once
+
+`new Bun.WaitGroup({ limit })` runs at most `limit` of the group's goroutines at once, like errgroup's `SetLimit`. `group.go()` still returns the goroutine at once; one past the limit waits until another settles, then starts:
+
+```ts
+await using group = new Bun.WaitGroup({ limit: 4 });
+const pages = urls.map(url => group.go(fetchPage, url, group.signal)); // 4 fetches at a time
+console.log(await Promise.all(pages));
+```
+
+`go()` does not wait for a slot, so a loop that starts a million goroutines holds a million waiting ones: start them in batches, or from a channel, when there are that many. A waiting goroutine's arguments are cloned when it starts. `go()` still throws at once when a function can't run on another thread, or an argument can't be cloned. Once `group.signal` has aborted, a goroutine that waits rejects with `signal.reason` and never starts.
 
 Goroutines that started other goroutines can wait for them too: a goroutine can call `Bun.go()`.
 
@@ -216,7 +226,7 @@ async function sum(from: number, to: number): Promise<number> {
 }
 ```
 
-`sum` can call itself: a function's own name is its own.
+`sum` can call itself: a function's own name is its own. A function written in place can pass itself to `Bun.go()` only as a named function expression, `Bun.go(async function sum(from, to) { ... })`. An arrow function stored in a `const`, or a function declared at the top of the entry point, is a variable of the code around it: export it from a module instead.
 
 ---
 
@@ -372,7 +382,7 @@ Set `BUN_GO_DEADLOCK=0` to turn this off. Windows doesn't detect deadlocks yet.
 
 ## Coming from Go
 
-[From Go to Bun](/runtime/concurrency#from-go-to-bun) maps Go's concurrency to Bun's, from `go f(x)` to `sync.Mutex` and `errgroup`.
+[Coming from Go](/runtime/concurrency#coming-from-go) maps Go's concurrency to Bun's, from `go f(x)` to `sync.Mutex` and `errgroup`.
 
 ---
 
@@ -384,20 +394,36 @@ Set `BUN_GO_DEADLOCK=0` to turn this off. Windows doesn't detect deadlocks yet.
 
 ## Bundles and executables
 
-`bun build --target=bun` and `bun build --compile` find the modules that `Bun.go()` runs, and make each one an entry point of the build. The build finds:
+`bun build --target=bun` and `bun build --compile` find the modules that `Bun.go()`, `group.go()` of a `WaitGroup` and `go()` imported from `"bun"` run, and make each one an entry point of the build. The build finds:
 
 - an imported function: `Bun.go(countPrimes)`, a default import, or `Bun.go(primes.countPrimes)` after `import * as primes`
 - a URL with a literal path: `Bun.go(new URL("./task.ts", import.meta.url))`, with or without a fragment
 
-It writes the call with the URL of that entry point's output, and the export as the fragment:
+It writes a `Bun.go()` call with the URL of that entry point's output, and the export as the fragment:
 
 ```js main.js
 Bun.go(new URL("./primes.js#countPrimes", import.meta.url), 0, 5e5);
 ```
 
+The build looks at the first argument of any method named `go`, because it can't tell a `WaitGroup` from another object. There it keeps the function, and tells `Bun.go()` the URL on the way, so a `go()` method that isn't Bun's still gets the same function. A method that is not a `WaitGroup`'s only costs an extra entry point.
+
+```ts main.ts icon="/icons/typescript.svg"
+import { resize } from "./images.ts";
+
+await using group = new Bun.WaitGroup({ limit: 8 });
+for (const file of process.argv.slice(2)) group.go(resize, file, group.signal);
+await group.wait();
+```
+
+```sh terminal icon="terminal"
+bun build --compile ./main.ts --outfile resize
+```
+
+`./images.ts` is in the executable, with what it imports. A goroutine written in place, such as `group.go(async file => { const { resize } = await import("./images.ts"); ... })`, runs from its source, and the build rewrites the `await import()` in it into code of the bundle around the function, so it can't run on another thread. Import the function and pass it, as above.
+
 So you can move the output and delete the sources. Each task module's output keeps its exports under their own names, with `--minify` too. An executable holds the task modules, so it runs from any directory.
 
-The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment. For a module named by a computed path, list the module as an entry point of the build, as for a [Worker](/runtime/workers):
+The build can't tell which module a function comes from when it arrives any other way, as in `Bun.go(tasks[name])`. Then the bundle holds a copy of the function that no module exports. A self-contained function still runs from its source. A function that uses the bindings around it throws `ERR_GOROUTINE_NOT_SENDABLE`, and the message says what to do: pass the imported binding itself, or the module's URL with the export as its fragment, or list the module as an entry point of the build, as for a [Worker](/runtime/workers):
 
 ```sh terminal icon="terminal"
 bun build --compile ./main.ts ./tasks/*.ts --outfile app

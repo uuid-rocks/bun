@@ -147,4 +147,125 @@ describe("Bun.WaitGroup", () => {
       expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
     );
   });
+
+  test("a goroutine that rejects with its signal's reason rejects with the original reason, not a copy", async () => {
+    const parent = new AbortController();
+    const group = new Bun.WaitGroup({ signal: parent.signal });
+    const ended = new Int32Array(new SharedArrayBuffer(8));
+    const inGroup = group.go(untilAborted, group.signal, ended.buffer, 0).catch(e => e);
+    const alone = Bun.go(untilAborted, parent.signal, ended.buffer, 1).catch(e => e);
+    const reason = new Error("shutting down");
+    parent.abort(reason);
+    expect(await inGroup).toBe(reason);
+    expect(await alone).toBe(reason);
+    // A clean shutdown can be told from a failure by identity.
+    expect(await group.wait().catch(e => e)).toBe(parent.signal.reason);
+    expect(await group[Symbol.asyncDispose]().then(() => "disposed")).toBe("disposed");
+  });
+
+  test("disposal ignores its own abort reason, and not an error that only looks like it", async () => {
+    const thrown = await (async () => {
+      await using group = new Bun.WaitGroup();
+      group.go(async (signal: AbortSignal) => {
+        await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
+        throw new DOMException(signal.reason.message, signal.reason.name);
+      }, group.signal);
+    })().catch(e => e);
+    expect(thrown).toBeInstanceOf(DOMException);
+    expect(`${thrown.name}: ${thrown.message}`).toBe("AbortError: The WaitGroup was disposed");
+  });
+
+  test("a WaitGroup can't be sent to another thread", async () => {
+    const group = new Bun.WaitGroup();
+    const hint = "A WaitGroup belongs to the thread that created it: send results on a channel instead.";
+    expect(() => Bun.go((group: unknown) => group, group)).toThrow(
+      `Bun.go() argument 1 is a WaitGroup, which can't be sent to another thread. ${hint}`,
+    );
+    expect(() => group.go((nested: unknown) => nested, { nested: group })).toThrow(
+      `WaitGroup.go() argument 1 has a WaitGroup at .nested, which can't be sent to another thread. ${hint}`,
+    );
+    const channel = new Bun.Channel(1);
+    expect(await channel.send(group).catch(e => `${e.name}: ${e.message}`)).toBe(
+      `DataCloneError: channel.send(): value is a WaitGroup, which can't be sent to another thread. ${hint}`,
+    );
+    expect(() => structuredClone(group)).toThrow(expect.objectContaining({ name: "DataCloneError" }));
+    const goroutine = Bun.go(() => 1);
+    expect(() => Bun.go((g: unknown) => g, goroutine)).toThrow(
+      "Bun.go() argument 1 is a Goroutine, which can't be sent to another thread. A goroutine belongs to the thread that started it: await it, and send its result.",
+    );
+    await goroutine;
+  });
+
+  describe("limit", () => {
+    test("runs at most `limit` goroutines at once; go() returns at once, and the rest start as slots free", async () => {
+      const group = new Bun.WaitGroup({ limit: 2 });
+      const started = new Bun.Channel<number>(5);
+      const gate = new Bun.Channel<void>(5);
+      const goroutines = [0, 1, 2, 3, 4].map(i =>
+        group.go(
+          async (i: number, started: Bun.Channel<number>, gate: Bun.Channel<void>) => {
+            await started.send(i);
+            await gate.receive();
+            return i;
+          },
+          i,
+          started,
+          gate,
+        ),
+      );
+      const first = [await started.receive(), await started.receive()].sort();
+      expect(first).toEqual([0, 1]);
+      // Both slots wait on the gate: nothing else can have started.
+      expect((await Bun.select([started], { default: true })).index).toBe(-1);
+      await gate.send();
+      expect(await started.receive()).toBe(2);
+      expect((await Bun.select([started], { default: true })).index).toBe(-1);
+      for (let i = 0; i < 4; i++) await gate.send();
+      await group.wait();
+      expect(await Promise.all(goroutines)).toEqual([0, 1, 2, 3, 4]);
+    });
+
+    test("once the group's signal aborts, a goroutine that waits for a slot rejects with its reason and never starts", async () => {
+      const group = new Bun.WaitGroup({ limit: 1 });
+      const ran = new Int32Array(new SharedArrayBuffer(4));
+      const gate = new Bun.Channel<void>();
+      const first = group.go(async (gate: Bun.Channel<void>) => {
+        await gate.receive();
+        throw new Error("first failed");
+      }, gate);
+      const queued = group.go((ran: SharedArrayBuffer) => Atomics.store(new Int32Array(ran), 0, 1), ran.buffer);
+      await gate.send();
+      const failure = await first.catch(e => e);
+      expect(failure.message).toBe("first failed");
+      expect(await queued.catch(e => e)).toBe(failure);
+      expect(await group.wait().catch(e => e)).toBe(failure);
+      expect(ran[0]).toBe(0);
+    });
+
+    test("a goroutine that waits for a slot throws from go() at once if it can't start", () => {
+      const group = new Bun.WaitGroup({ limit: 1 });
+      const gate = new Bun.Channel<void>(1);
+      group.go((gate: Bun.Channel<void>) => gate.receive(), gate);
+      expect(() =>
+        group.go(
+          (fn: unknown) => fn,
+          () => {},
+        ),
+      ).toThrow(expect.objectContaining({ name: "DataCloneError" }));
+      const captured = 1;
+      expect(() => group.go(() => captured)).toThrow(expect.objectContaining({ code: "ERR_GOROUTINE_NOT_SENDABLE" }));
+      gate.close();
+      return group.wait().catch(() => {});
+    });
+
+    test("must be an integer of at least 1, or Infinity", () => {
+      for (const limit of [0, -1, 1.5, NaN]) {
+        expect(() => new Bun.WaitGroup({ limit })).toThrow(expect.objectContaining({ code: "ERR_OUT_OF_RANGE" }));
+      }
+      expect(() => new Bun.WaitGroup({ limit: "2" as any })).toThrow(
+        expect.objectContaining({ code: "ERR_INVALID_ARG_TYPE" }),
+      );
+      new Bun.WaitGroup({ limit: Infinity });
+    });
+  });
 });

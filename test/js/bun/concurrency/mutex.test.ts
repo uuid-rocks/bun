@@ -182,4 +182,17 @@ describe("Bun.Mutex", () => {
     expect(mu.tryLock()).toBeUndefined();
     expect(await Bun.go((mu: Bun.Mutex) => mu.tryLock() === undefined, mu)).toBe(true);
   });
+
+  test("Bun.inspect() shows whether it is locked and how many wait, not its methods", async () => {
+    const mutex = new Bun.Mutex();
+    expect(Bun.inspect(mutex)).toBe("Mutex { locked: false, waiters: 0 }");
+    const held = mutex.tryLock()!;
+    const waiting = [mutex.lock(), mutex.lock()];
+    expect(Bun.inspect(mutex)).toBe("Mutex { locked: true, waiters: 2 }");
+    expect(Bun.inspect({ mutex })).toBe("{\n  mutex: Mutex { locked: true, waiters: 2 },\n}");
+    held.unlock();
+    (await waiting[0]).unlock();
+    (await waiting[1]).unlock();
+    expect(Bun.inspect(mutex)).toBe("Mutex { locked: false, waiters: 0 }");
+  });
 });
