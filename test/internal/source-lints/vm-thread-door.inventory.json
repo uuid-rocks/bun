@@ -123,6 +123,11 @@
       "SharedWatcher"
     ]
   },
+  "src/runtime/concurrency/message.rs": {
+    "unsafe impl Send": [
+      "ChannelMessage"
+    ]
+  },
   "src/runtime/dns_jsc/dns.rs": {
     "WorkPool::schedule*": 1,
     "unsafe impl Send": [
