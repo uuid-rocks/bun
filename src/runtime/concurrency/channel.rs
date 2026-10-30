@@ -18,7 +18,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use bun_event_loop::{ConcurrentTask::ConcurrentTask, ContextId, Task, TaskTag, Taskable, task_tag};
+use bun_event_loop::{
+    ConcurrentTask::ConcurrentTask, ContextId, Task, TaskTag, Taskable, task_tag,
+};
 use bun_jsc::bindgen::{JsLocal, JsPayload as _, JsScope};
 use bun_jsc::virtual_machine::VirtualMachine;
 use bun_jsc::{
@@ -156,7 +158,9 @@ bun_jsc::impl_abort_handle_owner!(ChannelOp, abort_handle, |this, cause| {
         // The outcome is on its way and settles it.
         return;
     }
-    let op = ops().remove(id).expect("an operation is in the table until it settles");
+    let op = ops()
+        .remove(id)
+        .expect("an operation is in the table until it settles");
     if let AbortCause::Signal(reason) = cause {
         let global = VirtualMachine::get().global();
         let mut promise = op.promise;
@@ -242,7 +246,10 @@ impl ChannelCore {
     }
 
     /// `Ok(None)`: closed and drained.
-    fn receive(&self, waiter: impl FnOnce() -> Arc<Waiter>) -> Result<Option<ChannelMessage>, Arc<Waiter>> {
+    fn receive(
+        &self,
+        waiter: impl FnOnce() -> Arc<Waiter>,
+    ) -> Result<Option<ChannelMessage>, Arc<Waiter>> {
         let mut state = self.state.lock();
         let mut sender = None;
         let message = if let Some(message) = state.buffer.pop_front() {
@@ -290,7 +297,10 @@ impl ChannelCore {
                 core::mem::take(&mut state.senders),
             )
         };
-        for waiter in receivers.iter().chain(senders.iter().map(|(waiter, _)| waiter)) {
+        for waiter in receivers
+            .iter()
+            .chain(senders.iter().map(|(waiter, _)| waiter))
+        {
             if waiter.fire() {
                 waiter.wake(WakeResult::Closed);
             }
@@ -305,7 +315,10 @@ impl ChannelCore {
                 state.receivers.remove(i);
                 None
             } else {
-                let i = state.senders.iter().position(|(w, _)| Arc::ptr_eq(w, waiter));
+                let i = state
+                    .senders
+                    .iter()
+                    .position(|(w, _)| Arc::ptr_eq(w, waiter));
                 i.and_then(|i| state.senders.remove(i))
             }
         };
@@ -325,8 +338,13 @@ impl Channel {
         let capacity = if capacity.is_undefined() {
             0
         } else {
-            validators::validate_integer(cx.global(), capacity, "capacity", Some(0), Some(u32::MAX.into()))?
-                as u32
+            validators::validate_integer(
+                cx.global(),
+                capacity,
+                "capacity",
+                Some(0),
+                Some(u32::MAX.into()),
+            )? as u32
         };
         Ok(Self {
             core: Arc::new(ChannelCore {
@@ -386,7 +404,12 @@ impl Channel {
         self.receive_as(global, OpKind::Next, Options::NONE)
     }
 
-    fn receive_as(&self, global: &JSGlobalObject, kind: OpKind, options: Options) -> JsResult<JSValue> {
+    fn receive_as(
+        &self,
+        global: &JSGlobalObject,
+        kind: OpKind,
+        options: Options,
+    ) -> JsResult<JSValue> {
         if let Some(rejected) = options.rejected_if_aborted(global) {
             return Ok(rejected);
         }

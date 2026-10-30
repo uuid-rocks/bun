@@ -9,7 +9,10 @@ unsafe extern "C" {
         value: JSValue,
         transfer: JSValue,
     ) -> *mut c_void;
-    fn Bun__ChannelMessage__deserialize(global: &JSGlobalObject, message: NonNull<c_void>) -> JSValue;
+    fn Bun__ChannelMessage__deserialize(
+        global: &JSGlobalObject,
+        message: NonNull<c_void>,
+    ) -> JSValue;
     fn Bun__ChannelMessage__destroy(message: NonNull<c_void>);
 }
 
@@ -26,7 +29,11 @@ unsafe impl Send for ChannelMessage {}
 impl ChannelMessage {
     /// Clones `value`, moving what `transfer` (`undefined` or an iterable) lists. Throws what
     /// `postMessage()` throws: a `DataCloneError`, or the `TypeError` of a bad transfer list.
-    pub(crate) fn create(global: &JSGlobalObject, value: JSValue, transfer: JSValue) -> JsResult<Self> {
+    pub(crate) fn create(
+        global: &JSGlobalObject,
+        value: JSValue,
+        transfer: JSValue,
+    ) -> JsResult<Self> {
         let message = bun_jsc::call_check_slow(global, || {
             Bun__ChannelMessage__create(global, value, transfer)
         })?;

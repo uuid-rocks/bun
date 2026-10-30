@@ -104,7 +104,8 @@ pub(crate) struct RuntimeState {
     /// `clear_all_for_vm`.
     pub(crate) cron_jobs: Vec<bun_ptr::RefPtr<crate::api::cron::CronJob>>,
     /// `Bun.Channel` operations waiting for another thread.
-    pub(crate) channel_ops: crate::concurrency::ops::OpTable<crate::concurrency::channel::ChannelOp>,
+    pub(crate) channel_ops:
+        crate::concurrency::ops::OpTable<crate::concurrency::channel::ChannelOp>,
     /// `bun lint`: what runs the rules of JavaScript plugins in this VM.
     pub(crate) lint: core::cell::OnceCell<Box<crate::cli::lint_js::LintVm>>,
     /// The `uv_loop_t` that addons get for this VM. Stored inline because addons

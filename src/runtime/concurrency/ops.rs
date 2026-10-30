@@ -45,6 +45,9 @@ impl<T> Drop for OpTable<T> {
     fn drop(&mut self) {
         // Each operation leaves when its context stops, which VM teardown does while the heap is
         // alive. One still here holds a handle into a heap that is gone: leak it.
-        debug_assert!(self.ops.is_empty(), "an operation outlived its VM's contexts");
+        debug_assert!(
+            self.ops.is_empty(),
+            "an operation outlived its VM's contexts"
+        );
     }
 }
