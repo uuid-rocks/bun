@@ -128,6 +128,9 @@
       "Registry"
     ]
   },
+  "src/runtime/concurrency/graph.rs": {
+    "thread spawn": 1
+  },
   "src/runtime/concurrency/message.rs": {
     "unsafe impl Send": [
       "ChannelMessage"

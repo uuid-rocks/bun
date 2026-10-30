@@ -91,6 +91,8 @@ fn request() {
         WAKE.signal();
         return;
     }
+    // SAFETY: VM-free: the thread holds no VM or JS state, only channel cores and the messages in
+    // their queues, which any thread may lock and drop.
     let spawned = std::thread::Builder::new()
         .name("Bun.Channel collector".into())
         .spawn(run);
