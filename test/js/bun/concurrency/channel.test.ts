@@ -802,6 +802,80 @@ describe.concurrent("Bun.Channel process", () => {
     expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
   });
 
+  test("a cycle released while a long chain drops is freed", async () => {
+    const result = await runReclaiming(`
+      async function chain(length) {
+        let head = new Bun.Channel(1);
+        for (let i = 0; i < length; i++) {
+          const link = new Bun.Channel(1);
+          await link.send({ next: head });
+          head = link;
+        }
+        return head;
+      }
+      let first = new Bun.Channel(1), second = new Bun.Channel(1);
+      async function build() {
+        // Two cycles that only the values of first and second hold, beside long chains: they are
+        // released while the chains drop, and a collection may run meanwhile.
+        const a = new Bun.Channel(1), b = new Bun.Channel(1), c = new Bun.Channel(1), d = new Bun.Channel(1);
+        await a.send({ b });
+        await b.send({ a });
+        await c.send({ d });
+        await d.send({ c });
+        await first.send({ a, chain: await chain(20_000) });
+        await second.send({ chain: await chain(20_000), c });
+      }
+      async function settle() {
+        // The collector's thread runs meanwhile.
+        for (let i = 0; i < 6; i++) {
+          Bun.gc(true);
+          await Bun.sleep(80);
+        }
+      }
+      await build();
+      // The cycles were candidates once, while first and second held them.
+      await settle();
+      collectChannels();
+      first = second = null;
+      await settle();
+      console.log(await reclaimed());
+    `);
+    expect(result).toEqual({ stdout: "0\n", stderr: "", exitCode: 0 });
+  }, 60_000);
+
+  test("a small cycle that refers to a large live channel is freed, and the large one is left alone", async () => {
+    const result = await runReclaiming(`
+      setChannelCollectReach(256);
+      // Holds more cycles than one collection reaches, and stays alive.
+      const hub = new Bun.Channel(1000);
+      async function fill() {
+        for (let i = 0; i < 1000; i++) {
+          const c = new Bun.Channel(1);
+          await c.send({ c });
+          await hub.send({ c });
+        }
+      }
+      await fill();
+      const filled = channelLiveCount();
+      async function cycle() {
+        const a = new Bun.Channel(1), b = new Bun.Channel(1), c = new Bun.Channel(1);
+        await b.send({ c });
+        await c.send({ a });
+        await a.send({ hub, b });
+      }
+      await cycle();
+      let left = 0;
+      for (let i = 0; i < 100 && (left = channelLiveCount() - filled) > 0; i++) {
+        Bun.gc(true);
+        collectChannels();
+        await Bun.sleep(1);
+      }
+      const first = await hub.receive();
+      console.log(left, hub.length, first.c instanceof Bun.Channel);
+    `);
+    expect(result).toEqual({ stdout: "0 999 true\n", stderr: "", exitCode: 0 });
+  });
+
   test("a cycle of more channels than one collection reaches is freed by a collection without the limit", async () => {
     const result = await runReclaiming(`
       setChannelCollectReach(256);

@@ -11,6 +11,7 @@
 //! An `AbortSignal` case is ready once its signal aborts. A select that waits follows its signals;
 //! the first to abort wins the waiter for its case the way its own VM cancels it.
 
+use core::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use bun_collections::smallvec::SmallVec;
@@ -21,19 +22,33 @@ use bun_jsc::{
 
 use super::channel::{
     Channel, ChannelCore, Channels, Delivery, OpKind, Options, Queued, ReceiveNow, SendNow,
-    WakeResult, closed_error, new_waiter, ops, select_result, shuffle, wait,
+    WakeResult, closed_error, ending, never, new_waiter, ops, select_result, shuffle, wait,
 };
 use super::graph;
 use super::message::{ChannelMessage, CloneSite};
 use crate::node::util::validators;
 
 struct Case {
-    channel: Arc<ChannelCore>,
+    channel: ManuallyDrop<Arc<ChannelCore>>,
     /// The value of a send. Taken when the send happens or waits.
     send: Option<ChannelMessage>,
     is_send: bool,
     /// The index of the channel in the select's distinct channels.
     lock: usize,
+}
+
+impl Drop for Case {
+    fn drop(&mut self) {
+        // SAFETY: dropping; not used again.
+        graph::release(unsafe { ManuallyDrop::take(&mut self.channel) });
+    }
+}
+
+/// Releases the select's own references to its channels.
+fn release_all(channels: Channels) {
+    for channel in channels {
+        graph::release(channel);
+    }
 }
 
 enum Read {
@@ -94,6 +109,9 @@ pub(crate) fn select(
     // A getter can have aborted it.
     if let Some(rejected) = parsed.rejected_if_aborted(global) {
         return Ok(rejected);
+    }
+    if ending(global) {
+        return Ok(never(global));
     }
     if !default && parsed.signal.is_none() && read.iter().all(|case| matches!(case, Read::Never)) {
         return Err(validators::throw_err_invalid_arg_value(
@@ -168,6 +186,7 @@ pub(crate) fn select(
         if default {
             drop(locks);
             drop(read);
+            release_all(channels);
             return Ok(JSPromise::resolved_promise_value(
                 global,
                 select_result(global, -1, JSValue::UNDEFINED, false),
@@ -216,6 +235,7 @@ pub(crate) fn select(
         ));
     };
     drop(locks);
+    release_all(channels);
     let (reason, channel) = match (&won, &read[index as usize]) {
         (Won::Aborted, Read::Signal(signal)) => (signal.js_reason(global), None),
         (_, Read::Channel(case)) => (JSValue::UNDEFINED, Some(Arc::clone(&case.channel))),
@@ -235,16 +255,22 @@ pub(crate) fn select(
         }
         Won::Received(ReceiveNow::Closed) => select_result(global, index, JSValue::UNDEFINED, true),
         Won::Sent(SendNow::Handed(receiver, message)) => {
-            let channel = channel.expect("a send case is a channel's");
-            receiver.wake(WakeResult::Received(Delivery::new(message, &channel)));
+            let channel = channel.as_ref().expect("a send case is a channel's");
+            receiver.wake(WakeResult::Received(Delivery::new(message, channel)));
             select_result(global, index, JSValue::UNDEFINED, false)
         }
         Won::Sent(SendNow::Buffered) => select_result(global, index, JSValue::UNDEFINED, false),
         Won::Sent(SendNow::Closed(message)) => {
             drop(message);
+            if let Some(channel) = channel {
+                graph::release(channel);
+            }
             return Ok(JSPromise::rejected_promise(global, closed_error(global)).to_js());
         }
     };
+    if let Some(channel) = channel {
+        graph::release(channel);
+    }
     Ok(JSPromise::resolved_promise_value(global, value))
 }
 
@@ -257,7 +283,7 @@ fn read_case(global: &JSGlobalObject, case: JSValue, i: u32, hole: bool) -> JsRe
     }
     if let Some(channel) = case.as_class_ref::<Channel>() {
         return Ok(Read::Channel(Case {
-            channel: Arc::clone(channel.core()),
+            channel: ManuallyDrop::new(Arc::clone(channel.core())),
             send: None,
             is_send: false,
             lock: 0,
@@ -277,7 +303,7 @@ fn read_case(global: &JSGlobalObject, case: JSValue, i: u32, hole: bool) -> JsRe
                 CloneSite::SelectSend(i),
             )?;
             return Ok(Read::Channel(Case {
-                channel,
+                channel: ManuallyDrop::new(channel),
                 send: Some(message),
                 is_send: true,
                 lock: 0,

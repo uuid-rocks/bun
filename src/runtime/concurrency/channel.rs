@@ -56,8 +56,12 @@ pub(crate) struct ChannelCore {
     /// Its queues may hold a value that shares a channel: set under `state`'s lock when they do,
     /// cleared by the [`graph`]'s collection when they don't.
     pub(super) holds_channels: AtomicBool,
-    /// Queued for the [`graph`]'s collection.
-    pub(super) candidate: AtomicBool,
+    /// Queued for the [`graph`]'s collection. Apart, so that a release can register the channel
+    /// after it dropped its reference.
+    pub(super) candidate: Arc<AtomicBool>,
+    /// How many values in channels' queues share this channel: the edges into it. A channel with
+    /// more references than that has a root.
+    pub(super) incoming: AtomicU32,
 }
 
 /// How many channels exist, for `bun:internal-for-testing`.
@@ -70,7 +74,8 @@ impl ChannelCore {
             capacity,
             state: Guarded::new(State::default()),
             holds_channels: AtomicBool::new(false),
-            candidate: AtomicBool::new(false),
+            candidate: Arc::new(AtomicBool::new(false)),
+            incoming: AtomicU32::new(0),
         })
     }
 }
@@ -138,25 +143,49 @@ pub(super) enum ReceiveNow {
 }
 
 impl State {
+    /// `message` enters a queue: its channels are edges of this one.
+    fn enter(&mut self, message: &ChannelMessage) {
+        if !message.carries_channels() {
+            return;
+        }
+        self.edges += 1;
+        for &target in message.targets() {
+            // SAFETY: the message holds the core.
+            unsafe { &*target }.incoming.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// `message` leaves a queue.
+    fn leave(&mut self, message: &ChannelMessage) {
+        if !message.carries_channels() {
+            return;
+        }
+        self.edges -= 1;
+        for &target in message.targets() {
+            // SAFETY: the message holds the core.
+            unsafe { &*target }.incoming.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
     fn push_buffer(&mut self, message: ChannelMessage) {
-        self.edges += u32::from(message.carries_channels());
+        self.enter(&message);
         self.buffer.push_back(message);
     }
 
     fn pop_buffer(&mut self) -> Option<ChannelMessage> {
         let message = self.buffer.pop_front()?;
-        self.edges -= u32::from(message.carries_channels());
+        self.leave(&message);
         Some(message)
     }
 
     pub(super) fn push_sender(&mut self, sender: Queued, message: ChannelMessage) {
-        self.edges += u32::from(message.carries_channels());
+        self.enter(&message);
         self.senders.push_back((sender, message));
     }
 
     fn pop_sender_entry(&mut self) -> Option<(Queued, ChannelMessage)> {
         let (sender, message) = self.senders.pop_front()?;
-        self.edges -= u32::from(message.carries_channels());
+        self.leave(&message);
         Some((sender, message))
     }
 
@@ -171,12 +200,16 @@ impl State {
     pub(super) fn take_all(
         &mut self,
     ) -> (VecDeque<ChannelMessage>, VecDeque<(Queued, ChannelMessage)>) {
-        self.edges = 0;
         self.receivers.clear();
-        (
-            core::mem::take(&mut self.buffer),
-            core::mem::take(&mut self.senders),
-        )
+        let buffer = core::mem::take(&mut self.buffer);
+        let senders = core::mem::take(&mut self.senders);
+        for message in buffer
+            .iter()
+            .chain(senders.iter().map(|(_, message)| message))
+        {
+            self.leave(message);
+        }
+        (buffer, senders)
     }
 
     /// `Err`: the send would wait. The value back.
@@ -364,9 +397,9 @@ impl ChannelWake {
     pub(crate) fn run(this: *mut Self, global: &JSGlobalObject) -> JsResult<()> {
         // SAFETY: the dispatch hands over the boxed wake.
         let wake = unsafe { bun_core::heap::take(this) };
-        if !global.bun_vm().script_allowed() {
-            // The VM is ending: nothing would read a value. Its operation leaves the table when
-            // its context stops, and a value goes back to its channel.
+        if ending(global) {
+            // Nothing would read a value. Its operation leaves the table when its context stops,
+            // and a value goes back to its channel.
             return Ok(());
         }
         if let Some(op) = ops().get(wake.op_id) {
@@ -714,6 +747,21 @@ fn cancel(global: &JSGlobalObject, id: u64) {
     let _ = promise.reject(global, Ok(cancelled_error(global)));
 }
 
+/// This VM is ending, or its thread was asked to: script it runs from here on may be cut short, so
+/// it takes no value from a channel.
+pub(super) fn ending(global: &JSGlobalObject) -> bool {
+    let vm = global.bun_vm();
+    !vm.script_allowed()
+        || vm
+            .worker_ref()
+            .is_some_and(|worker| worker.has_requested_terminate())
+}
+
+/// What a receive returns on a VM that is [ending](ending): it waits for good.
+pub(super) fn never(global: &JSGlobalObject) -> JSValue {
+    JSPromise::create(global).to_js()
+}
+
 pub(super) fn closed_error(global: &JSGlobalObject) -> JSValue {
     global
         .err(ErrorCode::CHANNEL_CLOSED, format_args!("Channel is closed"))
@@ -817,7 +865,7 @@ impl ChannelCore {
                 return;
             }
         }
-        state.edges += u32::from(message.carries_channels());
+        state.enter(&message);
         state.buffer.push_front(message);
         graph::note_edges(self, &state);
     }
@@ -856,11 +904,9 @@ impl ChannelCore {
             }
             state.closed = true;
             let senders = core::mem::take(&mut state.senders);
-            state.edges = state
-                .buffer
-                .iter()
-                .map(|m| u32::from(m.carries_channels()))
-                .sum();
+            for (_, message) in &senders {
+                state.leave(message);
+            }
             // A value handed out may still come back to them.
             let receivers = match state.has_ended() {
                 true => core::mem::take(&mut state.receivers),
@@ -896,7 +942,7 @@ impl ChannelCore {
                 .position(|(queued, _)| Arc::ptr_eq(&queued.waiter, waiter))
             {
                 if let Some((_, message)) = state.senders.remove(i) {
-                    state.edges -= u32::from(message.carries_channels());
+                    state.leave(&message);
                     dropped.push(message);
                 }
             }
@@ -1039,6 +1085,9 @@ impl Channel {
     ) -> JsResult<JSValue> {
         if let Some(rejected) = options.rejected_if_aborted(global) {
             return Ok(rejected);
+        }
+        if ending(global) {
+            return Ok(never(global));
         }
         let id = ops().next_id();
         match self.core.receive(|| new_waiter(global, id)) {

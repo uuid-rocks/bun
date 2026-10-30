@@ -41,7 +41,13 @@ use bun_threading::{Condition, Guarded};
 
 use super::channel::{ChannelCore, State};
 
-static CANDIDATES: Guarded<Vec<Weak<ChannelCore>>> = Guarded::new(Vec::new());
+/// A channel that may have become garbage, and its `candidate` flag, which outlives it.
+struct Candidate {
+    channel: Weak<ChannelCore>,
+    flag: Arc<AtomicBool>,
+}
+
+static CANDIDATES: Guarded<Vec<Candidate>> = Guarded::new(Vec::new());
 /// How many candidates wait, read without the lock.
 static BACKLOG: AtomicUsize = AtomicUsize::new(0);
 
@@ -112,47 +118,65 @@ static WAKE: Condition = Condition::new();
 /// `state` is `channel`'s, locked: a value was queued in it.
 pub(super) fn note_edges(channel: &ChannelCore, state: &State) {
     if state.edges > 0 && !channel.holds_channels.load(Ordering::Relaxed) {
-        channel.holds_channels.store(true, Ordering::Relaxed);
+        channel.holds_channels.store(true, Ordering::Release);
     }
 }
 
-/// Drops a reference to `channel` that is not an edge. Nothing locked.
+/// Drops a reference to `channel` that is not an edge, then makes it a candidate. Nothing locked.
 pub(super) fn release(channel: Arc<ChannelCore>) {
     // A channel whose queues hold no channel is in no cycle, and drops no channel. (If this is its
     // last reference, nothing can be queueing one meanwhile.)
-    if !channel.holds_channels.load(Ordering::Relaxed) {
+    if !channel.holds_channels.load(Ordering::Acquire) {
         return drop(channel);
     }
-    if !channel.candidate.swap(true, Ordering::AcqRel) {
-        CANDIDATES.lock().push(Arc::downgrade(&channel));
-        BACKLOG.fetch_add(1, Ordering::Relaxed);
-        request();
+    // After the reference is gone: a collection that took it before would count it as a root.
+    let candidate = Candidate {
+        channel: Arc::downgrade(&channel),
+        flag: Arc::clone(&channel.candidate),
+    };
+    drop_then(channel, Some(candidate));
+}
+
+fn register(candidate: Candidate) {
+    if candidate.channel.strong_count() == 0 || candidate.flag.swap(true, Ordering::AcqRel) {
+        return;
     }
-    drop_channel(channel);
+    CANDIDATES.lock().push(candidate);
+    BACKLOG.fetch_add(1, Ordering::Relaxed);
+    request();
 }
 
 thread_local! {
-    /// This thread is dropping a channel: channels its values drop wait in `DEFERRED`.
+    /// This thread is dropping a channel: channels its values drop wait in `DEFERRED`, with the
+    /// candidates to register once they are dropped.
     static DROPPING: Cell<bool> = const { Cell::new(false) };
-    static DEFERRED: RefCell<Vec<Arc<ChannelCore>>> = const { RefCell::new(Vec::new()) };
+    static DEFERRED: RefCell<Vec<(Arc<ChannelCore>, Option<Candidate>)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Drops `channel` without recursing into the channels its values hold, however long the chain:
 /// inside another drop on this thread, it is dropped after that one.
 pub(super) fn drop_channel(channel: Arc<ChannelCore>) {
-    let mut channel = Some(channel);
-    let deferred = DEFERRED.try_with(|deferred| {
+    drop_then(channel, None);
+}
+
+/// Drops `channel`, then registers `candidate`.
+fn drop_then(channel: Arc<ChannelCore>, candidate: Option<Candidate>) {
+    let mut pending = Some((channel, candidate));
+    let _ = DEFERRED.try_with(|deferred| {
         if DROPPING.get() {
             deferred
                 .borrow_mut()
-                .push(channel.take().expect("taken once"));
+                .push(pending.take().expect("taken once"));
         }
     });
-    // Thread-locals are gone (the thread is ending), or this is the outermost drop.
-    if let Some(channel) = channel {
+    // The outermost drop, or thread-locals are gone (the thread is ending).
+    if let Some((channel, candidate)) = pending {
         dropping(move || drop(channel));
+        if let Some(candidate) = candidate {
+            register(candidate);
+        }
     }
-    let _ = deferred;
 }
 
 /// Runs `drop`, then the drops it deferred, one at a time.
@@ -161,8 +185,13 @@ fn dropping(drop: impl FnOnce()) {
         Err(_) | Ok(true) => drop(),
         Ok(false) => {
             drop();
-            while let Some(next) = DEFERRED.with(|deferred| deferred.borrow_mut().pop()) {
+            while let Some((next, candidate)) =
+                DEFERRED.with(|deferred| deferred.borrow_mut().pop())
+            {
                 core::mem::drop(next);
+                if let Some(candidate) = candidate {
+                    register(candidate);
+                }
             }
             DROPPING.with(|dropping| dropping.set(false));
         }
@@ -319,13 +348,13 @@ fn take_candidates(count: usize) -> Vec<Weak<ChannelCore>> {
         candidates.split_off(at)
     };
     BACKLOG.fetch_sub(taken.len(), Ordering::Relaxed);
-    for candidate in &taken {
-        if let Some(channel) = candidate.upgrade() {
-            channel.candidate.store(false, Ordering::SeqCst);
-            drop_channel(channel);
-        }
-    }
     taken
+        .into_iter()
+        .map(|candidate| {
+            candidate.flag.store(false, Ordering::SeqCst);
+            candidate.channel
+        })
+        .collect()
 }
 
 /// Collects a batch of the newest candidates.
@@ -344,8 +373,10 @@ fn collect_newest() {
 fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen, limit: usize) -> (usize, bool) {
     // What the candidates reach through values that share channels, one channel locked at a time.
     // Channels that hold none are left out: they are in no cycle, and drop with what holds them.
-    // Weakly: one that the counts free meanwhile is not kept, and drops out.
+    // So are roots, which have references besides the edges into them: what they reach is
+    // reachable. Weakly: one that the counts free meanwhile is not kept, and drops out.
     let mut reached: Vec<Weak<ChannelCore>> = Vec::with_capacity(batch.len());
+    let mut roots = Vec::new();
     for candidate in batch {
         if seen.insert(candidate.as_ptr() as usize, ()).is_none() {
             reached.push(candidate);
@@ -358,6 +389,13 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen, limit: usize) -
             i += 1;
             continue;
         };
+        // Less this reference.
+        if Arc::strong_count(&channel) - 1 > channel.incoming.load(Ordering::Acquire) as usize {
+            roots.push(i);
+            drop_channel(channel);
+            i += 1;
+            continue;
+        }
         {
             let state = channel.state.lock();
             for message in state.values() {
@@ -375,13 +413,19 @@ fn collect_batch(batch: Vec<Weak<ChannelCore>>, seen: &mut Seen, limit: usize) -
                     if seen.insert(target as usize, ()).is_none() {
                         // SAFETY: as above: a live core of an `Arc`, which this does not drop.
                         let target = core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(target) });
-                        reached.push(Arc::downgrade(&target));
+                        let incoming = core.incoming.load(Ordering::Acquire) as usize;
+                        if Arc::strong_count(&target) <= incoming {
+                            reached.push(Arc::downgrade(&target));
+                        }
                     }
                 }
             }
         }
         drop_channel(channel);
         i += 1;
+    }
+    for &root in roots.iter().rev() {
+        reached.swap_remove(root);
     }
     let channels = reached.iter().filter_map(Weak::upgrade).collect();
     drop(reached);
