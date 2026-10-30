@@ -290,10 +290,10 @@ console.log((await channel.receive()).byteLength); // => 1024
 
 Each operation clones its value and settles a promise, so a channel moves a few million small values a second (3 to 6 million in `bench/concurrency`), far fewer than a Go channel. When values are small and many, send them in batches, such as arrays of a few hundred.
 
-A channel that holds a value containing a handle to itself is freed only once that value is received.
+Channels can hold each other: a channel sent into itself, or two channels sent into each other, are freed like any other garbage once nothing else refers to them. A thread refers to a channel until it collects its own garbage, so a cycle that went through a goroutine is freed after that goroutine's thread collects too.
 
 ---
 
 ## The event loop
 
-A waiting `send()`, `receive()` or `select()` does not keep the process alive. When every thread waits on a channel or a mutex and nothing else can wake one, Bun reports a [deadlock](/runtime/goroutines#deadlocks) and exits. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel.
+A waiting `send()`, `receive()` or `select()` does not keep the process alive. When every thread waits on a channel or a mutex and nothing else can wake one, Bun reports a [deadlock](/runtime/goroutines#deadlocks) and exits. A worker that is still running keeps it alive, as it always does. If a worker exits while it waits on a channel, the channel drops its waiting operations, and other threads keep using the channel. A value that was handed to a receive on that worker but not yet read goes back to the channel, to the next receiver: the sender saw its `send()` succeed, so the value is still received once.
