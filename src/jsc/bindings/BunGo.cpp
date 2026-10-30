@@ -14,6 +14,7 @@
 #include "root.h"
 #include "BunGo.h"
 
+#include "CodeGenerationFromStrings.h"
 #include "ErrorStackTrace.h"
 #include "InternalModuleRegistry.h"
 #include "MessageWithMessagePorts.h"
@@ -24,6 +25,12 @@
 #include <JavaScriptCore/ModuleRegistryEntry.h>
 #include <JavaScriptCore/AbstractModuleRecord.h>
 #include <JavaScriptCore/JSModuleNamespaceObject.h>
+#include <JavaScriptCore/Completion.h>
+#include <JavaScriptCore/FunctionExecutable.h>
+#include <JavaScriptCore/FunctionExecutableInlines.h>
+#include <JavaScriptCore/JSModuleEnvironment.h>
+#include <JavaScriptCore/JSSymbolTableObject.h>
+#include <JavaScriptCore/SourceProvider.h>
 #include <wtf/Deque.h>
 #include <wtf/HashMap.h>
 #include <wtf/HashSet.h>
@@ -35,6 +42,27 @@ extern "C" uint32_t Bun__Go__maxPoolThreads();
 extern "C" WebCore::MessageWithMessagePorts* Bun__ChannelMessage__create(JSC::JSGlobalObject*, JSC::EncodedJSValue value, JSC::EncodedJSValue transfer);
 extern "C" JSC::EncodedJSValue Bun__ChannelMessage__deserialize(JSC::JSGlobalObject*, WebCore::MessageWithMessagePorts*);
 extern "C" bool Bun__Go__resolveModule(void* bunVM, const BunString* specifier, BunString* out, BunString* errorMessage);
+
+// bun_runtime::concurrency::go. Zero-based, in bytes of the text; the line is -1 for none.
+struct NamePosition {
+    int32_t line;
+    int32_t column;
+};
+struct FunctionNames {
+    // bun_js_parser's FunctionTextKind
+    uint8_t kind;
+    NamePosition thisPosition;
+    NamePosition importMetaPosition;
+    // It calls `eval` directly, which reads the variables around it.
+    bool directEval;
+};
+enum class FunctionTextKind : uint8_t {
+    Other = 0,
+    Function = 1,
+    Arrow = 2,
+    Class = 3,
+};
+extern "C" bool Bun__Go__functionNames(const char8_t* text, size_t length, void* context, void (*onName)(void*, const uint8_t* name, size_t length, NamePosition), FunctionNames* out);
 
 namespace Bun::Go {
 using namespace JSC;
@@ -48,11 +76,18 @@ using Message = std::unique_ptr<MessageWithMessagePorts>;
 
 struct Task {
     uint64_t id;
-    // Module key the pool thread imports, and the export to call (see internal/go/spawn).
+    // Module key the pool thread imports, and the export to call (see internal/go/spawn). For a
+    // function no module exports, the module it is written in.
     String module;
     String exportName;
     bool fromCommonJSExports;
     Message args;
+    // A function no module exports: its source, compiled on the pool thread where it starts in
+    // `module` (zero-based line and column).
+    String source;
+    int32_t line { 0 };
+    int32_t column { 0 };
+    bool strict { false };
 };
 
 // internal/go/spawn's `Outcome`.
@@ -352,10 +387,20 @@ JSArray* taskToJS(Zig::GlobalObject* globalObject, Task&& task)
     RETURN_IF_EXCEPTION(scope, nullptr);
     MarkedArgumentBuffer values;
     values.append(jsNumber(task.id));
-    values.append(jsString(vm, WTF::move(task.module)));
-    values.append(jsString(vm, WTF::move(task.exportName)));
-    values.append(jsBoolean(task.fromCommonJSExports));
     values.append(args);
+    if (task.source.isNull()) {
+        values.append(jsNumber(0));
+        values.append(jsString(vm, WTF::move(task.module)));
+        values.append(jsString(vm, WTF::move(task.exportName)));
+        values.append(jsBoolean(task.fromCommonJSExports));
+    } else {
+        values.append(jsNumber(1));
+        values.append(jsString(vm, WTF::move(task.module)));
+        values.append(jsString(vm, WTF::move(task.source)));
+        values.append(jsNumber(task.line));
+        values.append(jsNumber(task.column));
+        values.append(jsBoolean(task.strict));
+    }
     RELEASE_AND_RETURN(scope, constructArray(globalObject, static_cast<ArrayAllocationProfile*>(nullptr), values));
 }
 
@@ -450,6 +495,225 @@ JSC_DEFINE_HOST_FUNCTION(jsGoSpawn, (JSGlobalObject * lexicalGlobalObject, CallF
     return JSValue::encode(jsNumber(id));
 }
 
+// spawnInline(source, module, line, column, strict, args): queue a goroutine that runs a function
+// no module exports, from its source (see sourceOf); returns its id. Throws (DataCloneError) if
+// `args` can't be cloned.
+JSC_DEFINE_HOST_FUNCTION(jsGoSpawnInline, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto& vm = lexicalGlobalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    String source = callFrame->argument(0).toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    String module = callFrame->argument(1).toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    int32_t line = callFrame->argument(2).toInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    int32_t column = callFrame->argument(3).toInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    bool strict = callFrame->argument(4).toBoolean(lexicalGlobalObject);
+    auto args = serialize(lexicalGlobalObject, callFrame->argument(5));
+    RETURN_IF_EXCEPTION(scope, {});
+    auto& context = contextOf(lexicalGlobalObject);
+    Task task { 0, WTF::move(module).isolatedCopy(), String(), false, WTF::move(args), WTF::move(source).isolatedCopy(), line, column, strict };
+    uint64_t id = scheduler().spawn(WTF::move(task), Spawner { context.identifier(), context.currentLoopKind() });
+    return JSValue::encode(jsNumber(id));
+}
+
+// sourceOf(fn): [source, module, line, column, strict] of a function with source of its own, or
+// undefined (native, bound). `line` and `column` are zero-based, where its text starts in `module`.
+JSC_DEFINE_HOST_FUNCTION(jsGoSourceOf, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto& vm = lexicalGlobalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* function = dynamicDowncast<JSFunction>(callFrame->argument(0));
+    if (!function || function->isHostOrBuiltinFunction())
+        return JSValue::encode(jsUndefined());
+    FunctionExecutable* executable = function->jsExecutable();
+    JSString* source = executable->toString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    auto position = executable->source().provider()->documentZeroBasedLineColumnForOffset(executable->functionStart());
+    MarkedArgumentBuffer values;
+    values.append(source);
+    values.append(jsString(vm, Zig::sourceURL(vm, function)));
+    values.append(jsNumber(position.line));
+    values.append(jsNumber(position.column));
+    values.append(jsBoolean(executable->isInStrictContext()));
+    RELEASE_AND_RETURN(scope, JSValue::encode(constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), values)));
+}
+
+enum class Binding : uint8_t {
+    // A global, or nothing
+    Global,
+    // A variable of the code around the function
+    Captured,
+    // What the function's module imports
+    Imported,
+};
+
+// What `name` in `function` is, if the function itself does not declare it.
+static Binding bindingOf(JSFunction* function, const Identifier& name)
+{
+    for (JSScope* scope = function->scope(); scope; scope = scope->next()) {
+        if (scope->isGlobalObject())
+            return Binding::Global;
+        // A `with` statement's object may have any name.
+        if (scope->type() == WithScopeType)
+            return Binding::Captured;
+        if (auto* variables = dynamicDowncast<JSSymbolTableObject>(scope); variables && !variables->symbolTable()->get(name.impl()).isNull())
+            return Binding::Captured;
+        if (auto* module = dynamicDowncast<JSModuleEnvironment>(scope); module && module->moduleRecord()->importEntries().contains(name.impl()))
+            return Binding::Imported;
+    }
+    return Binding::Global;
+}
+
+// check(fn, source, module, line, column): [line, column, problems?] for `fn`, whose source starts
+// at zero-based `line` and `column` of `module` (sourceOf): where it starts in the module's own
+// text (Bun transpiled what sourceOf counts in), and what keeps it from running on another thread,
+// as [kind, name, line] with a one-based line of the module's own text. `kind` is "unparsable" (a method, a getter), "class",
+// "this", "arguments" (an arrow function's, from the code around it), "import.meta", "eval" (called
+// directly), "captured" (a variable of the code around it), "imported" (by its module) or
+// "undeclared" (not a global either).
+JSC_DEFINE_HOST_FUNCTION(jsGoCheck, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto& vm = lexicalGlobalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* function = dynamicDowncast<JSFunction>(callFrame->argument(0));
+    if (!function || function->isHostOrBuiltinFunction())
+        return throwVMTypeError(lexicalGlobalObject, scope);
+    String source = callFrame->argument(1).toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    String module = callFrame->argument(2).toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    int32_t firstLine = callFrame->argument(3).toInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    int32_t firstColumn = callFrame->argument(4).toInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    using Names = Vector<std::pair<String, NamePosition>>;
+    Names names;
+    FunctionNames found {};
+    auto text = makeString('(', source, ')').utf8();
+    bool parsed = Bun__Go__functionNames(text.data(), text.length(), &names, [](void* context, const uint8_t* name, size_t length, NamePosition position) { static_cast<Names*>(context)->append({ String::fromUTF8(std::span { name, length }), position }); }, &found);
+
+    // Where a position of the text is in the module's own text, which Bun transpiled (TypeScript,
+    // JSX). The text begins with the "(" around the source.
+    auto original = [&](NamePosition position) {
+        Bun::OwnedZigStackFrames frames(1);
+        frames[0].position.line_zero_based = firstLine + std::max(position.line, 0);
+        frames[0].position.column_zero_based = position.line > 0 ? position.column : firstColumn + std::max(position.column - 1, 0);
+        frames[0].source_url = Bun::toStringRef(module);
+        frames.remap(defaultGlobalObject(lexicalGlobalObject)->bunVM());
+        return NamePosition { frames[0].position.line_zero_based, frames[0].position.column_zero_based };
+    };
+    MarkedArgumentBuffer problems;
+    // Check for an exception after each.
+    auto add = [&](ASCIILiteral kind, const String& name, NamePosition position) {
+        MarkedArgumentBuffer problem;
+        problem.append(jsString(vm, String(kind)));
+        problem.append(jsString(vm, name));
+        problem.append(jsNumber(original(position).line + 1));
+        if (auto* array = constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), problem))
+            problems.append(array);
+    };
+    auto kind = static_cast<FunctionTextKind>(found.kind);
+    if (!parsed || kind == FunctionTextKind::Other) {
+        add("unparsable"_s, emptyString(), {});
+        RETURN_IF_EXCEPTION(scope, {});
+    } else if (kind == FunctionTextKind::Class || function->jsExecutable()->isClassConstructorFunction()) {
+        add("class"_s, emptyString(), {});
+        RETURN_IF_EXCEPTION(scope, {});
+    } else {
+        if (found.thisPosition.line >= 0) {
+            add("this"_s, "this"_s, found.thisPosition);
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        if (found.importMetaPosition.line >= 0) {
+            add("import.meta"_s, "import.meta"_s, found.importMetaPosition);
+            RETURN_IF_EXCEPTION(scope, {});
+        }
+        for (auto& [name, position] : names) {
+            // The thread gives the function a `require` of its module's (internal/go/runtime).
+            if (name == "require"_s)
+                continue;
+            if ((kind == FunctionTextKind::Arrow && name == "arguments"_s) || (found.directEval && name == "eval"_s)) {
+                add(name == "eval"_s ? "eval"_s : "arguments"_s, name, position);
+                RETURN_IF_EXCEPTION(scope, {});
+                continue;
+            }
+            auto identifier = Identifier::fromString(vm, name);
+            auto binding = bindingOf(function, identifier);
+            if (binding != Binding::Global) {
+                add(binding == Binding::Imported ? "imported"_s : "captured"_s, name, position);
+                RETURN_IF_EXCEPTION(scope, {});
+                continue;
+            }
+            bool isGlobal = lexicalGlobalObject->hasProperty(lexicalGlobalObject, identifier);
+            RETURN_IF_EXCEPTION(scope, {});
+            if (!isGlobal) {
+                add("undeclared"_s, name, position);
+                RETURN_IF_EXCEPTION(scope, {});
+            }
+        }
+    }
+    auto start = original({ 0, 1 });
+    MarkedArgumentBuffer result;
+    result.append(jsNumber(start.line));
+    result.append(jsNumber(start.column));
+    if (!problems.isEmpty()) {
+        result.append(constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), problems));
+        RETURN_IF_EXCEPTION(scope, {});
+    }
+    RELEASE_AND_RETURN(scope, JSValue::encode(constructArray(lexicalGlobalObject, static_cast<ArrayAllocationProfile*>(nullptr), result)));
+}
+
+// codeGenerationAllowed(): whether script may be made from a string here, which an inline
+// goroutine's thread does with its source.
+JSC_DEFINE_HOST_FUNCTION(jsGoCodeGenerationAllowed, (JSGlobalObject * lexicalGlobalObject, CallFrame*))
+{
+    return JSValue::encode(jsBoolean(lexicalGlobalObject->evalEnabled() && !Bun::isCodeGenerationFromStringsStrict()));
+}
+
+// compile(source, module, line, column, strict): `(require) => fn`, where fn is the function
+// `source` is (spawnInline), compiled as if it were where it is in `module`: an import() in it
+// resolves from there, and a stack trace names it. Throws what compiling throws.
+JSC_DEFINE_HOST_FUNCTION(jsGoCompile, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto& vm = lexicalGlobalObject->vm();
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    String source = callFrame->argument(0).toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    String module = callFrame->argument(1).toWTFString(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    int32_t line = callFrame->argument(2).toInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    int32_t column = callFrame->argument(3).toInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+    bool strict = callFrame->argument(4).toBoolean(lexicalGlobalObject);
+
+    auto prefix = strict ? "(function (require) { 'use strict'; return ("_s : "(function (require) { return ("_s;
+    auto code = makeString(prefix, source, ")})"_s);
+    URL url;
+    if (!module.isEmpty() && module[0] == '/')
+        url = URL::fileURLWithFileSystemPath(module);
+#if OS(WINDOWS)
+    else if (module.length() > 2 && module[1] == ':')
+        url = URL::fileURLWithFileSystemPath(module);
+#endif
+    else
+        url = URL({}, module);
+    TextPosition position { OrdinalNumber::fromZeroBasedInt(std::max(line, 0)), OrdinalNumber::fromZeroBasedInt(std::max(column - static_cast<int32_t>(prefix.length()), 0)) };
+    SourceCode sourceCode { StringSourceProvider::create(code, url.isValid() ? SourceOrigin { url } : SourceOrigin {}, String(module), SourceTaintedOrigin::Untainted, position) };
+    NakedPtr<JSC::Exception> exception;
+    JSValue value = JSC::evaluate(lexicalGlobalObject, sourceCode, lexicalGlobalObject, exception);
+    if (exception) {
+        throwException(lexicalGlobalObject, scope, exception.get());
+        return {};
+    }
+    RETURN_IF_EXCEPTION(scope, {});
+    return JSValue::encode(value);
+}
+
 // keepAlive(delta): ref (+1) or unref (-1) this thread's event loop for a goroutine.
 JSC_DEFINE_HOST_FUNCTION(jsGoKeepAlive, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
 {
@@ -508,8 +772,7 @@ JSC_DEFINE_HOST_FUNCTION(jsGoResolveModule, (JSGlobalObject * lexicalGlobalObjec
     return JSValue::encode(jsString(vm, out.transferToWTFString()));
 }
 
-// take(): [id, module, exportName, fromCommonJSExports, args] of the next goroutine for this pool
-// thread, or undefined; then `run` is called with the next one handed to it.
+// take(): the next goroutine for this pool thread (internal/go/runtime's `Task`), or undefined.
 JSC_DEFINE_HOST_FUNCTION(jsGoTake, (JSGlobalObject * lexicalGlobalObject, CallFrame*))
 {
     auto& vm = lexicalGlobalObject->vm();
@@ -559,8 +822,12 @@ JSValue createGoSpawnBinding(Zig::GlobalObject* globalObject)
 {
     auto& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    JSObject* binding = constructEmptyObject(globalObject, globalObject->objectPrototype(), 4);
+    JSObject* binding = constructEmptyObject(globalObject, globalObject->objectPrototype(), 8);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "spawn"_s), 4, Bun::Go::jsGoSpawn, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "spawnInline"_s), 6, Bun::Go::jsGoSpawnInline, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "sourceOf"_s), 1, Bun::Go::jsGoSourceOf, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "check"_s), 5, Bun::Go::jsGoCheck, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "codeGenerationAllowed"_s), 0, Bun::Go::jsGoCodeGenerationAllowed, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "keepAlive"_s), 1, Bun::Go::jsGoKeepAlive, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "moduleOf"_s), 1, Bun::Go::jsGoModuleOf, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "resolveModule"_s), 1, Bun::Go::jsGoResolveModule, ImplementationVisibility::Public, NoIntrinsic, 0);
@@ -571,8 +838,9 @@ JSValue createGoRuntimeBinding(Zig::GlobalObject* globalObject)
 {
     auto& vm = globalObject->vm();
     auto scope = DECLARE_THROW_SCOPE(vm);
-    JSObject* binding = constructEmptyObject(globalObject, globalObject->objectPrototype(), 2);
+    JSObject* binding = constructEmptyObject(globalObject, globalObject->objectPrototype(), 3);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "take"_s), 0, Bun::Go::jsGoTake, ImplementationVisibility::Public, NoIntrinsic, 0);
+    binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "compile"_s), 5, Bun::Go::jsGoCompile, ImplementationVisibility::Public, NoIntrinsic, 0);
     binding->putDirectNativeFunction(vm, globalObject, Identifier::fromString(vm, "settle"_s), 3, Bun::Go::jsGoSettle, ImplementationVisibility::Public, NoIntrinsic, 0);
     RELEASE_AND_RETURN(scope, binding);
 }

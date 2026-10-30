@@ -93,7 +93,10 @@ enum class SerializationErrorMode { NonThrowing,
     Throwing };
 enum class SerializationContext { Default,
     WorkerPostMessage,
-    WindowPostMessage };
+    WindowPostMessage,
+    // A Bun.Channel value or a Bun.go argument or result: as WorkerPostMessage, and an AbortSignal is
+    // cloned as a signal linked to it (LinkedAbortSignal.h).
+    Channel };
 enum class SerializationForStorage : bool { No,
     Yes };
 enum class SerializationForCrossProcessTransfer : bool { No,

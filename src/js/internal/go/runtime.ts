@@ -3,14 +3,48 @@
 // One goroutine is taken per turn of the event loop. A goroutine runs until it first awaits; then
 // the thread takes the next. A thread that finds nothing to take is idle until BunGo.cpp wakes it.
 
-const { take, settle } = $cpp("BunGo.cpp", "createGoRuntimeBinding") as {
+const { take, settle, compile } = $cpp("BunGo.cpp", "createGoRuntimeBinding") as {
   take(): Task | Failed | undefined;
   settle(id: number, outcome: 0 | 1, value: unknown): void;
+  compile(
+    source: string,
+    module: string,
+    line: number,
+    column: number,
+    strict: boolean,
+  ): (require: unknown) => Function;
 };
 
-type Task = [id: number, module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]];
+// internal/go/spawn's targets.
+type Task =
+  | [id: number, args: unknown[], kind: 0, module: string, exportName: string, fromCommonJSExports: boolean]
+  | [
+      id: number,
+      args: unknown[],
+      kind: 1,
+      module: string,
+      source: string,
+      line: number,
+      column: number,
+      strict: boolean,
+    ];
 // The goroutine's arguments could not be read on this thread.
 type Failed = [id: number, error: unknown];
+
+// The `require` an inline function written in `module` gets.
+function requireOf(module: string) {
+  const { createRequire } = require("node:module");
+  try {
+    return createRequire(module);
+  } catch {
+    // A module with no path, such as `bun -e`'s
+    return createRequire(require("node:path").join(process.cwd(), "[eval]"));
+  }
+}
+
+// Inline functions compiled on this thread, by source.
+const compiled = new Map<string, { module: string; line: number; column: number; fn: Function }>();
+const kMaxCompiled = 1024;
 
 const kMaxCauseDepth = 8;
 
@@ -70,19 +104,37 @@ function fail(id: number, error: unknown) {
   ]);
 }
 
-async function start(id: number, module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]) {
+async function exported(module: string, exportName: string, fromCommonJSExports: boolean) {
+  const namespace = await import(module);
+  const fn = fromCommonJSExports ? namespace.default?.[exportName] : namespace[exportName];
+  if (!$isCallable(fn)) {
+    throw $ERR_GOROUTINE_NOT_SENDABLE(
+      exportName === "default"
+        ? `The default export of ${module} is not a function`
+        : `The export "${exportName}" of ${module} is not a function`,
+    );
+  }
+  return fn;
+}
+
+function inline(source: string, module: string, line: number, column: number, strict: boolean) {
+  const entry = compiled.$get(source);
+  if (entry !== undefined && entry.module === module && entry.line === line && entry.column === column) {
+    return entry.fn;
+  }
+  if (compiled.size >= kMaxCompiled) compiled.clear();
+  const fn = compile(source, module, line, column, strict)(requireOf(module));
+  compiled.$set(source, { module, line, column, fn });
+  return fn;
+}
+
+async function start(task: Task) {
+  const id = task[0];
   let value;
   try {
-    const namespace = await import(module);
-    const fn = fromCommonJSExports ? namespace.default?.[exportName] : namespace[exportName];
-    if (!$isCallable(fn)) {
-      throw $ERR_GOROUTINE_NOT_SENDABLE(
-        exportName === "default"
-          ? `The default export of ${module} is not a function`
-          : `The export "${exportName}" of ${module} is not a function`,
-      );
-    }
-    value = await fn.$apply(undefined, args);
+    const fn =
+      task[2] === 0 ? await exported(task[3], task[4], task[5]) : inline(task[4], task[3], task[5], task[6], task[7]);
+    value = await fn.$apply(undefined, task[1]);
   } catch (error) {
     fail(id, error);
     return;
@@ -105,7 +157,7 @@ function pull() {
     fail(task[0], task[1]);
     return;
   }
-  start(task[0], task[1], task[2], task[3], task[4]);
+  start(task);
 }
 
 pull();

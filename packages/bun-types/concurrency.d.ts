@@ -106,33 +106,51 @@ declare module "bun" {
    * or as the machine has CPU cores. A goroutine runs on one thread until it settles. While it awaits, its thread runs other
    * goroutines. Goroutines on different threads run in parallel.
    *
-   * `fn` must be a function that a module exports (ES module or CommonJS). Each pool thread imports that module
-   * once, and calls the export with `args`. Module state is per thread, and `import.meta.main` is `false` there. A
-   * closure, a bound or native function, or a function no module exports throws a `TypeError`
-   * (`ERR_GOROUTINE_NOT_SENDABLE`), because its variables can't move to another thread.
+   * `fn` is either:
+   * - a function that uses only its parameters, what it declares itself, and globals (`Bun`, `fetch`, `Atomics`,
+   *   `require`, ...). Bun sends its source to the other thread and compiles it there once, as if it were where it
+   *   is written: `await import("./x.ts")` and `require()` in it resolve from its module. A function that uses a
+   *   variable of the code around it, an arrow function that uses the `this` or `arguments` around it, a function
+   *   that uses `import.meta`, a method or a class throws a `TypeError` (`ERR_GOROUTINE_NOT_SENDABLE`) that names
+   *   what it uses and where. Pass such values as arguments instead.
+   * - a function that a module exports (ES module or CommonJS). Each pool thread imports that module once, and calls
+   *   the export. Module state is per thread, and `import.meta.main` is `false` there. Bun prefers this when the
+   *   function is exported, and it is the way for code that uses its module's imports.
+   *
+   * A bound or native function throws `ERR_GOROUTINE_NOT_SENDABLE`. So does a function no module exports while
+   * code generation from strings is disallowed (`--disallow-code-generation-from-strings`).
    *
    * The arguments and the result are structured clones, as with `postMessage()`: a `SharedArrayBuffer` or a
-   * {@link Channel} is shared, everything else is copied. Arguments that can't be cloned throw a `DataCloneError`.
-   * If the function throws, the goroutine rejects with a copy of the error (its name, message, stack, `cause` and
-   * own properties). A rejection that nothing handles is an unhandled rejection on the thread that called `go()`.
+   * {@link Channel} is shared, everything else is copied. An `AbortSignal` arrives as a signal that aborts when the
+   * original does, with a clone of its reason (an `AbortError` if the reason can't be cloned). Arguments that can't be
+   * cloned throw a `DataCloneError`. If the function throws, the goroutine rejects with a copy of the error (its name,
+   * message, stack, `cause` and own properties). A rejection that nothing handles is an unhandled rejection on the
+   * thread that called `go()`.
    *
    * @example
    * ```ts
-   * // primes.ts
-   * export function countPrimes(from: number, to: number) {
-   *   let count = 0;
-   *   for (let n = from; n < to; n++) if (isPrime(n)) count++;
-   *   return count;
-   * }
-   *
-   * // main.ts
-   * import { countPrimes } from "./primes.ts";
-   * const counts = await Promise.all([Bun.go(countPrimes, 0, 1e6), Bun.go(countPrimes, 1e6, 2e6)]);
+   * const counts = await Promise.all(
+   *   [0, 1e6].map(from =>
+   *     Bun.go(
+   *       (from, to) => {
+   *         let count = 0;
+   *         for (let n = from; n < to; n++) if (isPrime(n)) count++;
+   *         return count;
+   *         function isPrime(n: number) {
+   *           for (let d = 2; d * d <= n; d++) if (n % d === 0) return false;
+   *           return n > 1;
+   *         }
+   *       },
+   *       from,
+   *       from + 1e6,
+   *     ),
+   *   ),
+   * );
    * ```
    *
    * @category Concurrency
    */
-  function go<F extends (...args: any[]) => unknown>(fn: F, ...args: Parameters<F>): Goroutine<Awaited<ReturnType<F>>>;
+  function go<A extends unknown[], R>(fn: (...args: A) => R, ...args: A): Goroutine<Awaited<R>>;
   /**
    * Runs the default export of a module on another thread, like {@link go} with a function. `module` is resolved
    * the way `new Worker(module)` resolves its entry point: a relative path against the current directory, so prefer

@@ -356,6 +356,8 @@ pub struct P<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> {
     pub(crate) stack_check: bun_core::StackCheck,
     /// `Parser::parse_only`: where what does not say so itself starts.
     pub(crate) starts_for_parse_only: Option<StartsForParseOnly>,
+    /// Where the code first uses a `this` that no function in it binds.
+    pub(crate) top_level_this: Option<bun_ast::Loc>,
 
     pub(crate) reported_stack_overflow: core::cell::Cell<bool>,
 
@@ -5899,6 +5901,9 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
 
     pub(crate) fn value_for_this(&mut self, loc: bun_ast::Loc) -> Option<Expr> {
         if !self.fn_only_data_visit.is_this_nested {
+            if self.top_level_this.is_none() {
+                self.top_level_this = Some(loc);
+            }
             // In the REPL, top-level `this` must evaluate to the global object
             // (matching Node's `> this` and `deno repl > this`). The REPL wraps
             // user input in an arrow IIFE that has no `exports` binding, so the
@@ -9662,6 +9667,7 @@ impl<'a, const TYPESCRIPT: bool, const SCAN_ONLY: bool> P<'a, TYPESCRIPT, SCAN_O
             log,
             stack_check: bun_core::StackCheck::init(),
             starts_for_parse_only: None,
+            top_level_this: None,
             reported_stack_overflow: core::cell::Cell::new(false),
             ts_infer_constraint_backtracks: Vec::new(),
             ts_conditional_arrow_attempts: Vec::new(),

@@ -222,6 +222,7 @@ Every value is a [structured clone](https://developer.mozilla.org/en-US/docs/Web
 
 - `SharedArrayBuffer` and `WebAssembly.Memory` are shared: both threads see the same memory.
 - Channels are shared: the receiver gets a handle to the same channel.
+- An `AbortSignal` arrives as a signal that aborts when the original does, with a copy of its reason (see [Cancelling goroutines](/runtime/goroutines#cancelling-goroutines)). `postMessage()` still refuses an `AbortSignal`.
 - `ArrayBuffer`s listed in `transfer` move to the receiver and are detached for the sender.
 - Everything else is copied. Functions and other values that cannot be cloned reject with a `DataCloneError`.
 

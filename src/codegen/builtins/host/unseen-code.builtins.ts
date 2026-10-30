@@ -251,6 +251,7 @@ const nativeFiles = [
   "JSMIMEParams.cpp",
   "JSSQLStatement.cpp",
   "JSWebSocket.cpp",
+  "LinkedAbortSignal.cpp",
   "NoOpForTesting.cpp",
   "NodeAsyncHooks.cpp",
   "NodeFetch.cpp",
