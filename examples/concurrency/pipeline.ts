@@ -17,13 +17,31 @@ import { parseArgs } from "node:util";
 type Range = [from: number, to: number];
 
 // Counts the primes in each range it receives, and sends each count on. It uses only its
-// parameters and globals, so Bun.go() runs it on another thread just as it is written, and the
-// main thread can call it too.
+// parameters, what it declares and globals, so Bun.go() runs it on another thread just as it is
+// written, and the main thread can call it too.
 async function worker(ranges: Bun.Channel<Range>, counts: Bun.Channel<number>, signal: AbortSignal) {
-  const { countPrimes } = await import("./primes.ts");
+  // A plain function: written in this async function with a helper arrow function, the loop
+  // ran about 15 times slower.
+  function countPrimes(from: number, to: number) {
+    let count = 0;
+    for (let n = from; n < to; n++) {
+      // Nothing interrupts a goroutine that computes: it has to look at its signal.
+      if (n % 16_384 === 0 && signal.aborted) return -1;
+      if (n < 2 || (n % 2 === 0 && n !== 2)) continue;
+      let prime = true;
+      for (let d = 3; d * d <= n; d += 2) {
+        if (n % d === 0) {
+          prime = false;
+          break;
+        }
+      }
+      if (prime) count++;
+    }
+    return count;
+  }
   for await (const [from, to] of ranges) {
-    const count = countPrimes(from, to, signal);
-    if (signal.aborted) return;
+    const count = countPrimes(from, to);
+    if (count < 0) return;
     await counts.send(count);
   }
 }

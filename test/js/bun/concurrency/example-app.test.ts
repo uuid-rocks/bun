@@ -1,13 +1,13 @@
 // Runs the example app in examples/concurrency. Times vary, so they are masked; the counts are exact.
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe } from "harness";
+import { bunEnv, bunExe, tempDir } from "harness";
 import { join } from "node:path";
 
 const examples = join(import.meta.dir, "../../../../examples/concurrency");
 
-async function run(file: string, args: string[]) {
+async function run(file: string, args: string[], cmd = [bunExe(), join(examples, file)]) {
   await using proc = Bun.spawn({
-    cmd: [bunExe(), join(examples, file), ...args],
+    cmd: [...cmd, ...args],
     env: { ...bunEnv, GOMAXPROCS: "4", UV_THREADPOOL_SIZE: undefined },
     stdout: "pipe",
     stderr: "pipe",
@@ -60,5 +60,44 @@ describe.concurrent("examples/concurrency", () => {
       stderr: "",
       exitCode: 0,
     });
+  });
+
+  test("pipeline.ts and server.ts run as executables built with bun build --compile", async () => {
+    using dir = tempDir("concurrency-example", {});
+    for (const name of ["pipeline", "server"]) {
+      await using build = Bun.spawn({
+        cmd: [bunExe(), "build", "--compile", join(examples, `${name}.ts`), "--outfile", join(String(dir), name)],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stderr, exitCode] = await Promise.all([build.stderr.text(), build.exited]);
+      expect({ name, stderr, exitCode }).toEqual({ name, stderr: "", exitCode: 0 });
+    }
+    const pipeline = await run(
+      "",
+      ["--limit", "200000", "--size", "10000", "--workers", "4", "--no-single"],
+      [join(String(dir), "pipeline")],
+    );
+    const server = await run("", ["--demo", "--below", "200000", "--requests", "2"], [join(String(dir), "server")]);
+    expect([pipeline, server]).toEqual([
+      {
+        stdout: [
+          "Counting the primes below 200,000, in 20 ranges of 10,000:",
+          "  4 goroutines <ms>   17,984 primes",
+        ].join("\n"),
+        stderr: "",
+        exitCode: 0,
+      },
+      {
+        stdout: [
+          "2 requests for the primes below 200,000, and /ping meanwhile:",
+          "  on goroutines  17,984 primes   all answered in <ms>   <n> pings, slowest <ms>",
+          "  on main        17,984 primes   all answered in <ms>   <n> pings, slowest <ms>",
+        ].join("\n"),
+        stderr: "",
+        exitCode: 0,
+      },
+    ]);
   });
 });

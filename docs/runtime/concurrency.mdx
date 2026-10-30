@@ -153,7 +153,7 @@ setTimeout(() => controller.abort(), 100);
 await crawler.catch(() => {}); // fetch() rejects with an AbortError
 ```
 
-Nothing stops a goroutine that computes without awaiting. Check `signal.aborted` in long loops, as `examples/concurrency/primes.ts` does.
+Nothing stops a goroutine that computes without awaiting. Check `signal.aborted` in long loops, as the worker in `examples/concurrency/pipeline.ts` does.
 
 ---
 
@@ -226,22 +226,13 @@ async function withLock<T>(lock: Bun.Channel<void>, fn: () => Promise<T>): Promi
 
 ## Executables
 
-`bun build --compile` bundles a program into one executable. Goroutines written in place work in an executable as they do with `bun run`. To run a function that a module exports, pass the module's URL to `Bun.go()` and list it as an entry point of the build, as for a [Worker](/runtime/workers):
-
-```ts count.ts icon="/icons/typescript.svg"
-export default function count(text: string) {
-  return text.split(/\s+/).length;
-}
-```
-
-```ts main.ts icon="/icons/typescript.svg"
-const count = await Bun.go(new URL("./count.ts", import.meta.url), "one two three");
-console.log(count); // => 3
-```
+`bun build --compile` bundles a program into one executable, and goroutines work in it as they do with `bun run`. The build finds the modules whose functions you pass to `Bun.go()`, as in `Bun.go(countPrimes)` after `import { countPrimes } from "./primes.ts"`, and puts them in the executable.
 
 ```sh terminal icon="terminal"
-bun build --compile ./main.ts ./count.ts --outfile app
+bun build --compile ./main.ts --outfile app
 ```
+
+A goroutine written in place runs from its source, so in a bundle it must not `await import()` a module of the bundle: the build rewrites that import into code of the bundle around the function. Import the function from the module and pass it to `Bun.go()` instead. [Bundles and executables](/runtime/goroutines#bundles-and-executables) has the details.
 
 ---
 
