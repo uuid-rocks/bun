@@ -1,6 +1,7 @@
 // The value a `Bun.Channel` operation moves between threads: a structured clone made the way
-// `worker.postMessage()` makes one (SharedArrayBuffers and channels shared, `transfer` moved),
-// owned by Rust as `bun_runtime::concurrency::message::ChannelMessage`.
+// `worker.postMessage()` makes one (SharedArrayBuffers and channels shared, `transfer` moved), and
+// an AbortSignal is a signal linked to it (LinkedAbortSignal.h). Owned by Rust as
+// `bun_runtime::concurrency::message::ChannelMessage`.
 
 #include "root.h"
 
@@ -32,7 +33,7 @@ extern "C" MessageWithMessagePorts* Bun__ChannelMessage__create(JSGlobalObject* 
     }
 
     Vector<RefPtr<MessagePort>> ports;
-    auto serialized = SerializedScriptValue::create(*globalObject, JSValue::decode(encodedValue), WTF::move(transferList), ports, SerializationForStorage::No, SerializationContext::WorkerPostMessage);
+    auto serialized = SerializedScriptValue::create(*globalObject, JSValue::decode(encodedValue), WTF::move(transferList), ports, SerializationForStorage::No, SerializationContext::Channel);
     if (serialized.hasException()) {
         WebCore::propagateException(*globalObject, scope, serialized.releaseException());
         return nullptr;

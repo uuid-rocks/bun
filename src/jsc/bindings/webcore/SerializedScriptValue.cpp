@@ -98,6 +98,8 @@
 #include "GeneratedBlockList.h"
 #include "GeneratedHistogram.h"
 #include "GeneratedChannel.h"
+#include "JSAbortSignal.h"
+#include "LinkedAbortSignal.h"
 #include "JSX509Certificate.h"
 #include "ncrypto.h"
 #include "JSKeyObject.h"
@@ -205,6 +207,7 @@ enum SerializationTag {
     Bun__nodenet_BlockList = 251,
     Bun__NodePerformanceHooksHistogramTag = 250,
     Bun__ChannelTag = 249,
+    Bun__AbortSignalTag = 248,
 
     ErrorTag = 255
 };
@@ -229,6 +232,12 @@ extern "C" void Histogram__releaseStructuredClone(uint64_t id);
 extern "C" uint64_t Channel__retainForStructuredClone(JSC::EncodedJSValue channel);
 extern "C" JSC::EncodedJSValue Channel__fromStructuredClone(JSC::JSGlobalObject*, uint64_t id);
 extern "C" void Channel__releaseStructuredClone(uint64_t id);
+
+// SharedArrayBuffers and shared WebAssembly memories are shared, not copied.
+static bool sharesMemory(SerializationContext context)
+{
+    return context == SerializationContext::WorkerPostMessage || context == SerializationContext::Channel;
+}
 
 enum ArrayBufferViewSubtag {
     DataViewTag = 0,
@@ -1309,7 +1318,7 @@ private:
                 if (!startObjectInternal(obj)) // handle duplicates
                     return true;
 
-                if (arrayBuffer->isShared() && m_context == SerializationContext::WorkerPostMessage) {
+                if (arrayBuffer->isShared() && sharesMemory(m_context)) {
                     // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserializeinternal
                     if (!JSC::Options::useSharedArrayBuffer()) {
                         code = SerializationReturnCode::DataCloneError;
@@ -1387,7 +1396,7 @@ private:
 #endif
 #if ENABLE(WEBASSEMBLY)
             if (JSWebAssemblyModule* module = dynamicDowncast<JSWebAssemblyModule>(obj)) {
-                if (m_context != SerializationContext::WorkerPostMessage && m_context != SerializationContext::WindowPostMessage)
+                if (!sharesMemory(m_context) && m_context != SerializationContext::WindowPostMessage)
                     return false;
 
                 uint32_t index = m_wasmModules.size();
@@ -1402,7 +1411,7 @@ private:
                     code = SerializationReturnCode::DataCloneError;
                     return true;
                 }
-                if (m_context != SerializationContext::WorkerPostMessage) {
+                if (!sharesMemory(m_context)) {
                     code = SerializationReturnCode::DataCloneError;
                     return true;
                 }
@@ -1476,6 +1485,18 @@ private:
                 write(Bun__ChannelTag);
                 write(id);
                 return true;
+            }
+
+            if (m_context == SerializationContext::Channel) {
+                if (auto* signal = JSAbortSignal::toWrapped(m_lexicalGlobalObject->vm(), obj)) {
+                    if (!startObjectInternal(obj)) // handle duplicates
+                        return true;
+                    uint64_t id = Bun::LinkedAbortSignal::retainForStructuredClone(m_lexicalGlobalObject, *signal);
+                    m_serializedHandles.append({ Bun::LinkedAbortSignal::releaseStructuredClone, id });
+                    write(Bun__AbortSignalTag);
+                    write(id);
+                    return true;
+                }
             }
 
             if (auto* x509 = dynamicDowncast<Bun::JSX509Certificate>(obj)) {
@@ -3540,6 +3561,25 @@ private:
         return channel;
     }
 
+    JSValue readAbortSignal()
+    {
+        VM& vm = m_globalObject->vm();
+        auto scope = DECLARE_THROW_SCOPE(vm);
+        uint64_t id;
+        if (!read(id)) {
+            fail();
+            return JSValue();
+        }
+        JSValue signal = Bun::LinkedAbortSignal::fromStructuredClone(m_globalObject, id);
+        RETURN_IF_EXCEPTION(scope, JSValue());
+        if (signal.isEmpty()) {
+            fail();
+            return JSValue();
+        }
+        addTerminalToObjectPool(signal);
+        return signal;
+    }
+
     JSValue readBunType(JSC::EncodedJSValue (*deserialize)(JSC::JSGlobalObject*, const uint8_t** ptr, const uint8_t* end))
     {
         JSValue deserialized = JSValue::decode(deserialize(m_lexicalGlobalObject, &m_ptr, m_end));
@@ -4065,6 +4105,9 @@ private:
 
         case Bun__ChannelTag:
             return readChannel();
+
+        case Bun__AbortSignalTag:
+            return readAbortSignal();
 
         default:
             m_ptr = preTagPtr; // Push the tag back
@@ -4688,7 +4731,7 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
     auto scope = DECLARE_THROW_SCOPE(vm);
 
     // Fast path optimization: for postMessage/structuredClone with pure strings and no transfers
-    const bool canUseFastPath = (context == SerializationContext::WorkerPostMessage || context == SerializationContext::WindowPostMessage || context == SerializationContext::Default)
+    const bool canUseFastPath = (sharesMemory(context) || context == SerializationContext::WindowPostMessage || context == SerializationContext::Default)
         && forStorage == SerializationForStorage::No
         && forTransfer == SerializationForCrossProcessTransfer::No
         && transferList.isEmpty()
@@ -5035,10 +5078,10 @@ ExceptionOr<Ref<SerializedScriptValue>> SerializedScriptValue::create(JSGlobalOb
     }
 
     scope.releaseAssertNoException();
-    auto result = adoptRef(*new SerializedScriptValue(WTF::move(buffer), WTF::move(arrayBufferContentsArray), context == SerializationContext::WorkerPostMessage ? WTF::move(sharedBuffers) : nullptr
+    auto result = adoptRef(*new SerializedScriptValue(WTF::move(buffer), WTF::move(arrayBufferContentsArray), sharesMemory(context) ? WTF::move(sharedBuffers) : nullptr
 #if ENABLE(WEBASSEMBLY)
         ,
-        makeUnique<WasmModuleArray>(wasmModules), context == SerializationContext::WorkerPostMessage ? makeUnique<WasmMemoryHandleArray>(wasmMemoryHandles) : nullptr
+        makeUnique<WasmModuleArray>(wasmModules), sharesMemory(context) ? makeUnique<WasmMemoryHandleArray>(wasmMemoryHandles) : nullptr
 #endif
         ));
     result->m_serializedBlockListRefs = WTF::move(serializedBlockListRefs);
