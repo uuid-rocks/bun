@@ -286,10 +286,11 @@ void Scheduler::dispatch(Grow mayGrow)
                 grows = mayGrow == Grow::Yes && shouldGrow(onMainThread);
                 // Off the main thread, a new thread waits for the main thread to create it, and the
                 // idle thread may be this one, about to block: ask both, the first to take runs it.
+                // The new thread is the one counted on, so what is queued next gets another.
                 if ((!grows || !onMainThread) && !m_idle.isEmpty())
                     thread = m_idle.takeLast();
             }
-            if (thread)
+            if (thread && !grows)
                 m_woken.add(*thread);
         }
         if (grows)
