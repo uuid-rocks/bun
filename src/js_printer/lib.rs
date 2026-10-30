@@ -3517,7 +3517,7 @@ pub(crate) mod __gated_printer {
                 ExprData::ECall(e)
                     if matches!(e.target.data, ExprData::ESpecial(E::Special::BunGoTask(_))) =>
                 {
-                    self.print_bun_go_task(&e, level, in_flags);
+                    self.print_bun_go_task(e, level, in_flags);
                 }
                 ExprData::ECall(e) => {
                     let mut wrap = level.gte(Level::New) || flags.contains(ExprFlag::ForbidCall);
