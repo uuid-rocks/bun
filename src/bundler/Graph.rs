@@ -28,6 +28,8 @@ pub struct Graph<'a> {
     pub entry_points: Vec<Index>,
     /// Maps entry point source indices to their original specifiers (for virtual entries resolved by plugins)
     pub(crate) entry_point_original_names: IndexStringMap,
+    /// The entry points that `Bun.go()` calls added (`add_bun_go_tasks_as_extra_entry_points`)
+    pub(crate) bun_go_entry_points: Vec<IndexInt>,
     /// Every source index has an associated InputFile
     pub input_files: MultiArrayList<InputFile<'a>>,
     /// Every source index has an associated Ast
@@ -164,6 +166,7 @@ impl<'a> Graph<'a> {
             heap,
             entry_points: Vec::new(),
             entry_point_original_names: IndexStringMap::default(),
+            bun_go_entry_points: Vec::new(),
             input_files: MultiArrayList::default(),
             ast: MultiArrayList::default(),
             pending_items: 0,

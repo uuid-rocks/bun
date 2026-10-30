@@ -942,6 +942,8 @@ impl<'a> LinkerGraph<'a> {
                                 | ImportKind::Composes => continue,
                                 // Other non-JS imports
                                 ImportKind::HtmlManifest | ImportKind::Internal => continue,
+                                // Loaded on a pool thread, not by the importer
+                                ImportKind::BunGo => continue,
                             }
 
                             let import_index: usize = import_record.source_index.get() as usize;

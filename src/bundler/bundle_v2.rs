@@ -4393,6 +4393,7 @@ pub mod bv2_impl {
 
                 this.process_files_to_copy(&reachable_files)?;
 
+                this.add_bun_go_tasks_as_extra_entry_points(&reachable_files);
                 this.add_server_component_boundaries_as_extra_entry_points()?;
 
                 this.clone_ast()?;
@@ -4557,6 +4558,7 @@ pub mod bv2_impl {
 
                 this.process_files_to_copy(&reachable_files)?;
 
+                this.add_bun_go_tasks_as_extra_entry_points(&reachable_files);
                 this.add_server_component_boundaries_as_extra_entry_points()?;
 
                 this.clone_ast()?;
@@ -4590,6 +4592,50 @@ pub mod bv2_impl {
             this.deinit_without_freeing_arena();
 
             result
+        }
+
+        /// Every module a reachable `Bun.go()` call names becomes an entry point, as if it were
+        /// listed on the command line: its exports are kept, and the call names its output.
+        pub(crate) fn add_bun_go_tasks_as_extra_entry_points(&mut self, reachable_files: &[Index]) {
+            let all_import_records = self.graph.ast.items_import_records();
+            let loaders = self.graph.input_files.items_loader();
+            let sources = self.graph.input_files.items_source();
+            let mut tasks: Vec<IndexInt> = Vec::new();
+            for source_index in reachable_files {
+                let Some(records) = all_import_records.get(source_index.get() as usize) else {
+                    continue;
+                };
+                for record in records.as_slice() {
+                    if record.kind == ImportKind::BunGo
+                        && record.source_index.is_valid()
+                        && loaders[record.source_index.get() as usize].is_javascript_like()
+                    {
+                        tasks.push(record.source_index.get());
+                    }
+                }
+            }
+            if tasks.is_empty() {
+                return;
+            }
+            // Parse order is not deterministic; output paths and chunk order must be.
+            tasks.sort_unstable_by(|a, b| {
+                sources[*a as usize]
+                    .path
+                    .text
+                    .cmp(sources[*b as usize].path.text)
+            });
+            tasks.dedup();
+            for task in tasks {
+                if !self
+                    .graph
+                    .entry_points
+                    .iter()
+                    .any(|entry| entry.get() == task)
+                {
+                    self.graph.entry_points.push(Index::init(task));
+                    self.graph.bun_go_entry_points.push(task);
+                }
+            }
         }
 
         pub(crate) fn add_server_component_boundaries_as_extra_entry_points(
@@ -5604,6 +5650,7 @@ pub mod bv2_impl {
 
             self.process_files_to_copy(&reachable_files)?;
 
+            self.add_bun_go_tasks_as_extra_entry_points(&reachable_files);
             self.add_server_component_boundaries_as_extra_entry_points()?;
 
             // SAFETY: see `generate_from_cli` — repr(transparent) Index slice cast +

@@ -1272,7 +1272,8 @@ impl<'a> Resolver<'a> {
             ast::ImportKind::EntryPointBuild
             | ast::ImportKind::EntryPointRun
             | ast::ImportKind::Stmt
-            | ast::ImportKind::Dynamic => options::ExtOrder::DefaultEsm,
+            | ast::ImportKind::Dynamic
+            | ast::ImportKind::BunGo => options::ExtOrder::DefaultEsm,
             _ if !self.opts.extension_order.required_by_package.is_empty()
                 && strings::path_contains_node_modules_folder(source_dir) =>
             {

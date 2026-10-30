@@ -108,7 +108,7 @@ impl ExtensionOrder {
         use bun_ast::ImportKind as K;
         match kind {
             K::Url | K::AtConditional | K::At => ExtOrder::Css,
-            K::Stmt | K::EntryPointBuild | K::EntryPointRun | K::Dynamic => {
+            K::Stmt | K::EntryPointBuild | K::EntryPointRun | K::Dynamic | K::BunGo => {
                 if is_node_modules {
                     ExtOrder::NodeModulesEsm
                 } else {

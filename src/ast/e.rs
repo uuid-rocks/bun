@@ -251,6 +251,12 @@ pub enum Special {
     /// Prints the resolved specifier string for an import record
     /// (an `ImportRecord` index).
     ResolvedSpecifierString(u32),
+    /// The target of the call that stands for the function given to `Bun.go()`, with the
+    /// `ImportKind::BunGo` record of its module. Its arguments are the expression as written
+    /// and the URL fragment that names the export (`""` for the default export). Printed as
+    /// `new URL("<entry chunk>#<export>", import.meta.url)` once the linker points the record
+    /// at the module's entry chunk, else as the expression.
+    BunGoTask(u32),
 }
 
 pub struct Call {

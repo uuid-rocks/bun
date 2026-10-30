@@ -2661,6 +2661,45 @@ pub(crate) mod __gated_printer {
         }
 
         #[inline]
+        /// The function given to `Bun.go()` (`E::Special::BunGoTask`): the URL of its module's
+        /// entry chunk with the export as the fragment, or the expression as written when the
+        /// module is not part of the bundle.
+        fn print_bun_go_task(&mut self, call: &E::Call, level: Level, flags: ExprFlagSet) {
+            let ExprData::ESpecial(E::Special::BunGoTask(import_record_index)) = call.target.data
+            else {
+                unreachable!()
+            };
+            let [original, fragment] = call.args.slice() else {
+                unreachable!()
+            };
+            let record = self.import_record(import_record_index as usize);
+            if !record
+                .flags
+                .contains(bun_ast::ImportRecordFlags::IMPORTS_CHUNK)
+            {
+                self.print_expr(*original, level, flags);
+                return;
+            }
+            let fragment = fragment.data.e_string();
+            let fragment: &[u8] = fragment.as_ref().map_or(b"", |fragment| fragment.slice8());
+            let mut href = Vec::with_capacity(record.path.text.len() + fragment.len());
+            href.extend_from_slice(record.path.text);
+            href.extend_from_slice(fragment);
+            self.print_space_before_identifier();
+            self.add_source_mapping(original.loc);
+            // Another file's top-level `URL` can share the chunk's scope.
+            self.print(b"new globalThis.URL(");
+            self.print_string_literal_utf8(&href, true);
+            self.print(b",");
+            self.print_space();
+            if self.options.module_type == bundle_opts::Format::Esm {
+                self.print(b"import.meta.url");
+            } else {
+                self.print(b"Bun.pathToFileURL(__filename)");
+            }
+            self.print(b")");
+        }
+
         pub(crate) fn import_record(&self, import_record_index: usize) -> &'a ImportRecord<'a> {
             // detached from `&self` so callers can interleave `&mut self` printing.
             &self.import_records[import_record_index]
@@ -3408,6 +3447,17 @@ pub(crate) mod __gated_printer {
                             in_flags,
                         );
                     }
+                    // Only ever the target of the call `print_bun_go_task` prints.
+                    E::Special::BunGoTask(_) => {
+                        self.print_expr(
+                            Expr {
+                                data: ExprData::EUndefined(E::Undefined {}),
+                                loc: expr.loc,
+                            },
+                            level,
+                            in_flags,
+                        );
+                    }
                     E::Special::ResolvedSpecifierString(index) => {
                         debug_assert!(
                             self.options.module_type == bundle_opts::Format::InternalBakeDev
@@ -3463,6 +3513,11 @@ pub(crate) mod __gated_printer {
                     if wrap {
                         self.print(b")");
                     }
+                }
+                ExprData::ECall(e)
+                    if matches!(e.target.data, ExprData::ESpecial(E::Special::BunGoTask(_))) =>
+                {
+                    self.print_bun_go_task(&e, level, in_flags);
                 }
                 ExprData::ECall(e) => {
                     let mut wrap = level.gte(Level::New) || flags.contains(ExprFlag::ForbidCall);

@@ -39,6 +39,7 @@ fn import_kind_label(kind: ImportKind) -> &'static [u8] {
         ImportKind::Composes => b"composes",
         ImportKind::Internal => b"internal",
         ImportKind::HtmlManifest => b"html_manifest",
+        ImportKind::BunGo => b"bun-go",
     }
 }
 
@@ -91,7 +92,7 @@ impl ResolveMessage {
                         }
                         // require resolve does not have the UNKNOWN_BUILTIN_MODULE error code
                         ImportKind::RequireResolve => b"MODULE_NOT_FOUND",
-                        ImportKind::Stmt | ImportKind::Dynamic => {
+                        ImportKind::Stmt | ImportKind::Dynamic | ImportKind::BunGo => {
                             if specifier.starts_with(b"node:") {
                                 break 'brk b"ERR_UNKNOWN_BUILTIN_MODULE";
                             } else {

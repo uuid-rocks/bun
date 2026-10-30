@@ -124,8 +124,12 @@ export const enums = {
     "dynamic-import",
     "require-resolve",
     "import-rule",
+    "import-rule",
     "url-token",
+    "composes",
+    "html_manifest",
     "internal",
+    "bun-go",
   ],
 };
 

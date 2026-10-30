@@ -3173,7 +3173,8 @@ declare module "bun" {
     | "url-token"
     | "internal"
     | "entry-point-run"
-    | "entry-point-build";
+    | "entry-point-build"
+    | "bun-go";
 
   interface Import {
     path: string;

@@ -106,7 +106,12 @@ function fail(id: number, error: unknown) {
 
 async function exported(module: string, exportName: string, fromCommonJSExports: boolean) {
   const namespace = await import(module);
-  const fn = fromCommonJSExports ? namespace.default?.[exportName] : namespace[exportName];
+  let fn = fromCommonJSExports ? namespace.default?.[exportName] : namespace[exportName];
+  // A bundle names the export of a CommonJS module by a URL fragment, and that module's entry chunk exports
+  // only `module.exports`, as `default`.
+  if (fn === undefined && !fromCommonJSExports && exportName !== "default" && !(exportName in namespace)) {
+    fn = namespace.default?.[exportName];
+  }
   if (!$isCallable(fn)) {
     throw $ERR_GOROUTINE_NOT_SENDABLE(
       exportName === "default"

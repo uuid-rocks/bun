@@ -7,7 +7,7 @@ const { spawn, spawnInline, keepAlive, moduleOf, resolveModule, sourceOf, check,
   spawn(module: string, exportName: string, fromCommonJSExports: boolean, args: unknown[]): number;
   spawnInline(source: string, module: string, line: number, column: number, strict: boolean, args: unknown[]): number;
   keepAlive(delta: number): void;
-  moduleOf(fn: Function): [url: string, namespace: object | undefined] | undefined;
+  moduleOf(fn: Function): [url: string, namespace: object | undefined, bundled: boolean] | undefined;
   resolveModule(specifier: string): string;
   sourceOf(fn: Function): Source | undefined;
   check(fn: Function, source: string, module: string, line: number, column: number): Checked;
@@ -103,7 +103,17 @@ function list(items: string[]) {
   return items.length === 1 ? items[0] : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 }
 
-function notSendable(fn: Function, url: string | undefined, problems?: Problem[]) {
+// bun build finds the module of a function only from the call itself.
+const inBundle =
+  ' In a bundle, pass Bun.go() the imported binding itself, as in Bun.go(task) or Bun.go(tasks.task), or the module\'s URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)): bun build makes that module an entry point. List a module named any other way as an entry point of the build.';
+
+function notSendable(fn: Function, url: string | undefined, problems?: Problem[], bundled = false) {
+  const error = notSendableIn(fn, url, problems);
+  if (bundled) error.message += inBundle;
+  return error;
+}
+
+function notSendableIn(fn: Function, url: string | undefined, problems?: Problem[]) {
   const label = fn.name ? `"${fn.name}"` : "this function";
   if (url === undefined) {
     return $ERR_GOROUTINE_NOT_SENDABLE(
@@ -162,8 +172,7 @@ function notSendable(fn: Function, url: string | undefined, problems?: Problem[]
 }
 
 // The function a module exports: its module's key and the name it is exported under.
-function exportOf(fn: Function): Target | undefined {
-  const source = moduleOf(fn);
+function exportOf(fn: Function, source: ReturnType<typeof moduleOf>): Target | undefined {
   if (source === undefined) return;
   const [url, namespace] = source;
   if (namespace !== undefined) {
@@ -181,7 +190,7 @@ function exportOf(fn: Function): Target | undefined {
 }
 
 // A function that uses nothing but its parameters, what it declares, and globals: its source.
-function inlineOf(fn: Function, source: Source | undefined): Target {
+function inlineOf(fn: Function, source: Source | undefined, bundled: boolean): Target {
   if (source === undefined) throw notSendable(fn, undefined);
   const [text, module, line, column, strict] = source;
   let verdict = verdicts.$get(text);
@@ -199,8 +208,8 @@ function inlineOf(fn: Function, source: Source | undefined): Target {
     verdicts.$set(text, verdict);
   }
   const { problems } = verdict;
-  if (problems !== undefined) throw notSendable(fn, module, problems);
-  if (!codeGenerationAllowed()) throw notSendable(fn, module);
+  if (problems !== undefined) throw notSendable(fn, module, problems, bundled);
+  if (!codeGenerationAllowed()) throw notSendable(fn, module, undefined, bundled);
   return verdict.target!;
 }
 
@@ -221,9 +230,26 @@ function targetOf(fn: Function): Target {
       return verdict.target;
     }
   }
-  target = exportOf(fn) ?? inlineOf(fn, source);
+  const module = moduleOf(fn);
+  target = exportOf(fn, module) ?? inlineOf(fn, source, module?.[2] ?? false);
   targets.set(fn, target);
   return target;
+}
+
+// A URL's fragment names the export to run; `bun build` writes `Bun.go(fn)` as one.
+function urlTarget(url: URL): Target {
+  let exportName = "default";
+  if (url.hash.length > 1) {
+    exportName = decodeURIComponent(url.hash.slice(1));
+    url = new URL(url.href);
+    url.hash = "";
+  }
+  return [
+    TargetKind.Export,
+    resolveModule(url.protocol === "file:" ? Bun.fileURLToPath(url) : url.href),
+    exportName,
+    false,
+  ];
 }
 
 function go(task: unknown, ...args: unknown[]) {
@@ -231,19 +257,11 @@ function go(task: unknown, ...args: unknown[]) {
   if ($isCallable(task)) {
     target = targetOf(task as Function);
   } else if (typeof task === "string") {
-    target = [
-      TargetKind.Export,
-      resolveModule(task.startsWith("file:") ? Bun.fileURLToPath(task) : task),
-      "default",
-      false,
-    ];
+    target = task.startsWith("file:")
+      ? urlTarget(new URL(task))
+      : [TargetKind.Export, resolveModule(task), "default", false];
   } else if (task instanceof URL) {
-    target = [
-      TargetKind.Export,
-      resolveModule(task.protocol === "file:" ? Bun.fileURLToPath(task) : task.href),
-      "default",
-      false,
-    ];
+    target = urlTarget(task);
   } else {
     throw $ERR_INVALID_ARG_TYPE("fn", ["function", "string", "URL"], task);
   }

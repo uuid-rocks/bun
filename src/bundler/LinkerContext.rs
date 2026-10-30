@@ -965,6 +965,8 @@ impl<'a> LinkerContext<'a> {
             self.check_for_memory_corruption();
         }
 
+        self.point_bun_go_records_at_entry_chunks(&chunks);
+
         compute_cross_chunk_dependencies(self, &mut chunks)?;
 
         if FeatureFlags::HELP_CATCH_MEMORY_ISSUES {
@@ -974,6 +976,31 @@ impl<'a> LinkerContext<'a> {
         self.graph.symbols.follow_all();
 
         Ok(chunks)
+    }
+
+    /// A `Bun.go()` record names the entry chunk of its module, which
+    /// `E::Special::BunGoTask` prints as a URL.
+    fn point_bun_go_records_at_entry_chunks(&mut self, chunks: &[Chunk<'a>]) {
+        let entry_point_chunk_indices = self.graph.files.items_entry_point_chunk_index();
+        for records in self.graph.ast.items_import_records_mut() {
+            for record in records.as_mut_slice() {
+                if record.kind != ImportKind::BunGo || !record.source_index.is_valid() {
+                    continue;
+                }
+                let chunk_index = entry_point_chunk_indices[record.source_index.get() as usize];
+                let Some(chunk) = chunks.get(chunk_index as usize) else {
+                    continue;
+                };
+                if !matches!(chunk.content, crate::chunk::Content::Javascript(_)) {
+                    continue;
+                }
+                record.path.text = chunk.unique_key;
+                record.path.pretty = chunk.id_key;
+                record
+                    .flags
+                    .insert(bun_ast::ImportRecordFlags::IMPORTS_CHUNK);
+            }
+        }
     }
 
     pub(crate) fn tree_shaking_and_code_splitting(&mut self) -> Result<(), AllocError> {

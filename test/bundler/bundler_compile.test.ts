@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "fs";
+import { mkdirSync, readFileSync, renameSync, rmSync } from "fs";
 import { bunEnv, bunExe, isWindows, tempDir } from "harness";
 import { join } from "path";
 import { BundlerTestInput, itBundled as itBundledBase } from "./expectBundled";
@@ -1563,6 +1563,147 @@ const server = serve({
     const result = await Bun.$`./app`.cwd(dir).env(bunEnv).nothrow();
     expect(result.stdout.toString().trim()).toBe("IT WORKS");
   }, 30_000);
+});
+
+// `Bun.go(fn)` and `Bun.go(new URL(...))` name a module that the bundle makes an entry point of.
+describe("Bun.go", () => {
+  const goFiles = {
+    "src/main.ts": `
+      import { add, label } from "./tasks/math.ts";
+      import { add as plus } from "./tasks/math.ts";
+      import * as text from "./tasks/text.ts";
+      import twice from "./tasks/twice.ts";
+      import { which } from "./tasks/dual";
+      import { which as packageWhich } from "dualpkg/dual";
+      import { work } from "./tasks/cjs.cjs";
+      import { urlLabel } from "./label.ts";
+      Promise.all([
+        Bun.go(add, 2, 3),
+        Bun.go(plus, 1, 1),
+        Bun.go(text.shout, "hi"),
+        Bun.go(text["odd name"], 5),
+        Bun.go(twice, 21),
+        Bun.go(new URL("./tasks/url-task.ts", import.meta.url), 4),
+        Bun.go(new URL("tasks/math.ts#mul", import.meta.url), 6, 7),
+        Bun.go(which),
+        Bun.go(packageWhich),
+        Bun.go(work),
+        Bun.go((n: number) => ({ inline: n * 3 }), 5),
+      ]).then(results => console.log(JSON.stringify(results), label, urlLabel));
+    `,
+    "src/tasks/math.ts": `
+      import { offset } from "../shared.ts";
+      export function add(a: number, b: number) { return { sum: a + b + offset(), isMainThread: Bun.isMainThread }; }
+      export function mul(a: number, b: number) { return a * b; }
+      export const label = "math";
+    `,
+    "src/tasks/text.ts": `
+      export function shout(s: string) { return s.toUpperCase() + "!"; }
+      function negate(n: number) { return -n; }
+      export { negate as "odd name" };
+    `,
+    "src/tasks/twice.ts": `export default function (n: number) { return n * 2; }`,
+    "src/tasks/url-task.ts": `export default (n: number) => n + 1;`,
+    "src/tasks/dual.mjs": `export const which = () => "mjs";`,
+    "src/tasks/dual.js": `export const which = () => "js";`,
+    "node_modules/dualpkg/package.json": `{ "name": "dualpkg" }`,
+    "node_modules/dualpkg/dual.mjs": `export const which = () => "package mjs";`,
+    "node_modules/dualpkg/dual.js": `export const which = () => "package js";`,
+    "src/tasks/cjs.cjs": `Object.assign(exports, { work: () => 77 });`,
+    "src/shared.ts": `export const offset = () => 0;`,
+    // Shares the bundle's top-level scope with the calls the build writes.
+    "src/label.ts": `const URL = "shadowed"; export const urlLabel = URL;`,
+  };
+  const goStdout = `[{"sum":5,"isMainThread":false},{"sum":2,"isMainThread":false},"HI!",-5,42,5,42,"mjs","package mjs",77,{"inline":15}] math shadowed\n`;
+
+  async function run(cmd: string[], cwd: string) {
+    await using proc = Bun.spawn({ cmd, env: bunEnv, cwd, stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  }
+
+  test("runs the same from source", async () => {
+    using dir = tempDir("bun-go-source", goFiles);
+    const { stdout, stderr, exitCode } = await run([bunExe(), "src/main.ts"], String(dir));
+    expect(stderr).toBe("");
+    expect(stdout).toBe(goStdout);
+    expect(exitCode).toBe(0);
+  });
+
+  for (const flags of [[], ["--minify"], ["--format=cjs"], ["--splitting"], ["--minify", "--splitting"]]) {
+    test(`bun build --target=bun ${flags.join(" ")}: the output runs moved, with the sources deleted`, async () => {
+      using dir = tempDir("bun-go-bundle", goFiles);
+      const root = String(dir);
+      const build = await run([bunExe(), "build", "--target=bun", "src/main.ts", "--outdir", "out", ...flags], root);
+      expect(build.stderr).toBe("");
+      expect(build.exitCode).toBe(0);
+      if (flags.length === 0) {
+        const main = readFileSync(join(root, "out", "main.js"), "utf8");
+        expect(main).toContain(`Bun.go(new globalThis.URL("./tasks/math.js#add", import.meta.url), 2, 3)`);
+        expect(main).toContain(`Bun.go(new globalThis.URL("./tasks/text.js#odd%20name", import.meta.url), 5)`);
+        expect(main).toContain(`Bun.go(new globalThis.URL("./tasks/twice.js", import.meta.url), 21)`);
+      }
+      rmSync(join(root, "src"), { recursive: true });
+      rmSync(join(root, "node_modules"), { recursive: true });
+      mkdirSync(join(root, "moved"));
+      renameSync(join(root, "out"), join(root, "moved", "dist"));
+      const { stdout, stderr, exitCode } = await run([bunExe(), join(root, "moved", "dist", "main.js")], root);
+      expect(stderr).toBe("");
+      expect(stdout).toBe(goStdout);
+      expect(exitCode).toBe(0);
+    });
+  }
+
+  for (const flags of [[], ["--minify"], ["--bytecode"], ["--splitting"]]) {
+    test(`bun build --compile ${flags.join(" ")}: the executable runs elsewhere, with the sources deleted`, async () => {
+      using dir = tempDir("bun-go-compile", goFiles);
+      const root = String(dir);
+      const build = await run(
+        [bunExe(), "build", "--compile", "src/main.ts", "--outfile", join("out", "app"), ...flags],
+        root,
+      );
+      expect(build.stderr).toBe("");
+      expect(build.exitCode).toBe(0);
+      rmSync(join(root, "src"), { recursive: true });
+      rmSync(join(root, "node_modules"), { recursive: true });
+      mkdirSync(join(root, "elsewhere"));
+      const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "elsewhere"));
+      expect(stderr).toBe("");
+      expect(stdout).toBe(goStdout);
+      expect(exitCode).toBe(0);
+    });
+  }
+
+  test("bun build --compile: a function the build can't trace to its module, and that is not self-contained, throws, naming the fix", async () => {
+    using dir = tempDir("bun-go-compile-computed", {
+      "main.ts": `
+        import * as tasks from "./tasks.ts";
+        const name = process.argv.length > 99 ? "none" : "work";
+        try {
+          console.log(await Bun.go(tasks[name], 3));
+        } catch (error) {
+          console.log(error.code);
+          console.log(error.message);
+        }
+      `,
+      "tasks.ts": `import { factor } from "./factor.ts"; export function work(n: number) { return n * factor; }`,
+      "factor.ts": `export const factor = 10;`,
+    });
+    const root = String(dir);
+    const source = await run([bunExe(), "main.ts"], root);
+    expect(source.stdout).toBe("30\n");
+    const build = await run([bunExe(), "build", "--compile", "main.ts", "--outfile", join("out", "app")], root);
+    expect(build.stderr).toBe("");
+    expect(build.exitCode).toBe(0);
+    const { stdout, stderr, exitCode } = await run([join(root, "out", "app")], join(root, "out"));
+    expect(stderr).toBe("");
+    const [code, message] = stdout.split("\n");
+    expect(code).toBe("ERR_GOROUTINE_NOT_SENDABLE");
+    expect(message).toContain(
+      `In a bundle, pass Bun.go() the imported binding itself, as in Bun.go(task) or Bun.go(tasks.task), or the module's URL with the export as its fragment, as in Bun.go(new URL("./tasks.ts#task", import.meta.url)): bun build makes that module an entry point. List a module named any other way as an entry point of the build.`,
+    );
+    expect(exitCode).toBe(0);
+  });
 });
 
 const MH_MAGIC_64 = 0xfeedfacf;
